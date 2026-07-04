@@ -56,3 +56,4 @@ cookies.json
 logs/
 CLAUDE.md
 .claude/
+.codebase-memory

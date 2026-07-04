@@ -8,10 +8,12 @@ use crate::server::core::live::{danmaku_client, downloader_runtime, live_request
 use crate::server::core::monitor::Monitor;
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::context::{Context, Stage, WorkerStatus};
+use crate::server::infrastructure::models::StreamerInfo;
 use crate::server::infrastructure::models::hook_step::process;
 use async_channel::Sender;
 use biliup::downloader::live::{LivePlugin, LiveStatus, LiveStream};
 use error_stack::ResultExt;
+use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -339,7 +341,8 @@ pub async fn start_download_workflow(
         }
     });
 
-    process(&[], &ctx.live_streamer().preprocessor).await;
+    let preprocessor_input = preprocessor_payload(ctx.streamer_info());
+    process(&preprocessor_input, &ctx.live_streamer().preprocessor).await;
 
     let _ = task.execute(&ctx, sender, downloader, rooms_handle).await;
 
@@ -350,4 +353,44 @@ pub async fn start_download_workflow(
         ctx.live_streamer().url,
         ctx.status(Stage::Download)
     );
+}
+
+fn preprocessor_payload(streamer_info: &StreamerInfo) -> Vec<u8> {
+    let payload = json!({
+        "name": &streamer_info.name,
+        "url": &streamer_info.url,
+        "start_time": streamer_info.date.timestamp(),
+    });
+    match serde_json::to_vec(&payload) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!(error=?e, "failed to serialize preprocessor payload");
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use serde_json::Value;
+
+    #[test]
+    fn preprocessor_payload_contains_stream_snapshot() {
+        let streamer_info = StreamerInfo::new(
+            "主播A",
+            "https://live.example/room",
+            "直播标题",
+            Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            "",
+        );
+
+        let payload: Value =
+            serde_json::from_slice(&preprocessor_payload(&streamer_info)).unwrap();
+
+        assert_eq!(payload["name"], "主播A");
+        assert_eq!(payload["url"], "https://live.example/room");
+        assert_eq!(payload["start_time"], 1_700_000_000);
+    }
 }

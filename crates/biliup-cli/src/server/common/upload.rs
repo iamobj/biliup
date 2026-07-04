@@ -183,6 +183,31 @@ where
     Ok(uploaded)
 }
 
+async fn collect_processed_segment_paths<F>(
+    rx: Inspect<Receiver<SegmentInfo>, F>,
+    segment_processors: &[HookStep],
+) -> Vec<PathBuf>
+where
+    F: FnMut(&SegmentInfo),
+{
+    let mut collected = Vec::new();
+    pin!(rx);
+    while let Some(event) = rx.next().await {
+        let mut paths = segment_paths(&event);
+        if !segment_processors.is_empty()
+            && let Err(e) = process_video_paths(&mut paths, segment_processors).await
+        {
+            error!(
+                file = ?event.prev_file_path,
+                "segment_processor failed, skipping segment without upload: {:?}", e
+            );
+            continue;
+        }
+        collected.extend(paths);
+    }
+    collected
+}
+
 async fn upload_single_file(file_path: &Path, context: &UploadContext) -> AppResult<Video> {
     let video_path = file_path;
     let UploadContext {
@@ -430,6 +455,38 @@ mod tests {
         assert_eq!(segment_paths(&event), vec![video, danmaku]);
     }
 
+    #[tokio::test]
+    async fn collect_processed_segment_paths_runs_processors_without_upload_config() {
+        let video = PathBuf::from("segment.mp4");
+        let event = SegmentInfo::new(video.clone(), None, None, 0);
+        let (tx, rx) = async_channel::bounded(1);
+        tx.send(event).await.unwrap();
+        drop(tx);
+
+        let processors = vec![HookStep::Remux {
+            remux: "mp4".into(),
+        }];
+        let paths = collect_processed_segment_paths(rx.inspect(|_| {}), &processors).await;
+
+        assert_eq!(paths, vec![video]);
+    }
+
+    #[tokio::test]
+    async fn collect_processed_segment_paths_skips_failed_processor_segment() {
+        let video = PathBuf::from("missing.ts");
+        let event = SegmentInfo::new(video, None, None, 0);
+        let (tx, rx) = async_channel::bounded(1);
+        tx.send(event).await.unwrap();
+        drop(tx);
+
+        let processors = vec![HookStep::Remux {
+            remux: "mp4".into(),
+        }];
+        let paths = collect_processed_segment_paths(rx.inspect(|_| {}), &processors).await;
+
+        assert!(paths.is_empty());
+    }
+
     const LIVE_URL: &str = "https://live.douyin.com/123456";
 
     #[test]
@@ -506,12 +563,13 @@ impl UActor {
                 let result = match ctx.upload_config() {
                     Some(config) => process_with_upload(inspect, &ctx, config).await,
                     None => {
-                        let mut paths = Vec::new();
-                        pin!(inspect);
-                        while let Some(event) = inspect.next().await {
-                            paths.extend(segment_paths(&event));
-                        }
-                        // 无上传配置时，直接执行后处理
+                        let segment_processors: Vec<HookStep> = ctx
+                            .live_streamer()
+                            .segment_processor
+                            .clone()
+                            .unwrap_or_default();
+                        let paths =
+                            collect_processed_segment_paths(inspect, &segment_processors).await;
                         execute_postprocessor(paths, &ctx).await
                     }
                 };
