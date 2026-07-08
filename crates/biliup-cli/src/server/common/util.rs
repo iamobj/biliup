@@ -173,7 +173,8 @@ pub fn parse_time(segment_time: &str) -> std::time::Duration {
 
 #[cfg(test)]
 mod tests {
-    use crate::server::common::util::media_ext_from_url;
+    use super::{FileValidator, media_ext_from_url};
+    use std::time::Duration;
 
     #[test]
     fn it_works() {
@@ -183,6 +184,31 @@ mod tests {
             ),
             Some("flv".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn validate_with_related_paths_removes_danmaku_when_video_filtered() {
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("segment.mp4");
+        let danmaku = dir.path().join("segment.xml");
+        std::fs::write(&video, b"video").unwrap();
+        std::fs::write(&danmaku, b"danmaku").unwrap();
+        let validator = FileValidator::new(20, true);
+
+        assert!(
+            validator
+                .validate_with_related_paths(&video, std::iter::once(danmaku.as_path()))
+                .is_err()
+        );
+
+        for _ in 0..50 {
+            if !video.exists() && !danmaku.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        panic!("filtered video and related danmaku were not removed");
     }
 }
 
@@ -214,22 +240,27 @@ impl Default for FileValidator {
 impl FileValidator {
     /// 验证文件有效性
     pub fn validate(&self, path: &Path) -> AppResult<()> {
+        self.validate_with_related_paths(path, std::iter::empty::<&Path>())
+    }
+
+    /// 验证文件有效性，并在过滤删除时同步删除关联文件
+    pub fn validate_with_related_paths<'a, I>(
+        &self,
+        path: &Path,
+        related_paths: I,
+    ) -> AppResult<()>
+    where
+        I: IntoIterator<Item = &'a Path>,
+    {
         let metadata = fs::metadata(path).change_context(AppError::Unknown)?;
 
         let size = metadata.len();
 
         if size < self.min_size {
-            let display = path.display();
-            let path = path.to_owned();
-            tokio::spawn(async move {
-                let Ok(()) = HookStep::remove_file(&[&path])
-                    .await
-                    .inspect_err(|e| error!(e=?e))
-                else {
-                    return;
-                };
-                info!("过滤删除 - {}", path.display());
-            });
+            let display = path.display().to_string();
+            let mut paths = vec![path.to_owned()];
+            paths.extend(related_paths.into_iter().map(Path::to_owned));
+            remove_filtered_files(paths);
             bail!(AppError::Custom(format!(
                 "File {display} too small: {size} bytes, minimum: {} bytes",
                 self.min_size
@@ -256,4 +287,18 @@ impl FileValidator {
             bail!(AppError::Custom("No file extension found".to_string()))
         }
     }
+}
+
+fn remove_filtered_files(paths: Vec<PathBuf>) {
+    tokio::spawn(async move {
+        for path in paths {
+            let Ok(()) = HookStep::remove_file(&[&path])
+                .await
+                .inspect_err(|e| error!(e=?e, file=?path, "过滤删除失败"))
+            else {
+                continue;
+            };
+            info!("过滤删除 - {}", path.display());
+        }
+    });
 }

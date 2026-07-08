@@ -14,7 +14,7 @@ use async_channel::Sender;
 use biliup::downloader::live::{LivePlugin, LiveStatus, LiveStream};
 use error_stack::ResultExt;
 use serde_json::json;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -64,7 +64,10 @@ impl SegmentEventProcessor {
     /// 处理分段事件
     pub fn process(&mut self, event: SegmentInfo) -> AppResult<()> {
         // 验证文件有效性
-        self.file_validator.validate(&event.prev_file_path)?;
+        self.file_validator.validate_with_related_paths(
+            &event.prev_file_path,
+            event.danmaku_file_path.iter().map(PathBuf::as_path),
+        )?;
 
         // 上一轮 process_with_upload 可能因上传失败提前返回，UActor 已 drop rx，
         // 这里挂着的 tx 是死的；丢弃后下面会重建一条新的管道。
