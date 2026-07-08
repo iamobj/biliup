@@ -15,6 +15,11 @@
   - 如配置了 `segment_processor`，会在无上传流程下照常执行。
   - 单个分段处理失败时只跳过该分段，不中断后续分段处理。
   - 成功处理后的路径会继续交给 `postprocessor`。
+- 修复录播分段时弹幕 XML 偶发丢失的问题。
+  - 弹幕 rolling 会先把当前 XML 落到分段目标路径，再创建下一段 writer，避免新 writer 与分段目标同名时被误删。
+  - 分段目标 XML 已存在时不会覆盖或删除已有文件，会保留当前文件并跳过该次分段弹幕输出。
+  - `ffmpeg` 内部分段不再对最后一个分段重复触发回调，避免同一视频段触发两次弹幕 rolling。
+  - 该调整不改动碎片过滤阈值和分段文件校验逻辑。
 
 这些调整主要面向只录制、不投稿，或需要用 Hook 接管分段后处理的场景。
 
@@ -70,4 +75,5 @@ git push origin HEAD
   - `crates/biliup-cli/src/server/common/download.rs`
   - `crates/biliup-cli/src/server/common/upload.rs`
   - `crates/biliup-cli/src/server/infrastructure/models/hook_step.rs`
-
+  - `crates/danmaku/src/client.rs`
+  - `crates/biliup-cli/src/server/core/downloader/ffmpeg_downloader.rs`

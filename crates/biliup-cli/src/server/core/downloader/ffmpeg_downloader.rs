@@ -260,7 +260,6 @@ impl FfmpegDownloader {
         // 异步读取stdout
         let mut reader = BufReader::new(stdout).lines();
         let mut segment_index = 0;
-        let mut prev_file_path: Option<PathBuf> = None;
 
         while let Some(line) = reader.next_line().await.change_context(AppError::Unknown)? {
             // 解析文件名
@@ -288,25 +287,8 @@ impl FfmpegDownloader {
             }));
 
             segment_index += 1;
-            prev_file_path = Some(file_path);
         }
         let status = spawn_log(child, &self.process_handle).await?;
-
-        if let Some(file_path) = prev_file_path {
-            // 重命名文件
-            let no_ext = file_path.with_extension("");
-            tokio::fs::rename(&file_path, &no_ext)
-                .await
-                .change_context(AppError::Unknown)?;
-            callback(SegmentEvent::Segment(SegmentInfo {
-                prev_file_path: no_ext,
-                danmaku_file_path: None,
-                next_file_path: None,
-                segment_index,
-                // start_time: std::time::SystemTime::now(),
-                // end_time: std::time::SystemTime::now(),
-            }));
-        }
 
         // 根据退出码判断状态
         match status.code() {

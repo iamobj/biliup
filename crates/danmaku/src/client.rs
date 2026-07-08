@@ -722,25 +722,32 @@ fn roll_writer(
     let current_path = xml_writer.file_path().to_path_buf();
     xml_writer.finalize()?;
     let current_exists = current_path.exists();
-    *xml_writer = XmlWriter::new(next_output_path(template), xml_config.clone())?;
 
-    if !current_exists {
-        return Ok(false);
-    }
+    let mut produced = current_exists;
 
-    if let Some(new_path) = new_file_name {
+    if current_exists
+        && let Some(new_path) = new_file_name
+    {
         if current_path != new_path {
-            if let Some(parent) = new_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
             if new_path.exists() {
-                fs::remove_file(&new_path)?;
+                warn!(
+                    current = %current_path.display(),
+                    target = %new_path.display(),
+                    "danmaku rolling target already exists; keeping current file"
+                );
+                produced = false;
+            } else {
+                if let Some(parent) = new_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::rename(current_path, new_path)?;
             }
-            fs::rename(current_path, new_path)?;
         }
     }
 
-    Ok(true)
+    *xml_writer = XmlWriter::new(next_output_path(template), xml_config.clone())?;
+
+    Ok(produced)
 }
 
 fn next_output_path(template: &Path) -> PathBuf {
@@ -803,6 +810,68 @@ mod tests {
         assert!(new_path.exists());
         let content = std::fs::read_to_string(&new_path).unwrap();
         assert!(content.contains("<i>"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rolling_creates_next_writer_after_renaming_current_xml() {
+        let dir = std::env::temp_dir().join(format!(
+            "danmaku-roll-collision-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let template = dir.join("segment");
+        let current_path = dir.join("current.xml");
+        let first_segment = dir.join("segment.xml");
+        let second_segment = dir.join("second.xml");
+        let config = XmlWriterConfig::default();
+        let mut writer = XmlWriter::new(&current_path, config.clone()).unwrap();
+
+        assert!(
+            roll_writer(&mut writer, &template, &config, Some(first_segment.clone())).unwrap()
+        );
+        assert!(first_segment.exists());
+        assert_ne!(writer.file_path(), first_segment.as_path());
+        assert!(writer.file_path().exists());
+
+        assert!(
+            roll_writer(&mut writer, &template, &config, Some(second_segment.clone())).unwrap()
+        );
+        assert!(first_segment.exists());
+        assert!(second_segment.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rolling_does_not_overwrite_existing_target_xml() {
+        let dir = std::env::temp_dir().join(format!(
+            "danmaku-roll-existing-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let template = dir.join("danmaku");
+        let current_path = dir.join("current.xml");
+        let existing_target = dir.join("segment.xml");
+        let config = XmlWriterConfig::default();
+        let mut writer = XmlWriter::new(&current_path, config.clone()).unwrap();
+        std::fs::write(&existing_target, "existing").unwrap();
+
+        assert!(
+            !roll_writer(
+                &mut writer,
+                &template,
+                &config,
+                Some(existing_target.clone())
+            )
+            .unwrap()
+        );
+
+        assert_eq!(std::fs::read_to_string(&existing_target).unwrap(), "existing");
+        assert!(current_path.exists());
+        assert!(writer.file_path().exists());
+        assert_ne!(writer.file_path(), current_path.as_path());
         let _ = std::fs::remove_dir_all(dir);
     }
 
