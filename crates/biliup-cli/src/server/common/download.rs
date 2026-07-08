@@ -14,6 +14,7 @@ use async_channel::Sender;
 use biliup::downloader::live::{LivePlugin, LiveStatus, LiveStream};
 use error_stack::ResultExt;
 use serde_json::json;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -266,12 +267,9 @@ impl DownloadTask {
                     // 分段时，获取到的是已下载的文件名
                     // 触发弹幕滚动保存
                     if let Some(ref client) = danmaku_client {
-                        let danmaku_file_path = event.prev_file_path.with_extension("xml");
-                        match client.rolling(&danmaku_file_path.display().to_string()) {
-                            Ok(true) => event.danmaku_file_path = Some(danmaku_file_path),
-                            Ok(false) => {}
-                            Err(e) => error!("Danmaku rolling error: {}", e),
-                        }
+                        attach_danmaku_file_path(&mut event, |danmaku_file_path| {
+                            client.rolling(&danmaku_file_path.display().to_string())
+                        });
                     }
                     // 异步处理事件
                     // let processor = processor.clone();
@@ -300,6 +298,25 @@ impl DownloadTask {
         self.downloader.stop().await?;
         self.done_notify.notified().await;
         Ok(())
+    }
+}
+
+fn attach_danmaku_file_path<F>(event: &mut SegmentInfo, rolling: F)
+where
+    F: FnOnce(&Path) -> Result<bool, Box<dyn std::error::Error>>,
+{
+    let danmaku_file_path = event.prev_file_path.with_extension("xml");
+    match rolling(&danmaku_file_path) {
+        Ok(true) => event.danmaku_file_path = Some(danmaku_file_path),
+        Ok(false) if danmaku_file_path.exists() => {
+            info!(
+                file = ?danmaku_file_path,
+                "danmaku rolling returned false but target exists; keeping it for postprocessor"
+            );
+            event.danmaku_file_path = Some(danmaku_file_path);
+        }
+        Ok(false) => {}
+        Err(e) => error!("Danmaku rolling error: {}", e),
     }
 }
 
@@ -392,5 +409,31 @@ mod tests {
         assert_eq!(payload["name"], "主播A");
         assert_eq!(payload["url"], "https://live.example/room");
         assert_eq!(payload["start_time"], 1_700_000_000);
+    }
+
+    #[test]
+    fn attach_danmaku_file_path_keeps_existing_xml_when_rolling_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("segment.mp4");
+        let danmaku = dir.path().join("segment.xml");
+        std::fs::write(&video, b"video").unwrap();
+        std::fs::write(&danmaku, b"danmaku").unwrap();
+        let mut event = SegmentInfo::new(video, None, None, 0);
+
+        attach_danmaku_file_path(&mut event, |_| Ok(false));
+
+        assert_eq!(event.danmaku_file_path, Some(danmaku));
+    }
+
+    #[test]
+    fn attach_danmaku_file_path_ignores_missing_xml_when_rolling_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("segment.mp4");
+        std::fs::write(&video, b"video").unwrap();
+        let mut event = SegmentInfo::new(video, None, None, 0);
+
+        attach_danmaku_file_path(&mut event, |_| Ok(false));
+
+        assert!(event.danmaku_file_path.is_none());
     }
 }
