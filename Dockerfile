@@ -1,10 +1,11 @@
-# Build biliup's web-ui
-FROM node:lts AS webui-builder
+# syntax=docker/dockerfile:1.7
+
+# Prepare biliup's source tree
+FROM node:lts AS source
 ARG repo_url=https://github.com/biliup/biliup
 ARG branch_name=master
 
 COPY . /biliup
-
 RUN set -eux; \
 	\
 	if [ ! -f /biliup/biliup.spec ]; then \
@@ -12,36 +13,46 @@ RUN set -eux; \
 	git clone --depth 1 --branch "$branch_name" "$repo_url" /biliup; \
 	fi;
 
+
+# Build biliup's web-ui
+FROM node:lts AS webui-builder
+
 WORKDIR /biliup
 
+COPY --from=source /biliup/package.json /biliup/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm \
+	set -eux; \
+	npm ci;
+
+COPY --from=source /biliup ./
 RUN set -eux; \
-	npm install; \
 	npm run build;
 
 
 # Build biliup's python wheel
 FROM rust:latest AS wheel-builder
-ARG repo_url=https://github.com/biliup/biliup
-ARG branch_name=master
 
-COPY . /biliup
-
-RUN set -eux; \
-	\
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+	--mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+	set -eux; \
 	apt-get update; \
-	apt-get install -y --no-install-recommends python3-pip g++ patchelf; \
-	pip3 install maturin --break-system-packages; \
-	if [ ! -f /biliup/biliup.spec ]; then \
-	rm -rf /biliup; \
-	git clone --depth 1 --branch "$branch_name" "$repo_url" /biliup; \
-	fi;
+	apt-get install -y --no-install-recommends python3-pip g++ patchelf;
 
-COPY --from=webui-builder /biliup/out /biliup/out
+RUN --mount=type=cache,target=/root/.cache/pip \
+	set -eux; \
+	pip3 install maturin --break-system-packages;
+
 
 WORKDIR /biliup
 
-RUN set -eux; \
-	maturin build --release;
+COPY --from=source /biliup ./
+COPY --from=webui-builder /biliup/out /biliup/out
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+	--mount=type=cache,target=/usr/local/cargo/git \
+	--mount=type=cache,target=/biliup/target \
+	set -eux; \
+	maturin build --release --out /tmp/wheels;
 
 
 # Deploy Biliup
@@ -55,17 +66,18 @@ EXPOSE 19159/tcp
 VOLUME /opt
 
 # 需要遵守 wheel 文件名规范
-COPY --from=wheel-builder /biliup/target/wheels/* /tmp/
+COPY --from=wheel-builder /tmp/wheels/* /tmp/
 
-RUN set -eux; \
+RUN --mount=type=cache,target=/root/.cache/pip \
+	set -eux; \
 	\
 	whl=$(ls /tmp/biliup*.whl); \
-	pip3 install --no-cache-dir "$whl"; \
-	# pip3 install --no-cache-dir "$whl[quickjs]"; \
-	pip3 cache purge; \
+	pip3 install "$whl"; \
+	# pip3 install "$whl[quickjs]"; \
 	rm -rf /tmp/*;
 
-RUN set -eux; \
+RUN --mount=type=cache,target=/root/.cache/pip \
+	set -eux; \
 	\
 	savedAptMark="$(apt-mark showmanual)"; \
 	useApt=false; \
@@ -112,7 +124,7 @@ RUN set -eux; \
 	fi; \
 	\
 	# 安装 quickjs 需要 g++
-	pip3 install --no-cache-dir quickjs; \
+	pip3 install quickjs; \
 	\
 	# Clean up \
 	[ -z "$savedAptMark" ] || apt-mark manual $savedAptMark; \
