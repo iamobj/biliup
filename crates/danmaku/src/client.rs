@@ -5,7 +5,10 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
@@ -89,11 +92,24 @@ enum RecorderCommand {
 pub struct RecorderHandle {
     cmd_tx: mpsc::Sender<RecorderCommand>,
     stop_tx: watch::Sender<bool>,
+    discard_current_on_stop: Arc<AtomicBool>,
 }
 
 impl RecorderHandle {
     /// Stop the recorder.
     pub async fn stop(&self) -> Result<()> {
+        self.stop_with_discard_current(false).await
+    }
+
+    /// Stop the recorder and remove the currently open output file.
+    pub async fn stop_and_discard_current(&self) -> Result<()> {
+        self.stop_with_discard_current(true).await
+    }
+
+    async fn stop_with_discard_current(&self, discard_current: bool) -> Result<()> {
+        if discard_current {
+            self.discard_current_on_stop.store(true, Ordering::SeqCst);
+        }
         let _ = self.stop_tx.send(true);
         let _ = self.cmd_tx.send(RecorderCommand::Stop).await;
         Ok(())
@@ -135,14 +151,16 @@ impl DanmakuRecorder {
     pub fn start(self) -> RecorderHandle {
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         let (stop_tx, stop_rx) = watch::channel(false);
+        let discard_current_on_stop = Arc::new(AtomicBool::new(false));
 
         let handle = RecorderHandle {
             cmd_tx,
             stop_tx: stop_tx.clone(),
+            discard_current_on_stop: discard_current_on_stop.clone(),
         };
 
         tokio::spawn(async move {
-            if let Err(e) = self.run(cmd_rx, stop_rx).await {
+            if let Err(e) = self.run(cmd_rx, stop_rx, discard_current_on_stop).await {
                 error!("Recorder error: {}", e);
             }
         });
@@ -155,6 +173,7 @@ impl DanmakuRecorder {
         self,
         mut cmd_rx: mpsc::Receiver<RecorderCommand>,
         mut stop_rx: watch::Receiver<bool>,
+        discard_current_on_stop: Arc<AtomicBool>,
     ) -> Result<()> {
         let platform_name = self.platform.name();
         info!(
@@ -224,16 +243,19 @@ impl DanmakuRecorder {
             }
         }
 
-        // Finish XML file
-        let has_messages = xml_writer.has_messages();
-        let final_path = xml_writer.finish()?;
-        if !has_messages {
-            let _ = fs::remove_file(&final_path);
+        let discard_current = discard_current_on_stop.load(Ordering::SeqCst);
+        let (final_path, _) = finish_xml_writer(xml_writer, discard_current)?;
+        if discard_current {
+            info!(
+                "{}: Recording finished. Discarded output: {:?}",
+                platform_name, final_path
+            );
+        } else {
+            info!(
+                "{}: Recording finished. Output: {:?}",
+                platform_name, final_path
+            );
         }
-        info!(
-            "{}: Recording finished. Output: {:?}",
-            platform_name, final_path
-        );
 
         Ok(())
     }
@@ -750,6 +772,16 @@ fn roll_writer(
     Ok(produced)
 }
 
+fn finish_xml_writer(xml_writer: XmlWriter, discard_current: bool) -> Result<(PathBuf, bool)> {
+    let has_messages = xml_writer.has_messages();
+    let final_path = xml_writer.finish()?;
+    let should_remove = discard_current || !has_messages;
+    if should_remove {
+        let _ = fs::remove_file(&final_path);
+    }
+    Ok((final_path, should_remove))
+}
+
 fn next_output_path(template: &Path) -> PathBuf {
     let output_path = format_output_path(template);
     if !output_path.exists() {
@@ -789,6 +821,7 @@ fn format_output_path(template: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::{ChatMessage, DanmakuEvent};
 
     #[test]
     fn rolling_without_messages_renames_current_xml() {
@@ -893,6 +926,29 @@ mod tests {
         assert!(roll_writer(&mut writer, &template, &config, Some(new_path.clone())).is_ok());
 
         assert!(!new_path.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn finish_xml_writer_discards_current_file_with_messages() {
+        let dir = std::env::temp_dir().join(format!(
+            "danmaku-finish-discard-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let output_path = dir.join("current.xml");
+        let config = XmlWriterConfig::default();
+        let mut writer = XmlWriter::new(&output_path, config).unwrap();
+        writer
+            .write_event(&DanmakuEvent::Chat(ChatMessage::new("tail".to_string())))
+            .unwrap();
+
+        let (final_path, removed) = finish_xml_writer(writer, true).unwrap();
+
+        assert_eq!(final_path, output_path);
+        assert!(removed);
+        assert!(!final_path.exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 

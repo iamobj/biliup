@@ -228,7 +228,7 @@ impl DanmakuClient for RustDanmakuClient {
         let handle = self.handle.lock().unwrap().take();
         if let Some(handle) = handle {
             handle
-                .stop()
+                .stop_and_discard_current()
                 .await
                 .map_err(|e| Report::new(AppError::Custom(e.to_string())))?;
         }
