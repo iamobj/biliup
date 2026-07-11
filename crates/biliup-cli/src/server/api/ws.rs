@@ -1,3 +1,4 @@
+use crate::server::logging::download_log_generation;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket};
 use axum::extract::{Query, WebSocketUpgrade};
 use serde::Deserialize;
@@ -38,6 +39,8 @@ async fn websocket_logs(mut ws: WebSocket, query: LogsQuery) {
     }
 
     let log_file = PathBuf::from(&file_param);
+    let watches_download_log = file_param == "download.log";
+    let mut log_generation = download_log_generation();
 
     // 发送初始内容（最后50行）并获取当前大小
     let mut file_size = match send_last_lines(&mut ws, &log_file, 50).await {
@@ -95,6 +98,31 @@ async fn websocket_logs(mut ws: WebSocket, query: LogsQuery) {
             }
 
             _ = tick.tick() => {
+                let current_generation = download_log_generation();
+                if watches_download_log && current_generation != log_generation {
+                    let _ = ws
+                        .send(Message::Text(Utf8Bytes::from(
+                            "日志文件已分割，重新加载...".to_string(),
+                        )))
+                        .await;
+                    match send_last_lines(&mut ws, &log_file, 50).await {
+                        Ok(size) => {
+                            file_size = size;
+                            log_generation = current_generation;
+                        }
+                        Err(e) => {
+                            let _ = ws
+                                .send(Message::Text(
+                                    format!("读取日志文件错误: {}", e).into(),
+                                ))
+                                .await;
+                            error!("读取日志文件错误: {}", e);
+                            break;
+                        }
+                    }
+                    continue;
+                }
+
                 // 文件是否存在
                 let meta = match fs::metadata(&log_file).await {
                     Ok(m) => m,

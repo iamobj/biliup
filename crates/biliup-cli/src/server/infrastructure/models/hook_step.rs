@@ -1,4 +1,5 @@
 use crate::server::errors::{AppError, AppResult};
+use crate::server::logging::download_log_writer;
 use error_stack::{ResultExt, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -242,16 +243,8 @@ impl HookStep {
 
         // 子命令输出可能是 GBK、UTF-8 或任意字节流。这里不能按文本解码，
         // 而是原样转发到控制台并追加到 Web 可查看的日志文件。
-        let stdout_task = tokio::spawn(Self::tee_command_output(
-            stdout,
-            tokio::io::stdout(),
-            "download.log",
-        ));
-        let stderr_task = tokio::spawn(Self::tee_command_output(
-            stderr,
-            tokio::io::stderr(),
-            "download.log",
-        ));
+        let stdout_task = tokio::spawn(Self::tee_command_output(stdout, tokio::io::stdout()));
+        let stderr_task = tokio::spawn(Self::tee_command_output(stderr, tokio::io::stderr()));
 
         let status = process.wait().await.change_context(AppError::Unknown)?;
         stdout_task.await.change_context(AppError::Unknown)??;
@@ -267,21 +260,12 @@ impl HookStep {
         Ok(())
     }
 
-    async fn tee_command_output<R, W>(
-        mut reader: R,
-        mut terminal: W,
-        log_file: &'static str,
-    ) -> AppResult<()>
+    async fn tee_command_output<R, W>(mut reader: R, mut terminal: W) -> AppResult<()>
     where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
-        let mut log = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_file)
-            .await
-            .change_context(AppError::Unknown)?;
+        let mut log = download_log_writer();
         let mut buf = [0; 8192];
         loop {
             let n = reader
@@ -295,12 +279,11 @@ impl HookStep {
                 .write_all(&buf[..n])
                 .await
                 .change_context(AppError::Unknown)?;
-            log.write_all(&buf[..n])
-                .await
+            std::io::Write::write_all(&mut log, &buf[..n])
                 .change_context(AppError::Unknown)?;
         }
         terminal.flush().await.change_context(AppError::Unknown)?;
-        log.flush().await.change_context(AppError::Unknown)?;
+        std::io::Write::flush(&mut log).change_context(AppError::Unknown)?;
         Ok(())
     }
 

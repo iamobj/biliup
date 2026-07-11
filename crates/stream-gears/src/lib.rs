@@ -22,6 +22,7 @@ use biliup::client::StatelessClient;
 use biliup::downloader::flv_parser::header;
 use biliup::downloader::httpflv::Connection;
 use biliup_cli::server::common::construct_headers;
+use biliup_cli::server::logging::download_log_writer;
 use pyo3::exceptions::PyRuntimeError;
 use tracing_subscriber::layer::SubscriberExt;
 
@@ -123,8 +124,7 @@ fn download_with_callback(
             // builds the subscriber.
             .with_timer(local_time.clone())
             .finish();
-        let file_appender = tracing_appender::rolling::never("", "download.log");
-        let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+        let (non_blocking, _guard) = tracing_appender::non_blocking(download_log_writer());
         let file_layer = tracing_subscriber::fmt::layer()
             .with_ansi(false)
             .with_timer(local_time)
