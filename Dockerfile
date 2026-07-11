@@ -71,14 +71,6 @@ COPY --from=wheel-builder /tmp/wheels/* /tmp/
 RUN --mount=type=cache,target=/root/.cache/pip \
 	set -eux; \
 	\
-	whl=$(ls /tmp/biliup*.whl); \
-	pip3 install "$whl"; \
-	# pip3 install "$whl[quickjs]"; \
-	rm -rf /tmp/*;
-
-RUN --mount=type=cache,target=/root/.cache/pip \
-	set -eux; \
-	\
 	savedAptMark="$(apt-mark showmanual)"; \
 	useApt=false; \
 	apt-get update; \
@@ -88,6 +80,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 		xz-utils \
 		g++ \
 	; \
+	whl=$(ls /tmp/biliup*.whl); \
+	pip3 install "$whl"; \
+	rm -f "$whl"; \
+	\
 	apt-mark auto '.*' > /dev/null; \
 	apt-mark manual curl wget; \
 	\
@@ -122,10 +118,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 			ffmpeg*; \
 		chmod a+x /usr/local/* ; \
 	fi; \
-	\
-	# 安装 quickjs 需要 g++
-	pip3 install quickjs; \
-	\
 	# Clean up \
 	[ -z "$savedAptMark" ] || apt-mark manual $savedAptMark; \
 	apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false; \
