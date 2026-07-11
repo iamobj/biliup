@@ -453,6 +453,7 @@ dependencies = [
  "nom 8.0.0",
  "ormlite",
  "password-auth",
+ "pyo3",
  "qrcode",
  "rand 0.8.5",
  "regex",

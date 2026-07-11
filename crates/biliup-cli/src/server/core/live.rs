@@ -6,6 +6,8 @@ use crate::server::core::downloader::ytdlp::{
     YouTubeDownloader as YtDlpDownloader,
 };
 use crate::server::core::downloader::{DownloaderRuntime, DownloaderType, RustDanmakuClient};
+#[cfg(feature = "python-bridge")]
+use crate::server::core::downloader::PythonDanmakuClient;
 use crate::server::infrastructure::context::Worker;
 use crate::server::infrastructure::models::StreamerInfo;
 use biliup::downloader::live::{
@@ -260,6 +262,19 @@ pub fn danmaku_client(
     name: &str,
 ) -> Option<Arc<dyn crate::server::core::downloader::DanmakuClient + Send + Sync>> {
     let source = source?;
+    let output_file = PathBuf::from(danmaku_filename_template(filename_prefix, name));
+
+    #[cfg(feature = "python-bridge")]
+    if source.platform == "douyin" {
+        return Some(Arc::new(PythonDanmakuClient::new(
+            source.url.clone(),
+            output_file,
+            source.room_id.clone(),
+            source.cookie.clone(),
+            source.extra.clone(),
+        )));
+    }
+
     let mut context = PlatformContext::new();
     if let Some(room_id) = &source.room_id {
         context = context.with_room_id(room_id.clone());
@@ -273,7 +288,7 @@ pub fn danmaku_client(
 
     let config = RecorderConfig::new(
         source.url.clone(),
-        PathBuf::from(danmaku_filename_template(filename_prefix, name)),
+        output_file,
     )
     .with_context(context)
     .with_raw(source.raw)

@@ -6,7 +6,10 @@ build-backend = "maturin"
 # "extension-module" tells pyo3 we want to build an extension module (skips linking against libpython.so)
 features = ["pyo3/extension-module"]
 # Include additional files
-#include = [ "biliup/web/public/**/*" ]
+include = [
+    "biliup/web/public/**/*",
+    "biliup/Danmaku/douyin_util/webmssdk.js",
+]
 #data = "biliup/web/public"
 python-packages = ["biliup"]
 manifest-path = "crates/stream-gears/Cargo.toml"
@@ -22,6 +25,9 @@ requires-python = ">= 3.9"
 dependencies = [
     "yt-dlp >= 2025.7.21",
     "aiohttp[speedups] >= 3.9.5",
+    "lxml >= 5.0.0",
+    "protobuf >= 4.23.0",
+    "quickjs >= 1.19.0",
     "Pillow >= 5.2.0",
     "requests >= 2.32.3",
     "streamlink >= 7.5.0",

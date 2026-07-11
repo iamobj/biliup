@@ -1,9 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all, copy_metadata
 
-datas = []
+datas = [('biliup/Danmaku/douyin_util/webmssdk.js', 'biliup/Danmaku/douyin_util/')]
 binaries = []
-hiddenimports = []
+hiddenimports = [
+    'biliup.Danmaku',
+    'biliup.Danmaku.douyin',
+    'biliup.Danmaku.douyin_util',
+    'biliup.Danmaku.douyin_util.dy_pb2',
+]
 tmp_ret = collect_all('biliup.plugins')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 # datas += copy_metadata('biliup')

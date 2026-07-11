@@ -20,6 +20,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+#[cfg(feature = "python-bridge")]
+use pyo3::prelude::*;
+#[cfg(feature = "python-bridge")]
+use pyo3::types::PyDict;
+
 /// 下载器配置
 /// 包含下载过程中需要的各种参数和设置
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -249,6 +254,118 @@ impl DanmakuClient for RustDanmakuClient {
             .map_err(Into::into);
         }
         Ok(false)
+    }
+}
+
+#[cfg(feature = "python-bridge")]
+pub struct PythonDanmakuClient {
+    url: String,
+    output_file: PathBuf,
+    room_id: Option<String>,
+    cookie: Option<String>,
+    extra: HashMap<String, String>,
+    client: Mutex<Option<Py<PyAny>>>,
+}
+
+#[cfg(feature = "python-bridge")]
+impl PythonDanmakuClient {
+    pub fn new(
+        url: String,
+        output_file: PathBuf,
+        room_id: Option<String>,
+        cookie: Option<String>,
+        extra: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            url,
+            output_file,
+            room_id,
+            cookie,
+            extra,
+            client: Mutex::new(None),
+        }
+    }
+
+    fn python_error(error: impl std::fmt::Display) -> Report<AppError> {
+        Report::new(AppError::Custom(format!("Python danmaku error: {error}")))
+    }
+}
+
+#[cfg(feature = "python-bridge")]
+#[async_trait]
+impl DanmakuClient for PythonDanmakuClient {
+    async fn download(&self) -> AppResult<()> {
+        let mut client = self.client.lock().map_err(Self::python_error)?;
+        if client.is_some() {
+            return Ok(());
+        }
+
+        let python_client = Python::attach(|py| -> PyResult<Py<PyAny>> {
+            let module = PyModule::import(py, "biliup.Danmaku")?;
+            let class = module.getattr("DanmakuClient")?;
+            let context = PyDict::new(py);
+            if let Some(room_id) = &self.room_id {
+                context.set_item("room_id", room_id)?;
+            }
+            if let Some(cookie) = &self.cookie {
+                context.set_item("cookie", cookie)?;
+            }
+            context.set_item(
+                "user_agent",
+                self.extra.get("user-agent").map(String::as_str).unwrap_or(""),
+            )?;
+            context.set_item(
+                "referer",
+                self.extra
+                    .get("referer")
+                    .map(String::as_str)
+                    .unwrap_or("https://live.douyin.com/"),
+            )?;
+
+            let instance = class.call1((
+                self.url.as_str(),
+                self.output_file.to_string_lossy().as_ref(),
+                context,
+            ))?;
+            instance.call_method0("start")?;
+            Ok(instance.unbind())
+        })
+        .map_err(Self::python_error)?;
+        *client = Some(python_client);
+        Ok(())
+    }
+
+    async fn stop(&self) -> AppResult<()> {
+        let client = self
+            .client
+            .lock()
+            .map_err(Self::python_error)?
+            .take();
+        if let Some(client) = client {
+            Python::attach(|py| -> PyResult<()> {
+                client.bind(py).call_method0("stop")?;
+                Ok(())
+            })
+            .map_err(Self::python_error)?;
+        }
+        Ok(())
+    }
+
+    fn rolling(&self, file_name: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        let client = self
+            .client
+            .lock()
+            .map_err(|_| "python danmaku client lock poisoned")?;
+        let Some(client) = client.as_ref() else {
+            return Ok(false);
+        };
+        Python::attach(|py| {
+            client
+                .bind(py)
+                .call_method1("save", (file_name,))?
+                .extract::<bool>()
+        })
+        .map_err(Into::into)
     }
 }
 

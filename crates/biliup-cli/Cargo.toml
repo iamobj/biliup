@@ -67,8 +67,8 @@ libc = "0.2.174"
 struct-patch = "0.10.4"
 shellexpand = "3.1"
 dirs = "6.0"
+pyo3 = { version = "0.27.1", features = ["abi3-py38"], optional = true }
 
 [features]
-default = []
-python-bridge = []
-
+default = ["python-bridge"]
+python-bridge = ["dep:pyo3"]
