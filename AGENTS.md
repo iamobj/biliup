@@ -11,9 +11,8 @@
   - 如配置了 `segment_processor`，会在无上传流程下照常执行。
   - 单个分段处理失败时只跳过该分段，不中断后续分段处理。
   - 成功处理后的路径会继续交给 `postprocessor`。
-- `download.log` 按 50 MiB 自动分割，保留当前文件和 2 份历史分片。
-  - 当前文件名固定为 `download.log`，历史文件依次为 `download.log.1` 和
-    `download.log.2`，其中 `.1` 为最新分片。
+- `download.log` 按 50 MiB 自动分割，保留当前文件和最新 1 份历史分片。
+  - 当前文件名固定为 `download.log`，历史文件为 `download.log.1`。
   - tracing 下载日志和 Hook 的 stdout/stderr 共用进程级写入器，避免并发轮转时
     覆盖归档或丢失输出。
   - Web 日志查看器仍只展示当前文件，并在轮转后重新加载最后 50 行。

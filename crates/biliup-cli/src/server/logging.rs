@@ -7,7 +7,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 const DOWNLOAD_LOG_PATH: &str = "download.log";
 const DOWNLOAD_LOG_MAX_BYTES: u64 = 50 * 1024 * 1024;
-const DOWNLOAD_LOG_BACKUPS: usize = 2;
+const DOWNLOAD_LOG_BACKUPS: usize = 1;
 
 static DOWNLOAD_LOG_WRITER: LazyLock<DownloadLogWriter> = LazyLock::new(|| {
     DownloadLogWriter::new(
@@ -120,6 +120,7 @@ impl RotatingFile {
         if self.backup_count == 0 {
             remove_if_exists(&self.path)?;
         } else {
+            remove_if_exists(&self.backup_path(self.backup_count + 1))?;
             for index in (1..=self.backup_count).rev() {
                 let destination = self.backup_path(index);
                 let source = if index == 1 {
@@ -224,6 +225,21 @@ mod tests {
         assert_eq!(read(&path.with_extension("log.2")), b"bcccc");
         assert!(!path.with_extension("log.3").exists());
         assert_eq!(writer.generation(), 3);
+    }
+
+    #[test]
+    fn download_log_keeps_only_latest_backup() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("download.log");
+        fs::write(path.with_extension("log.2"), b"stale").unwrap();
+        let mut writer = DownloadLogWriter::new(&path, 5, DOWNLOAD_LOG_BACKUPS);
+
+        writer.write_all(b"aaaaa").unwrap();
+        writer.write_all(b"b").unwrap();
+
+        assert_eq!(read(&path), b"b");
+        assert_eq!(read(&path.with_extension("log.1")), b"aaaaa");
+        assert!(!path.with_extension("log.2").exists());
     }
 
     #[test]
