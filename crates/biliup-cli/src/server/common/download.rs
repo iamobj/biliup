@@ -379,6 +379,7 @@ fn preprocessor_payload(streamer_info: &StreamerInfo) -> Vec<u8> {
     let payload = json!({
         "name": &streamer_info.name,
         "url": &streamer_info.url,
+        "title": &streamer_info.title,
         "start_time": streamer_info.date.timestamp(),
     });
     match serde_json::to_vec(&payload) {
@@ -411,6 +412,7 @@ mod tests {
 
         assert_eq!(payload["name"], "主播A");
         assert_eq!(payload["url"], "https://live.example/room");
+        assert_eq!(payload["title"], "直播标题");
         assert_eq!(payload["start_time"], 1_700_000_000);
     }
 

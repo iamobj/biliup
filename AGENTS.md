@@ -5,6 +5,7 @@
 - `preprocessor` Hook 在开始下载直播前执行时，会通过标准输入传入 JSON 数据：
   - `name`：主播名称
   - `url`：开播地址
+  - `title`：直播间标题
   - `start_time`：开播时间，Unix 秒级时间戳
 - `segment_processor` Hook 在没有配置投稿模板时仍会执行。
   - 每个分段事件都会先生成视频/弹幕路径列表。
