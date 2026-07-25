@@ -11,10 +11,10 @@ use crate::server::core::downloader::PythonDanmakuClient;
 use crate::server::infrastructure::context::Worker;
 use crate::server::infrastructure::models::StreamerInfo;
 use biliup::downloader::live::{
-    BilibiliOptions, CcOptions, DanmakuSource, DouyinOptions, DouyuOptions, DownloaderHint,
-    HuyaOptions, KilakilaOptions, KuaishouOptions, LiveCredentials, LiveOptions, LiveRequest,
-    LiveStream, RuntimeOptions, StreamlinkOptions, StreamlinkPlatform, TwitcastingOptions,
-    TwitchOptions, YoutubeOptions, YtDlpBackend, YtDlpOptions,
+    BatchCheckRequest, BilibiliOptions, CcOptions, DanmakuSource, DouyinOptions, DouyuOptions,
+    DownloaderHint, HuyaOptions, KilakilaOptions, KuaishouOptions, LiveCredentials, LiveOptions,
+    LiveRequest, LiveStream, RuntimeOptions, StreamlinkOptions, StreamlinkPlatform,
+    TwitcastingOptions, TwitchOptions, YoutubeOptions, YtDlpBackend, YtDlpOptions,
 };
 use danmaku_client::{PlatformContext, RecorderConfig};
 use std::path::PathBuf;
@@ -26,6 +26,17 @@ pub fn live_request(worker: &Worker) -> LiveRequest {
         client: worker.client.client.clone(),
         url: worker.get_streamer().url.clone(),
         name: worker.get_streamer().remark.clone(),
+        options: live_options(&config),
+        credentials: live_credentials(&config),
+    }
+}
+
+/// 以某个 worker 的客户端与配置为基础，构造同平台的批量检测请求。
+pub fn batch_check_request(worker: &Worker, urls: Vec<String>) -> BatchCheckRequest {
+    let config = worker.get_config();
+    BatchCheckRequest {
+        client: worker.client.client.clone(),
+        urls,
         options: live_options(&config),
         credentials: live_credentials(&config),
     }
@@ -80,18 +91,19 @@ fn live_options(config: &Config) -> LiveOptions {
         },
         huya: HuyaOptions {
             cdn: config.huya_cdn.clone().unwrap_or_default(),
+            cdn_fallback: config.huya_cdn_fallback.unwrap_or(false),
             max_ratio: config.huya_max_ratio.unwrap_or(0),
             protocol: config
                 .huya_protocol
                 .clone()
                 .unwrap_or_else(|| "Flv".to_string()),
             imgplus: config.huya_imgplus.unwrap_or(true),
+            mobile_api: config.huya_mobile_api.unwrap_or(false),
             codec: config
                 .huya_codec
                 .clone()
                 .unwrap_or_else(|| "264".to_string()),
             danmaku: config.huya_danmaku.unwrap_or(false),
-            mobile_api: config.huya_mobile_api.unwrap_or(false),
             use_wup: config.huya_use_wup.unwrap_or(true),
         },
         kilakila: KilakilaOptions {
@@ -172,6 +184,20 @@ pub fn downloader_runtime(
 
     match downloader_type {
         DownloaderType::Streamlink => streamlink_runtime(stream),
+        // Twitch 指定 ffmpeg 时也走 streamlink：Python 版 ffmpeg 消费的是
+        // streamlink --player-external-http 的代理输出（twitch.py:114-144），
+        // 去广告与 OAuth 鉴权都由 streamlink 完成，直连 usher 直链会丢掉这两项
+        DownloaderType::Ffmpeg
+            if matches!(
+                stream.runtime_options.as_ref(),
+                Some(RuntimeOptions::Streamlink(StreamlinkOptions {
+                    platform: StreamlinkPlatform::Twitch { .. },
+                    ..
+                }))
+            ) =>
+        {
+            streamlink_runtime(stream)
+        }
         DownloaderType::YtDlp | DownloaderType::Ytarchive => ytdlp_runtime(stream, downloader_type),
         _ => DownloaderRuntime::from_type(downloader_type),
     }
@@ -183,6 +209,11 @@ fn streamlink_runtime(stream: &LiveStream) -> DownloaderRuntime {
             url.clone().unwrap_or_else(|| stream.raw_stream_url.clone()),
             streamlink_platform(platform),
         ),
+        // yt-dlp 型来源（如 YouTube）交给 streamlink 时，传入网页地址让其自行提取，
+        // 而非已解析的 manifest 直链（对齐 youtube.py:96-101）
+        Some(RuntimeOptions::YtDlp(options)) if !options.webpage_url.is_empty() => {
+            (options.webpage_url.clone(), Platform::Generic)
+        }
         _ => (stream.raw_stream_url.clone(), Platform::Generic),
     };
     let downloader =

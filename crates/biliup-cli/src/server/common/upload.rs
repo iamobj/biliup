@@ -87,6 +87,23 @@ where
     Ok(())
 }
 
+async fn process_without_upload<F>(
+    rx: Inspect<Receiver<SegmentInfo>, F>,
+    ctx: &Context,
+) -> AppResult<()>
+where
+    F: FnMut(&SegmentInfo),
+{
+    // Noop 上传与“无投稿模板”一致：仍执行 segment_processor，仅跳过实际上传。
+    let segment_processors: Vec<HookStep> = ctx
+        .live_streamer()
+        .segment_processor
+        .clone()
+        .unwrap_or_default();
+    let paths = collect_processed_segment_paths(rx, &segment_processors).await;
+    execute_postprocessor(paths, ctx).await
+}
+
 async fn initialize_upload_context(
     config: &Config,
     client: &StatelessClient,
@@ -279,6 +296,10 @@ pub async fn submit_to_bilibili(
     let result = match submit_option {
         SubmitOption::BCutAndroid => bilibili
             .submit_by_bcut_android(studio, None)
+            .await
+            .change_context(AppError::Unknown)?,
+        SubmitOption::Web => bilibili
+            .submit_by_web(studio, None)
             .await
             .change_context(AppError::Unknown)?,
         _ => bilibili
@@ -561,6 +582,13 @@ impl UActor {
                     });
                 });
                 let result = match ctx.upload_config() {
+                    Some(config) if config.is_noop_uploader() => {
+                        info!(
+                            uploader = ?config.uploader,
+                            "Skipping upload because uploader is Noop"
+                        );
+                        process_without_upload(inspect, &ctx).await
+                    }
                     Some(config) => process_with_upload(inspect, &ctx, config).await,
                     None => {
                         let segment_processors: Vec<HookStep> = ctx

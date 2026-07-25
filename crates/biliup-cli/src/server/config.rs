@@ -122,12 +122,12 @@ pub struct Config {
     /// 虎牙是否保留 imgplus 流名
     #[serde(default)]
     pub huya_imgplus: Option<bool>,
+    /// 虎牙走小程序 API 获取房间信息
+    #[serde(default)]
+    pub huya_mobile_api: Option<bool>,
     /// 虎牙编码参数
     #[serde(default)]
     pub huya_codec: Option<String>,
-    /// 虎牙使用移动端 API 获取房间信息
-    #[serde(default)]
-    pub huya_mobile_api: Option<bool>,
     /// 虎牙使用 WUP 协议获取流 token
     #[serde(default)]
     pub huya_use_wup: Option<bool>,

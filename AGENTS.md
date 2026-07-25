@@ -10,6 +10,7 @@
 - `segment_processor` Hook 在没有配置投稿模板时仍会执行。
   - 每个分段事件都会先生成视频/弹幕路径列表。
   - 如配置了 `segment_processor`，会在无上传流程下照常执行。
+  - `uploader=Noop` 与无投稿模板一致：跳过实际上传，但仍执行 `segment_processor`。
   - 单个分段处理失败时只跳过该分段，不中断后续分段处理。
   - 成功处理后的路径会继续交给 `postprocessor`。
 - `download.log` 按 50 MiB 自动分割，保留当前文件和最新 1 份历史分片。
@@ -24,13 +25,14 @@
   - `ffmpeg` 内部分段不再对最后一个分段重复触发回调，避免同一视频段触发两次弹幕 rolling。
   - 下播或重试结束时会丢弃 rolling 后新开的尾部 XML，避免没有对应视频分段的弹幕文件残留。
   - 分段被碎片过滤阈值删除时，会同步删除已关联的弹幕 XML；未开启弹幕录制时仍只删除视频分段。
-- 虎牙取流默认对齐 DanmakuRender：通过 WUP `getCdnTokenInfoEx` 获取 `sFlvToken` 后再生成 anticode。
-  - 新增 `crates/biliup/src/downloader/live/huya_wup.rs` 实现本地最小 TARS/WUP 编解码，不依赖 `danmaku` crate。
+- 虎牙取流以上游 WUP 基线为主，并额外保留本仓可关闭开关与下载头：
+  - `huya_wup.rs` 采用上游最小 TARS/WUP 编解码；请求逻辑在 `huya.rs`。
   - 同一场次 anticode 只计算一次并缓存复用到各 CDN；签名使用 `lPresenterUid`。
-  - `huya_use_wup` 默认 `true`；关闭后回退页面 anti_code。
+  - `huya_use_wup` 默认 `true`；关闭后回退页面 anti_code + `lPresenterUid` 重建。
   - 仅当 `huya_mobile_api && huya_imgplus` 时保留页面/API 原始 anti_code。
-  - 走 WUP 时下载头会带 WUP UA。
-  - 保留本仓 `huya_cdn`、`huya_max_ratio`、`huya_imgplus` 以及过滤 `HY/HUYA/HYZJ`。
+  - `use_wup=true` 且走 WUP 时，`LiveStream.stream_headers` 会带 WUP UA。
+  - 保留上游 room_id 缓存、CDN 健康检查回退、回放标题过滤，以及本仓 `huya_cdn`、
+    `huya_max_ratio`、`huya_imgplus` 与 `HY/HUYA/HYZJ` 过滤。
   - 主播配置覆写里的布尔开关（如 `huya_use_wup=false`）必须从 `entity.override` 回填，不能只读顶层字段后回退默认值。
 - 抖音弹幕默认使用基于 `v1.0.7` 恢复的 Python 链路，而不是
   `crates/danmaku/src/protocols/douyin.rs` 中的 Rust 协议实现。
@@ -46,7 +48,7 @@
 
 ## 同步上游注意事项
 
-- 优先保留本仓库的 Hook 行为调整，尤其是 `preprocessor` 输入 JSON 和无投稿模板时执行 `segment_processor`。
+- 优先保留本仓库的 Hook 行为调整，尤其是 `preprocessor` 输入 JSON，以及无投稿模板/`uploader=Noop` 时执行 `segment_processor`。
 - 上游如改动下载、上传、Hook、配置导入相关代码，同步后需要重点检查：
   - `crates/biliup-cli/src/server/common/download.rs`
   - `crates/biliup-cli/src/server/common/upload.rs`
