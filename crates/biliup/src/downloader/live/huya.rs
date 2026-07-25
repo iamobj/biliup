@@ -2,6 +2,7 @@ use super::{
     DanmakuSource, DownloaderHint, LiveError, LivePlugin, LiveRequest, LiveResult, LiveStatus,
     LiveStream, media_ext_from_url,
 };
+use super::huya_wup::{self, WUP_UA};
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -15,7 +16,20 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const HUYA_WEB_BASE_URL: &str = "https://www.huya.com";
+const HUYA_MP_BASE_URL: &str = "https://mp.huya.com";
 const HUYA_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+const PLATFORMS: &[(&str, &str)] = &[
+    ("huya_pc_exe", "0"),
+    ("huya_adr", "2"),
+    ("huya_ios", "3"),
+    ("tv_huya_nftv", "10"),
+    ("huya_webh5", "100"),
+    ("huya_live", "100"),
+    ("tars_mp", "102"),
+    ("tars_mobile", "103"),
+    ("huya_liveshareh5", "104"),
+];
 
 pub struct Huya {
     re: Regex,
@@ -60,6 +74,8 @@ struct HuyaLive {
     huya_imgplus: bool,
     huya_codec: String,
     huya_danmaku: bool,
+    huya_mobile_api: bool,
+    huya_use_wup: bool,
 }
 
 impl HuyaLive {
@@ -75,12 +91,13 @@ impl HuyaLive {
             huya_imgplus: options.imgplus,
             huya_codec: options.codec,
             huya_danmaku: options.danmaku,
+            huya_mobile_api: options.mobile_api,
+            huya_use_wup: options.use_wup,
         }
     }
 
     async fn check_stream(&self) -> LiveResult<LiveStatus> {
-        let page = self.get_room_page().await?;
-        let Some(profile) = self.extract_room_profile(&page)? else {
+        let Some(profile) = self.get_room_profile().await? else {
             return Ok(LiveStatus::Offline);
         };
 
@@ -92,8 +109,13 @@ impl HuyaLive {
             return Ok(LiveStatus::Offline);
         }
 
-        let stream_urls = self.build_stream_urls(&profile.stream_info)?;
+        let stream_urls = self.build_stream_urls(&profile.stream_info).await?;
         let raw_stream_url = self.select_stream_url(&stream_urls, &profile)?;
+        let stream_headers = if self.should_use_wup() {
+            HashMap::from([("User-Agent".to_string(), WUP_UA.to_string())])
+        } else {
+            HashMap::new()
+        };
 
         Ok(LiveStatus::Live {
             stream: Box::new(LiveStream {
@@ -106,7 +128,7 @@ impl HuyaLive {
                     .unwrap_or_else(|| self.huya_protocol.extension().to_string()),
                 raw_stream_url,
                 platform: "huya".to_string(),
-                stream_headers: HashMap::new(),
+                stream_headers,
                 danmaku: self.danmaku_source(),
                 downloader_hint: DownloaderHint::StreamGears,
                 runtime_options: None,
@@ -114,15 +136,26 @@ impl HuyaLive {
         })
     }
 
-    async fn get_room_page(&self) -> LiveResult<String> {
-        let room_id = self
-            .url
+    fn room_id(&self) -> LiveResult<&str> {
+        self.url
             .split("huya.com/")
             .nth(1)
             .and_then(|part| part.split('?').next())
             .filter(|part| !part.is_empty())
-            .ok_or_else(|| LiveError::custom("虎牙直播间地址错误"))?;
+            .ok_or_else(|| LiveError::custom("虎牙直播间地址错误"))
+    }
 
+    async fn get_room_profile(&self) -> LiveResult<Option<HuyaRoomProfile>> {
+        if self.huya_mobile_api {
+            self.get_room_profile_from_api().await
+        } else {
+            let page = self.get_room_page().await?;
+            self.extract_room_profile_from_page(&page)
+        }
+    }
+
+    async fn get_room_page(&self) -> LiveResult<String> {
+        let room_id = self.room_id()?;
         let text = self
             .client
             .get(format!("{HUYA_WEB_BASE_URL}/{room_id}"))
@@ -135,14 +168,50 @@ impl HuyaLive {
             .await
             .map_err(|err| LiveError::custom(format!("读取虎牙直播间页面失败: {err}")))?;
 
-        if text.contains("找不到这个主播") || text.contains("该主播涉嫌违规，正在整改中")
-        {
+        if text.contains("找不到这个主播") || text.contains("该主播涉嫌违规，正在整改中") {
             return Err(LiveError::custom("虎牙直播间不可用"));
         }
         Ok(decode_html_entities(&text))
     }
 
-    fn extract_room_profile(&self, page: &str) -> LiveResult<Option<HuyaRoomProfile>> {
+    async fn get_room_profile_from_api(&self) -> LiveResult<Option<HuyaRoomProfile>> {
+        let room_id = self.room_id()?;
+        let text = self
+            .client
+            .get(format!("{HUYA_MP_BASE_URL}/cache.php"))
+            .query(&[
+                ("m", "Live"),
+                ("do", "profileRoom"),
+                ("roomid", room_id),
+                ("showSecret", "1"),
+            ])
+            .header("user-agent", HUYA_USER_AGENT)
+            .send()
+            .await
+            .map_err(|err| LiveError::custom(format!("获取虎牙移动端房间信息失败: {err}")))?
+            .text()
+            .await
+            .map_err(|err| LiveError::custom(format!("读取虎牙移动端房间信息失败: {err}")))?;
+
+        let decoded = decode_html_entities(&text);
+        let root: Value = serde_json::from_str(&decoded)
+            .map_err(|err| LiveError::custom(format!("解析虎牙移动端房间信息失败: {err}")))?;
+        let status = root
+            .get("status")
+            .and_then(|status| status.as_i64())
+            .unwrap_or_default();
+        if status != 200 {
+            let message = root
+                .get("message")
+                .and_then(|message| message.as_str())
+                .unwrap_or("未知错误");
+            return Err(LiveError::custom(format!("虎牙移动端接口错误: {message}")));
+        }
+
+        self.extract_room_profile_from_api(&root)
+    }
+
+    fn extract_room_profile_from_page(&self, page: &str) -> LiveResult<Option<HuyaRoomProfile>> {
         let room_data = extract_json_after(page, r"var\s+TT_ROOM_DATA\s*=\s*", ';')?;
         let room_state = room_data
             .get("state")
@@ -197,8 +266,62 @@ impl HuyaLive {
         }))
     }
 
-    fn build_stream_urls(&self, streams_info: &[Value]) -> LiveResult<Vec<(String, String)>> {
+    fn extract_room_profile_from_api(&self, root: &Value) -> LiveResult<Option<HuyaRoomProfile>> {
+        let data = root
+            .get("data")
+            .ok_or_else(|| LiveError::custom("虎牙移动端 data 为空"))?;
+        let live_status = data
+            .get("liveStatus")
+            .and_then(|status| status.as_str())
+            .unwrap_or_default();
+        let live_data = data.get("liveData").cloned().unwrap_or(Value::Null);
+        let bitrate_raw = live_data
+            .get("bitRateInfo")
+            .and_then(|info| info.as_str())
+            .unwrap_or_default();
+        if live_status != "ON" || bitrate_raw.is_empty() {
+            return Ok(None);
+        }
+
+        let bitrate_info: Vec<Value> = serde_json::from_str(bitrate_raw)
+            .map_err(|err| LiveError::custom(format!("解析虎牙码率信息失败: {err}")))?;
+        let stream_info = data
+            .get("stream")
+            .and_then(|stream| stream.get("baseSteamInfoList"))
+            .and_then(|info| info.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if stream_info.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(HuyaRoomProfile {
+            title: live_data
+                .get("introduction")
+                .and_then(|title| title.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            cover: live_data
+                .get("screenshot")
+                .and_then(|cover| cover.as_str())
+                .unwrap_or_default()
+                .replace("http://", "https://"),
+            max_bitrate: live_data
+                .get("bitRate")
+                .and_then(|bitrate| bitrate.as_u64())
+                .unwrap_or_default() as u32,
+            bitrate_info,
+            stream_info,
+        }))
+    }
+
+    fn should_use_wup(&self) -> bool {
+        should_use_wup(self.huya_mobile_api, self.huya_imgplus, self.huya_use_wup)
+    }
+
+    async fn build_stream_urls(&self, streams_info: &[Value]) -> LiveResult<Vec<(String, String)>> {
         let mut streams = Vec::new();
+        let mut cached_anticode: Option<String> = None;
 
         for stream in streams_info {
             let priority = stream
@@ -212,14 +335,37 @@ impl HuyaLive {
             let stream_name = self.get_stream_name(json_str(stream, "sStreamName")?);
             let cdn = json_str(stream, "sCdnType")?.to_string();
             let suffix = json_str(stream, self.huya_protocol.suffix_key())?;
-            let anti_code = json_str(stream, self.huya_protocol.anticode_key())?;
             let base_url =
                 json_str(stream, self.huya_protocol.url_key())?.replace("http://", "https://");
-            let anti_code = build_anticode(&stream_name, anti_code)?;
-            let url = format!(
-                "{base_url}/{stream_name}.{suffix}?{anti_code}&codec={}",
-                self.huya_codec
-            );
+
+            if cached_anticode.is_none() {
+                let anti_code = if self.should_use_wup() {
+                    let token =
+                        huya_wup::get_cdn_token_info_ex(&self.client, &stream_name).await?;
+                    let presenter_uid = stream
+                        .get("lPresenterUid")
+                        .and_then(|uid| uid.as_u64())
+                        .unwrap_or_default();
+                    build_anticode(&stream_name, &token, Some(presenter_uid))?
+                } else {
+                    let page_anti_code = json_str(stream, self.huya_protocol.anticode_key())?;
+                    if self.huya_mobile_api && self.huya_imgplus {
+                        page_anti_code.to_string()
+                    } else {
+                        let presenter_uid = stream
+                            .get("lPresenterUid")
+                            .and_then(|uid| uid.as_u64())
+                            .unwrap_or_default();
+                        build_anticode(&stream_name, page_anti_code, Some(presenter_uid))?
+                    }
+                };
+                cached_anticode = Some(format!("{anti_code}&codec={}", self.huya_codec));
+            }
+
+            let anti_code = cached_anticode
+                .as_ref()
+                .ok_or_else(|| LiveError::custom("虎牙 anticode 生成失败"))?;
+            let url = format!("{base_url}/{stream_name}.{suffix}?{anti_code}");
             streams.push((cdn, priority, url));
         }
 
@@ -309,7 +455,11 @@ enum HuyaProtocol {
 
 impl HuyaProtocol {
     fn from_config(value: &str) -> Self {
-        if value == "Hls" { Self::Hls } else { Self::Flv }
+        if value == "Hls" {
+            Self::Hls
+        } else {
+            Self::Flv
+        }
     }
 
     fn url_key(&self) -> &'static str {
@@ -412,32 +562,53 @@ fn find_json_value_end(input: &str, start: usize) -> Option<usize> {
     None
 }
 
-fn build_anticode(stream_name: &str, anti_code: &str) -> LiveResult<String> {
+
+fn should_use_wup(mobile_api: bool, imgplus: bool, use_wup: bool) -> bool {
+    // Align with historical biliup: mobile API + imgplus keeps raw anti_code.
+    if mobile_api && imgplus {
+        return false;
+    }
+    use_wup
+}
+
+fn build_anticode(
+    stream_name: &str,
+    anti_code: &str,
+    uid: Option<u64>,
+) -> LiveResult<String> {
     let query = serde_urlencoded::from_str::<HashMap<String, String>>(anti_code)
         .map_err(|err| LiveError::custom(format!("解析虎牙防盗链参数失败: {err}")))?;
-    let Some(fm) = query.get("fm") else {
+    if !query.contains_key("fm") {
         return Ok(anti_code.to_string());
-    };
+    }
 
-    let ctype = query
-        .get("ctype")
-        .cloned()
-        .unwrap_or_else(|| "huya_live".to_string());
-    let platform_id = query.get("t").cloned().unwrap_or_else(|| "100".to_string());
-    let uid = generate_random_uid();
+    let (ctype, platform_id) = resolve_platform(&query);
+    let is_wap = platform_id == "103";
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|err| LiveError::custom(format!("获取系统时间失败: {err}")))?;
     let now_secs = now.as_secs();
-    let seq_id = uid + now.as_millis() as u64;
+    let now_millis = now.as_millis() as u64;
+
+    let uid = match uid {
+        Some(value) if value > 0 => value,
+        _ => generate_random_uid(),
+    };
+    let seq_id = uid + now_millis;
     let secret_hash = md5_hex(format!("{seq_id}|{ctype}|{platform_id}"));
     let convert_uid = rotl64(uid);
-    let fm = urlencoding::decode(fm)
+    let calc_uid = if is_wap { uid } else { convert_uid };
+
+    let fm = query
+        .get("fm")
+        .cloned()
+        .ok_or_else(|| LiveError::custom("虎牙 fm 为空"))?;
+    let fm_decoded = urlencoding::decode(&fm)
         .map_err(|err| LiveError::custom(format!("解码虎牙 fm 参数失败: {err}")))?
         .to_string();
     let secret_prefix = String::from_utf8(
         STANDARD
-            .decode(fm.as_bytes())
+            .decode(fm_decoded.as_bytes())
             .map_err(|err| LiveError::custom(format!("解码虎牙 fm base64 失败: {err}")))?,
     )
     .map_err(|err| LiveError::custom(format!("虎牙 fm 参数不是 UTF-8: {err}")))?
@@ -450,21 +621,76 @@ fn build_anticode(stream_name: &str, anti_code: &str) -> LiveResult<String> {
         .get("wsTime")
         .cloned()
         .ok_or_else(|| LiveError::custom("虎牙 wsTime 为空"))?;
+    // DMR: if int(ws_time,16) - now < 20min, renew to now+1day
     if u64::from_str_radix(&ws_time, 16).unwrap_or_default() < now_secs + 20 * 60 {
         ws_time = format!("{:x}", now_secs + 24 * 60 * 60);
     }
 
-    let secret_str = format!("{secret_prefix}_{convert_uid}_{stream_name}_{secret_hash}_{ws_time}");
+    let secret_str = format!("{secret_prefix}_{calc_uid}_{stream_name}_{secret_hash}_{ws_time}");
     let ws_secret = md5_hex(secret_str);
     let fs = query
         .get("fs")
         .cloned()
         .unwrap_or_else(|| "bgct".to_string());
-    let fm = urlencoding::encode(query.get("fm").map(String::as_str).unwrap_or_default());
+    let fm_encoded = urlencoding::encode(&fm);
 
-    Ok(format!(
-        "wsSecret={ws_secret}&wsTime={ws_time}&seqid={seq_id}&ctype={ctype}&ver=1&fs={fs}&fm={fm}&t={platform_id}&u={convert_uid}"
-    ))
+    let mut parts = vec![
+        format!("wsSecret={ws_secret}"),
+        format!("wsTime={ws_time}"),
+        format!("seqid={seq_id}"),
+        format!("ctype={ctype}"),
+        "ver=1".to_string(),
+        format!("fs={fs}"),
+        format!("fm={fm_encoded}"),
+        format!("t={platform_id}"),
+    ];
+
+    if is_wap {
+        let mut rng = rand::thread_rng();
+        let ws_time_num = u64::from_str_radix(&ws_time, 16).unwrap_or(now_secs);
+        let ct = ((ws_time_num as f64 + rng.r#gen::<f64>()) * 1000.0) as u64;
+        let uuid = ((((ct as f64 % 1e10) + rng.r#gen::<f64>()) * 1e3) as u64 % 0xffff_ffff) as u32;
+        parts.push(format!("uid={uid}"));
+        parts.push(format!("uuid={uuid}"));
+    } else {
+        parts.push(format!("u={convert_uid}"));
+    }
+
+    Ok(parts.join("&"))
+}
+
+fn resolve_platform(query: &HashMap<String, String>) -> (String, String) {
+    match (query.get("ctype"), query.get("t")) {
+        (Some(ctype), Some(platform_id)) if !ctype.is_empty() && !platform_id.is_empty() => {
+            (ctype.clone(), platform_id.clone())
+        }
+        (Some(ctype), _) if !ctype.is_empty() => {
+            let platform_id = platform_id_for_ctype(ctype).unwrap_or_else(|| "100".to_string());
+            (ctype.clone(), platform_id)
+        }
+        _ => random_platform(),
+    }
+}
+
+fn platform_id_for_ctype(ctype: &str) -> Option<String> {
+    let upper = ctype.to_ascii_uppercase();
+    PLATFORMS
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(&upper) || name.to_ascii_uppercase() == upper)
+        .map(|(_, id)| (*id).to_string())
+        .or_else(|| {
+            // Accept exact enum-style names.
+            PLATFORMS
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(ctype))
+                .map(|(_, id)| (*id).to_string())
+        })
+}
+
+fn random_platform() -> (String, String) {
+    let mut rng = rand::thread_rng();
+    let (name, id) = PLATFORMS[rng.gen_range(0..PLATFORMS.len())];
+    (name.to_string(), id.to_string())
 }
 
 fn json_str<'a>(value: &'a Value, key: &str) -> LiveResult<&'a str> {
@@ -511,6 +737,11 @@ fn decode_html_entities(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::STANDARD;
+
+    fn sample_fm() -> String {
+        STANDARD.encode("secret_prefix_rest")
+    }
 
     #[test]
     fn extract_stream_json_stops_before_player_config_closing_brace() {
@@ -552,5 +783,65 @@ mod tests {
 
         assert_eq!(value["text"], "}; { ]");
         assert_eq!(value["items"][0]["value"], 1);
+    }
+
+    #[test]
+    fn build_anticode_without_fm_returns_original() {
+        let anti = "wsSecret=abc&wsTime=1";
+        let out = build_anticode("stream", anti, Some(1234)).unwrap();
+        assert_eq!(out, anti);
+    }
+
+    #[test]
+    fn build_anticode_pc_includes_u_and_convert_uid() {
+        let fm = sample_fm();
+        let anti = format!(
+            "fm={}&fs=bgct&ctype=huya_live&t=100&wsTime={:x}",
+            urlencoding::encode(&fm),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600
+        );
+        let uid = 12345678u64;
+        let out = build_anticode("demo-stream", &anti, Some(uid)).unwrap();
+        let convert_uid = rotl64(uid);
+        assert!(out.contains(&format!("u={convert_uid}")));
+        assert!(!out.contains("uuid="));
+        assert!(out.contains("ctype=huya_live"));
+        assert!(out.contains("t=100"));
+        assert!(out.contains("wsSecret="));
+    }
+
+    #[test]
+    fn build_anticode_wap_includes_uid_uuid() {
+        let fm = sample_fm();
+        let anti = format!(
+            "fm={}&fs=bgct&ctype=tars_mobile&t=103&wsTime={:x}",
+            urlencoding::encode(&fm),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600
+        );
+        let uid = 12345678u64;
+        let out = build_anticode("demo-stream", &anti, Some(uid)).unwrap();
+        assert!(out.contains(&format!("uid={uid}")));
+        assert!(out.contains("uuid="));
+        assert!(!out.contains("u="));
+    }
+
+    #[test]
+    fn should_use_wup_false_for_mobile_api_imgplus() {
+        assert!(!should_use_wup(true, true, true));
+    }
+
+    #[test]
+    fn should_use_wup_respects_flag_when_not_mobile_imgplus() {
+        assert!(!should_use_wup(false, true, false));
+        assert!(should_use_wup(false, true, true));
+        assert!(should_use_wup(true, false, true));
     }
 }

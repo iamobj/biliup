@@ -125,6 +125,12 @@ pub struct Config {
     /// 虎牙编码参数
     #[serde(default)]
     pub huya_codec: Option<String>,
+    /// 虎牙使用移动端 API 获取房间信息
+    #[serde(default)]
+    pub huya_mobile_api: Option<bool>,
+    /// 虎牙使用 WUP 协议获取流 token
+    #[serde(default)]
+    pub huya_use_wup: Option<bool>,
 
     // 抖音平台设置
     /// 抖音弹幕录制
@@ -595,6 +601,26 @@ mod tests {
         assert_eq!(config.file_size, None);
         assert_eq!(config.segment_time, None);
         assert!(config.validate_segment_limits().is_ok());
+    }
+
+    #[test]
+    fn huya_use_wup_roundtrip_preserves_bool() {
+        let raw = r#"{"huya_use_wup": true, "huya_mobile_api": false}"#;
+        let config: Config = serde_json::from_str(raw).unwrap();
+        assert_eq!(config.huya_use_wup, Some(true));
+        assert_eq!(config.huya_mobile_api, Some(false));
+
+        let encoded = serde_json::to_string(&config).unwrap();
+        let again: Config = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(again.huya_use_wup, Some(true));
+        assert_eq!(again.huya_mobile_api, Some(false));
+    }
+
+    #[test]
+    fn huya_use_wup_defaults_to_none_when_missing() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.huya_use_wup, None);
+        assert_eq!(config.huya_mobile_api, None);
     }
 
     #[test]

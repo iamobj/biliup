@@ -24,6 +24,14 @@
   - `ffmpeg` 内部分段不再对最后一个分段重复触发回调，避免同一视频段触发两次弹幕 rolling。
   - 下播或重试结束时会丢弃 rolling 后新开的尾部 XML，避免没有对应视频分段的弹幕文件残留。
   - 分段被碎片过滤阈值删除时，会同步删除已关联的弹幕 XML；未开启弹幕录制时仍只删除视频分段。
+- 虎牙取流默认对齐 DanmakuRender：通过 WUP `getCdnTokenInfoEx` 获取 `sFlvToken` 后再生成 anticode。
+  - 新增 `crates/biliup/src/downloader/live/huya_wup.rs` 实现本地最小 TARS/WUP 编解码，不依赖 `danmaku` crate。
+  - 同一场次 anticode 只计算一次并缓存复用到各 CDN；签名使用 `lPresenterUid`。
+  - `huya_use_wup` 默认 `true`；关闭后回退页面 anti_code。
+  - 仅当 `huya_mobile_api && huya_imgplus` 时保留页面/API 原始 anti_code。
+  - 走 WUP 时下载头会带 WUP UA。
+  - 保留本仓 `huya_cdn`、`huya_max_ratio`、`huya_imgplus` 以及过滤 `HY/HUYA/HYZJ`。
+  - 主播配置覆写里的布尔开关（如 `huya_use_wup=false`）必须从 `entity.override` 回填，不能只读顶层字段后回退默认值。
 - 抖音弹幕默认使用基于 `v1.0.7` 恢复的 Python 链路，而不是
   `crates/danmaku/src/protocols/douyin.rs` 中的 Rust 协议实现。
   - Rust 下载流程通过 `python-bridge` 和 PyO3 创建
@@ -47,6 +55,10 @@
   - `crates/biliup-cli/src/server/api/ws.rs`
   - `crates/danmaku/src/client.rs`
   - `crates/biliup-cli/src/server/core/downloader/ffmpeg_downloader.rs`
+  - `crates/biliup/src/downloader/live/huya.rs`
+  - `crates/biliup/src/downloader/live/huya_wup.rs`
+  - `app/ui/plugins/huya.tsx`
+  - `app/ui/OverrideModal.tsx`
 - 上游如改动任何抖音弹幕相关逻辑，包括 Rust/Python 协议、签名算法、WebSocket
   参数或节点、Cookie/UA/room_id 传递、protobuf/ACK、重连、XML rolling、依赖或
   打包配置，不得直接采用上游版本，也不得静默保留本分支版本。
@@ -59,6 +71,8 @@
     `crates/biliup-cli/src/server/core/downloader.rs`、
     `crates/danmaku/src/protocols/douyin.rs`、`pyproject.toml` 和
     `crates/stream-gears/Cargo.toml`。
+- 上游如改动虎牙取流、WUP/TARS、anticode、mobile API 或相关配置/UI，需优先核对本分支
+  是否仍对齐 DanmakuRender 的 WUP 默认路径与 anticode 规则，以及主播覆写布尔值回填。
 
 ## 开发规范
 

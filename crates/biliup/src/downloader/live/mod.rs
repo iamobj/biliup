@@ -15,6 +15,7 @@ mod douyin;
 mod douyu;
 mod general;
 mod huya;
+mod huya_wup;
 mod inke;
 mod kilakila;
 mod kuaishou;
@@ -195,6 +196,8 @@ pub struct HuyaOptions {
     pub imgplus: bool,
     pub codec: String,
     pub danmaku: bool,
+    pub mobile_api: bool,
+    pub use_wup: bool,
 }
 
 impl Default for HuyaOptions {
@@ -206,6 +209,8 @@ impl Default for HuyaOptions {
             imgplus: true,
             codec: "264".to_string(),
             danmaku: false,
+            mobile_api: false,
+            use_wup: true,
         }
     }
 }

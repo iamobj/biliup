@@ -112,7 +112,11 @@ const Huya: React.FC<Props> = props => {
           field="huya_imgplus"
           extraText="是否录制二次编码的直播流。默认为启用，关闭后可能无法下载。部分直播间的分辨率超分（如2k/4k）和HDR画质依赖于二次编码，请谨慎关闭。"
           label="虎牙二次编码（huya_imgplus）"
-          initValue={entity?.hasOwnProperty('huya_imgplus') ? entity['huya_imgplus'] : true}
+          initValue={
+            (initValues ?? entity)?.hasOwnProperty('huya_imgplus')
+              ? (initValues ?? entity)['huya_imgplus']
+              : true
+          }
           fieldStyle={{
             alignSelf: 'stretch',
             padding: 0,
@@ -131,7 +135,11 @@ const Huya: React.FC<Props> = props => {
           field="huya_use_wup"
           extraText="使用 WUP 协议获取直播流，可能解决部分直播分区 2 分钟分段问题"
           label="使用 WUP 协议（huya_use_wup）"
-          initValue={entity?.hasOwnProperty('huya_use_wup') ? entity['huya_use_wup'] : true}
+          initValue={
+            (initValues ?? entity)?.hasOwnProperty('huya_use_wup')
+              ? (initValues ?? entity)['huya_use_wup']
+              : true
+          }
           fieldStyle={{
             alignSelf: 'stretch',
             padding: 0,

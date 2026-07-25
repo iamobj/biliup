@@ -253,7 +253,13 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
           paddingRight: 10,
         }}
       >
-        <Form initValues={entity} getFormApi={formApi => (api.current = formApi)}>
+        <Form
+          initValues={{
+            ...(entity || {}),
+            ...((entity?.override as Record<string, any>) || {}),
+          }}
+          getFormApi={formApi => (api.current = formApi)}
+        >
           <Form.TextArea
             field="override_text"
             label="配置覆写"

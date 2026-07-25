@@ -91,6 +91,8 @@ fn live_options(config: &Config) -> LiveOptions {
                 .clone()
                 .unwrap_or_else(|| "264".to_string()),
             danmaku: config.huya_danmaku.unwrap_or(false),
+            mobile_api: config.huya_mobile_api.unwrap_or(false),
+            use_wup: config.huya_use_wup.unwrap_or(true),
         },
         kilakila: KilakilaOptions {
             protocol: config
