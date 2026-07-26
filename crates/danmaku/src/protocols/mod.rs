@@ -233,6 +233,13 @@ pub trait Platform: Send + Sync {
     /// Get heartbeat configuration.
     fn heartbeat_config(&self) -> HeartbeatConfig;
 
+    /// Delay before sending the first heartbeat.
+    ///
+    /// The default preserves the existing behavior of sending immediately.
+    fn heartbeat_initial_delay(&self) -> Duration {
+        Duration::ZERO
+    }
+
     /// Decode a WebSocket message into danmaku events.
     ///
     /// For text-based protocols, `msg` contains UTF-8 text.

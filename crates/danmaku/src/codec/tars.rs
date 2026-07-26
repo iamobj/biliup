@@ -67,8 +67,7 @@ impl TarsOutputStream {
             let head = (tag << 4) | (tars_type as u8);
             self.buffer.push(head);
         } else {
-            let head = (0xF0 | (tars_type as u8)) as u16;
-            self.buffer.push((head >> 8) as u8);
+            self.buffer.push(0xF0 | (tars_type as u8));
             self.buffer.push(tag);
         }
     }
@@ -90,7 +89,7 @@ impl TarsOutputStream {
 
     /// Write an int16 value.
     pub fn write_int16(&mut self, tag: u8, value: i16) {
-        if value >= -128 && value <= 127 {
+        if (-128..=127).contains(&value) {
             self.write_int8(tag, value as i8);
         } else {
             self.write_head(tag, TarsType::Int16);
@@ -100,7 +99,7 @@ impl TarsOutputStream {
 
     /// Write an int32 value.
     pub fn write_int32(&mut self, tag: u8, value: i32) {
-        if value >= -32768 && value <= 32767 {
+        if (-32768..=32767).contains(&value) {
             self.write_int16(tag, value as i16);
         } else {
             self.write_head(tag, TarsType::Int32);
@@ -306,15 +305,11 @@ impl<'a> TarsInputStream<'a> {
 
     /// Skip to struct end.
     fn skip_to_struct_end(&mut self) {
-        loop {
-            if let Some((_, tars_type)) = self.read_head() {
-                if tars_type == TarsType::StructEnd {
-                    break;
-                }
-                self.skip_field(tars_type);
-            } else {
+        while let Some((_, tars_type)) = self.read_head() {
+            if tars_type == TarsType::StructEnd {
                 break;
             }
+            self.skip_field(tars_type);
         }
     }
 
@@ -447,10 +442,12 @@ impl<'a> TarsInputStream<'a> {
                         let len = self.data[self.pos] as usize;
                         self.pos += 1;
                         if self.pos + len <= self.data.len() {
-                            let s = String::from_utf8_lossy(&self.data[self.pos..self.pos + len])
-                                .to_string();
-                            self.pos += len;
-                            return Some(s);
+                            let end = self.pos + len;
+                            let value = std::str::from_utf8(&self.data[self.pos..end])
+                                .ok()
+                                .map(str::to_owned);
+                            self.pos = end;
+                            return value;
                         }
                     }
                     None
@@ -465,10 +462,12 @@ impl<'a> TarsInputStream<'a> {
                         ]) as usize;
                         self.pos += 4;
                         if self.pos + len <= self.data.len() {
-                            let s = String::from_utf8_lossy(&self.data[self.pos..self.pos + len])
-                                .to_string();
-                            self.pos += len;
-                            return Some(s);
+                            let end = self.pos + len;
+                            let value = std::str::from_utf8(&self.data[self.pos..end])
+                                .ok()
+                                .map(str::to_owned);
+                            self.pos = end;
+                            return value;
                         }
                     }
                     None
@@ -478,6 +477,26 @@ impl<'a> TarsInputStream<'a> {
         } else {
             None
         }
+    }
+
+    /// Read a nested TARS structure and consume its trailing struct marker.
+    pub fn read_struct<T>(
+        &mut self,
+        tag: u8,
+        reader: impl FnOnce(&mut TarsInputStream<'a>) -> Option<T>,
+    ) -> Option<T> {
+        if !self.skip_to_tag(tag) {
+            return None;
+        }
+
+        let (_, tars_type) = self.read_head()?;
+        if tars_type != TarsType::StructBegin {
+            return None;
+        }
+
+        let value = reader(self);
+        self.skip_to_struct_end();
+        value
     }
 
     /// Read bytes value at a tag.
@@ -545,5 +564,40 @@ mod tests {
 
         let mut ios = TarsInputStream::new(buffer);
         assert_eq!(ios.read_bytes(0), Some(b"test data".to_vec()));
+    }
+
+    #[test]
+    fn test_extended_tag_roundtrip() {
+        let mut oos = TarsOutputStream::new();
+        oos.write_int32(15, 1);
+
+        assert_eq!(oos.get_buffer(), &[0xf0, 0x0f, 0x01]);
+
+        let mut ios = TarsInputStream::new(oos.get_buffer());
+        assert_eq!(ios.read_int32(15), Some(1));
+    }
+
+    #[test]
+    fn test_read_nested_struct() {
+        let mut oos = TarsOutputStream::new();
+        oos.write_struct_begin(0);
+        oos.write_string(2, "alice");
+        oos.write_struct_end();
+        oos.write_string(3, "hello");
+
+        let mut ios = TarsInputStream::new(oos.get_buffer());
+        let name = ios.read_struct(0, |user| user.read_string(2));
+
+        assert_eq!(name, Some("alice".to_string()));
+        assert_eq!(ios.read_string(3), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn test_read_string_rejects_invalid_utf8() {
+        let data = [0x06, 0x01, 0xff];
+        let mut ios = TarsInputStream::new(&data);
+
+        assert_eq!(ios.read_string(0), None);
+        assert!(ios.is_empty());
     }
 }

@@ -34,6 +34,16 @@
   - 保留上游 room_id 缓存、CDN 健康检查回退、回放标题过滤，以及本仓 `huya_cdn`、
     `huya_max_ratio`、`huya_imgplus` 与 `HY/HUYA/HYZJ` 过滤。
   - 主播配置覆写里的布尔开关（如 `huya_use_wup=false`）必须从 `entity.override` 回填，不能只读顶层字段后回退默认值。
+- 虎牙弹幕 Rust 链路以迁移前最后一版 Python `biliup/Danmaku/huya.py` 为协议基线：
+  - 获取房间 UID 的页面请求超时为 5 秒；进程级随机 Chrome 100–120 UA 必须同时用于
+    页面请求和 WebSocket 握手。
+  - `WSUserInfo` 注册包与 Python TARS 输出保持字节一致；心跳包为原始 Python 包，注册后
+    先等待 60 秒，再每 60 秒发送一次。
+  - 推送包按 `WebSocketCommand(tag0=7)` → `vData.tag1=1400` → 弹幕体解析；用户名位于
+    `User(tag0).tag2`，正文位于 `tag3`，颜色位于 `DColor(tag6).tag0`。仅用户名非空才写入，
+    空正文保留，颜色 `-1` 归一为白色。
+  - `crates/danmaku/src/codec/tars.rs` 的嵌套 struct、严格 UTF-8 与扩展 tag 编码均为该链路
+    所需；损坏帧只交由现有客户端丢弃，不应中断连接或退回扁平字段读取。
 - 主播「配置覆写」使用稀疏 override，而不是完整配置快照：
   - 前端 `OverrideModal` 以原始主播 entity 为底稿，只替换 `override`，避免保存时清空
     `filename_prefix` / `upload_streamers_id` 等主播字段。
@@ -68,6 +78,9 @@
   - `crates/biliup-cli/src/server/logging.rs`
   - `crates/biliup-cli/src/server/api/ws.rs`
   - `crates/danmaku/src/client.rs`
+  - `crates/danmaku/src/protocols/huya.rs`
+  - `crates/danmaku/src/codec/tars.rs`
+  - `crates/danmaku/src/protocols/mod.rs`
   - `crates/biliup-cli/src/server/core/downloader/ffmpeg_downloader.rs`
   - `crates/biliup/src/downloader/live/huya.rs`
   - `crates/biliup/src/downloader/live/huya_wup.rs`
@@ -93,6 +106,8 @@
     `crates/stream-gears/Cargo.toml`。
 - 上游如改动虎牙取流、WUP/TARS、anticode、mobile API 或相关配置/UI，需优先核对本分支
   是否仍对齐 DanmakuRender 的 WUP 默认路径与 anticode 规则，以及主播覆写布尔值回填。
+- 上游如改动虎牙弹幕协议、TARS codec、通用 heartbeat 调度或 Huya 弹幕示例，需保留上述
+  Python 基线：嵌套 `User`/`DColor` 解码、注册包黄金字节、共享随机 UA，以及 60 秒首跳延迟。
 - 上游如改动主播配置覆写、`LiveStreamer.override`、`ConfigPatch` apply、配置导入或
   录播管理前端表单，需优先核对本分支稀疏 override 语义是否保留：
   - 保存不丢主播本体字段

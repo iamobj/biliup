@@ -2,6 +2,8 @@
 
 use danmaku::protocols::{Platform, PlatformContext, RegistrationData, huya::Huya};
 use futures::{SinkExt, StreamExt};
+use tokio::time::{Instant, interval_at};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 #[tokio::main]
@@ -23,7 +25,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   Registration packets: {}", info.registration_data.len());
 
     println!("\n2. Connecting to WebSocket...");
-    let (ws_stream, _) = connect_async(&info.ws_url).await?;
+    let mut request = info.ws_url.as_str().into_client_request()?;
+    for (key, value) in &info.headers {
+        request.headers_mut().insert(key.clone(), value.clone());
+    }
+    let (ws_stream, _) = connect_async(request).await?;
     let (mut write, mut read) = ws_stream.split();
     println!("   Connected!");
 
@@ -47,7 +53,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n5. Listening for messages (Ctrl+C to stop)...\n");
 
     let mut message_count = 0;
-    let mut heartbeat_interval = tokio::time::interval(heartbeat_config.interval);
+    let mut heartbeat_interval = interval_at(
+        Instant::now() + platform.heartbeat_initial_delay(),
+        heartbeat_config.interval,
+    );
 
     loop {
         tokio::select! {

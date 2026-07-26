@@ -16,7 +16,7 @@ use rustls_platform_verifier::BuilderVerifierExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::interval;
+use tokio::time::{Instant, interval, interval_at};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{Connector, connect_async_tls_with_config};
@@ -381,6 +381,7 @@ impl DanmakuRecorder {
 
         // Get heartbeat config
         let heartbeat_config = self.platform.heartbeat_config();
+        let heartbeat_initial_delay = self.platform.heartbeat_initial_delay();
 
         // Create heartbeat receiver
         let mut heartbeat_rx = if let Some(ref hb_data) = heartbeat_config.data {
@@ -389,7 +390,8 @@ impl DanmakuRecorder {
             let (hb_tx, hb_rx) = mpsc::channel::<Message>(1);
 
             tokio::spawn(async move {
-                let mut ticker = interval(interval_duration);
+                let mut ticker =
+                    interval_at(Instant::now() + heartbeat_initial_delay, interval_duration);
                 loop {
                     ticker.tick().await;
                     let msg = match &hb_data {
@@ -514,13 +516,15 @@ impl DanmakuRecorder {
         }
 
         let heartbeat_config = self.platform.heartbeat_config();
+        let heartbeat_initial_delay = self.platform.heartbeat_initial_delay();
         let mut heartbeat_rx = if let Some(ref hb_data) = heartbeat_config.data {
             let hb_data = hb_data.clone();
             let interval_duration = heartbeat_config.interval;
             let (hb_tx, hb_rx) = mpsc::channel::<Vec<u8>>(1);
 
             tokio::spawn(async move {
-                let mut ticker = interval(interval_duration);
+                let mut ticker =
+                    interval_at(Instant::now() + heartbeat_initial_delay, interval_duration);
                 loop {
                     ticker.tick().await;
                     let data = match &hb_data {
