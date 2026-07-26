@@ -14,7 +14,7 @@ const Cookie: React.FC<Props> = props => {
     <>
       <Collapse.Panel header="用户 Cookie" itemKey="user">
         <Form.Input
-          field="user.kuaishou_cookie"
+          field="kuaishou_cookie"
           extraText={
             <div className="semi-form-field-extra">
               填入 Cookie 降低风控风险。 需要

@@ -1,6 +1,7 @@
 'use client'
-import React, { useEffect } from 'react'
-import { Form, Select, Collapse, useFormApi } from '@douyinfe/semi-ui'
+import React from 'react'
+import { Form, Select, Collapse } from '@douyinfe/semi-ui'
+import OverrideSwitch from '@/app/ui/components/OverrideSwitch'
 
 type Props = {
   entity: any
@@ -9,16 +10,7 @@ type Props = {
 }
 
 const Douyu: React.FC<Props> = props => {
-  const { entity, list, initValues } = props
-  const formApi = useFormApi()
-
-  useEffect(() => {
-    if (initValues) {
-      Object.entries(initValues).forEach(([key, value]) => {
-        formApi.setValue(key, value)
-      })
-    }
-  }, [initValues, formApi])
+  const { entity, list } = props
 
   return (
     <>
@@ -49,14 +41,12 @@ const Douyu: React.FC<Props> = props => {
           <Select.Option value={3}>超清（3）</Select.Option>
           <Select.Option value={2}>高清（2）</Select.Option>
         </Form.Select>
-        <Form.Switch
+        <OverrideSwitch
           field="douyu_danmaku"
-          extraText="录制斗鱼弹幕，默认关闭"
           label="录制弹幕（douyu_danmaku）"
-          fieldStyle={{
-            alignSelf: 'stretch',
-            padding: 0,
-          }}
+          extraText="录制斗鱼弹幕，默认关闭"
+          fieldStyle={{alignSelf: 'stretch',
+            padding: 0,}}
         />
         <Form.Select
           allowCreate={true}
@@ -78,23 +68,19 @@ tctc-h5（线路4）, tct-h5（线路5）, ali-h5（线路6）, hw-h5（线路7�
           <Select.Option value="hw-h5">线路7（hw-h5）</Select.Option>
           <Select.Option value="hs-h5">线路13（hs-h5）</Select.Option>
         </Form.Select>
-        <Form.Switch
+        <OverrideSwitch
           field="douyu_force_hs"
-          extraText="强制 hs 流使用构造链接，防止部分海外机器遇到频繁断流。使用时需将 douyu_cdn 设置为 hs-h5。"
           label="强制 hs 流（douyu_force_hs）"
-          fieldStyle={{
-            alignSelf: 'stretch',
-            padding: 0,
-          }}
+          extraText="强制 hs 流使用构造链接，防止部分海外机器遇到频繁断流。使用时需将 douyu_cdn 设置为 hs-h5。"
+          fieldStyle={{alignSelf: 'stretch',
+            padding: 0,}}
         />
-        <Form.Switch
+        <OverrideSwitch
           field="douyu_disable_interactive_game"
-          extraText="当主播运行了互动游戏，下个分段拒绝录制。小窗运行互动游戏也算入在内，请谨慎开启。"
           label="斗鱼拒绝互动游戏（douyu_disable_interactive_game）"
-          fieldStyle={{
-            alignSelf: 'stretch',
-            padding: 0,
-          }}
+          extraText="当主播运行了互动游戏，下个分段拒绝录制。小窗运行互动游戏也算入在内，请谨慎开启。"
+          fieldStyle={{alignSelf: 'stretch',
+            padding: 0,}}
         />
       </Collapse.Panel>
     </>

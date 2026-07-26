@@ -1,6 +1,7 @@
 'use client'
-import React, { useEffect } from 'react'
-import { Form, Select, Collapse, useFormApi } from '@douyinfe/semi-ui'
+import React from 'react'
+import { Form, Select, Collapse } from '@douyinfe/semi-ui'
+import OverrideSwitch from '@/app/ui/components/OverrideSwitch'
 
 type Props = {
   entity: any
@@ -9,16 +10,7 @@ type Props = {
 }
 
 const Douyin: React.FC<Props> = props => {
-  const { entity, list, initValues } = props
-  const formApi = useFormApi()
-
-  useEffect(() => {
-    if (initValues) {
-      Object.entries(initValues).forEach(([key, value]) => {
-        formApi.setValue(key, value)
-      })
-    }
-  }, [initValues, formApi])
+  const { entity, list } = props
 
   return (
     <>
@@ -48,14 +40,12 @@ const Douyin: React.FC<Props> = props => {
           <Select.Option value="ld">标清（ld）</Select.Option>
           <Select.Option value="md">流畅（md）</Select.Option>
         </Form.Select>
-        <Form.Switch
+        <OverrideSwitch
           field="douyin_danmaku"
-          extraText="录制抖音弹幕，默认关闭。"
           label="录制弹幕（douyin_danmaku）"
-          fieldStyle={{
-            alignSelf: 'stretch',
-            padding: 0,
-          }}
+          extraText="录制抖音弹幕，默认关闭。"
+          fieldStyle={{alignSelf: 'stretch',
+            padding: 0,}}
         />
         <Form.Input
           field="user.douyin_cookie"
@@ -89,8 +79,9 @@ const Douyin: React.FC<Props> = props => {
           <Select.Option value="flv">flv（默认）</Select.Option>
           <Select.Option value="hls">hls</Select.Option>
         </Form.Select>
-        <Form.Switch
+        <OverrideSwitch
           field="douyin_double_screen"
+          label="双屏直播录制方式（douyin_double_screen）"
           extraText={
             <div style={{ fontSize: '14px' }}>
               是否录制抖音双屏直播的原像素拼接流，默认关闭。
@@ -99,20 +90,17 @@ const Douyin: React.FC<Props> = props => {
               双屏拼接流。
             </div>
           }
-          label="双屏直播录制方式（douyin_double_screen）"
           fieldStyle={{
             alignSelf: 'stretch',
             padding: 0,
           }}
         />
-        <Form.Switch
+        <OverrideSwitch
           field="douyin_true_origin"
-          extraText="仅限直播流协议为 FLV 时生效，默认关闭。开启后可能录制到 HEVC 编码，而 stream-gears（默认下载器）暂不支持，请切换下载器后录制。"
           label="抖音真原画（douyin_true_origin）"
-          fieldStyle={{
-            alignSelf: 'stretch',
-            padding: 0,
-          }}
+          extraText="仅限直播流协议为 FLV 时生效，默认关闭。开启后可能录制到 HEVC 编码，而 stream-gears（默认下载器）暂不支持，请切换下载器后录制。"
+          fieldStyle={{alignSelf: 'stretch',
+            padding: 0,}}
         />
       </Collapse.Panel>
     </>

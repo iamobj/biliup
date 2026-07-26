@@ -279,12 +279,9 @@ fn to_live_streamer_insert(
         time_range: streamer.time_range.clone(),
         upload_streamers_id,
         format: streamer.format.clone(),
-        override_cfg: streamer
-            .override_cfg
-            .clone()
-            .map(|cfg| serde_json::from_value(serde_json::Value::Object(cfg.into_iter().collect())))
-            .transpose()
-            .change_context(AppError::Unknown)?,
+        override_cfg: streamer.override_cfg.clone().map(|cfg| {
+            serde_json::Value::Object(cfg.into_iter().collect())
+        }),
         preprocessor: streamer.preprocessor.clone(),
         segment_processor: streamer.segment_processor.clone(),
         downloaded_processor: streamer.downloaded_processor.clone(),

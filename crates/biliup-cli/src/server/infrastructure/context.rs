@@ -1,6 +1,6 @@
 use crate::server::common::download::DownloadTask;
 use crate::server::common::util::Recorder;
-use crate::server::config::Config;
+use crate::server::config::{config_patch_from_override_value, merge_user_config, Config};
 use crate::server::core::downloader::DownloadConfig;
 use crate::server::core::live::streamer_info;
 use crate::server::infrastructure::connection_pool::ConnectionPool;
@@ -193,8 +193,36 @@ impl Worker {
     pub fn get_config(&self) -> Config {
         let mut cfg = self.config.read().unwrap().clone();
 
-        if let Some(cfg_p) = self.live_streamer.override_cfg.clone() {
-            cfg.apply(cfg_p)
+        if let Some(raw) = self.live_streamer.override_cfg.as_ref() {
+            match config_patch_from_override_value(raw) {
+                Ok(mut cfg_p) => {
+                    // ConfigPatch.user 类型为 Option<Option<UserConfig>>：
+                    // None=未设置, Some(None)=显式清空, Some(Some(user))=字段级合并
+                    let user_patch = cfg_p.user.take();
+                    cfg.apply(cfg_p);
+                    match user_patch {
+                        Some(Some(user_patch)) => {
+                            cfg.user = Some(merge_user_config(cfg.user, user_patch));
+                        }
+                        Some(None) => {
+                            cfg.user = None;
+                        }
+                        None => {}
+                    }
+                    tracing::debug!(
+                        streamer_id = self.live_streamer.id,
+                        override_keys = raw.as_object().map(|o| o.len()).unwrap_or(0),
+                        "applied streamer override config"
+                    );
+                }
+                Err(err) => {
+                    error!(
+                        streamer_id = self.live_streamer.id,
+                        error = %err,
+                        "invalid streamer override config, ignored"
+                    );
+                }
+            }
         }
         cfg
     }

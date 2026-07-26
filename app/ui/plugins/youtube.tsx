@@ -1,6 +1,7 @@
 'use client'
-import React, { useEffect } from 'react'
-import { Form, Select, Collapse, useFormApi } from '@douyinfe/semi-ui'
+import React from 'react'
+import { Form, Select, Collapse } from '@douyinfe/semi-ui'
+import OverrideSwitch from '@/app/ui/components/OverrideSwitch'
 
 type Props = {
   entity: any
@@ -9,16 +10,7 @@ type Props = {
 }
 
 const YouTube: React.FC<Props> = props => {
-  const { entity, list, initValues } = props
-  const formApi = useFormApi()
-
-  useEffect(() => {
-    if (initValues) {
-      Object.entries(initValues).forEach(([key, value]) => {
-        formApi.setValue(key, value)
-      })
-    }
-  }, [initValues, formApi])
+  const { entity, list } = props
 
   return (
     <>
@@ -40,13 +32,9 @@ const YouTube: React.FC<Props> = props => {
             padding: 0,
           }}
         />
-        <Form.Switch
-          initValue={
-            entity?.hasOwnProperty('youtube_enable_download_live')
-              ? entity['youtube_enable_download_live']
-              : true
-          }
+        <OverrideSwitch
           field="youtube_enable_download_live"
+          label="下载直播（youtube_enable_download_live）"
           extraText="### 是否下载直播 默认开启
 关闭后将忽略直播下载（可以下载回放） 避免网络被风控(有些网络只能下载回放无法下载直播)的时候还会尝试下载直播
 大量下载时极易风控 如对实时性要求不高推荐关闭
@@ -54,29 +42,19 @@ const YouTube: React.FC<Props> = props => {
 如果正在录制直播将无法下载回放
 例如录制https://www.youtube.com/@NeneAmanoCh/streams，关闭后将忽略正在直播
 "
-          label="下载直播（youtube_enable_download_live）"
-          fieldStyle={{
-            alignSelf: 'stretch',
-            padding: 0,
-          }}
+          fieldStyle={{alignSelf: 'stretch',
+            padding: 0,}}
         />
-        <Form.Switch
-          initValue={
-            entity?.hasOwnProperty('youtube_enable_download_playback')
-              ? entity['youtube_enable_download_playback']
-              : true
-          }
+        <OverrideSwitch
           field="youtube_enable_download_playback"
+          label="下载回放（youtube_enable_download_playback）"
           extraText="是否下载直播回放 默认开启
 关闭后将忽略直播下载回放(不会影响正常的视频下载) 只想录制直播的可以开启
 如果正在下载回放将无法录制直播
 例如录制https://www.youtube.com/@NeneAmanoCh/streams，关闭后将忽略直播回放
 "
-          label="下载回放（youtube_enable_download_playback）"
-          fieldStyle={{
-            alignSelf: 'stretch',
-            padding: 0,
-          }}
+          fieldStyle={{alignSelf: 'stretch',
+            padding: 0,}}
         />
         <Form.Input
           field="youtube_after_date"

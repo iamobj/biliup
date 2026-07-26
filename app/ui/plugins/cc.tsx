@@ -1,6 +1,7 @@
 'use client'
-import React, { useEffect } from 'react'
-import { Form, Select, Collapse, useFormApi } from '@douyinfe/semi-ui'
+import React from 'react'
+import { Form, Select, Collapse } from '@douyinfe/semi-ui'
+import OverrideSwitch from '@/app/ui/components/OverrideSwitch'
 
 type Props = {
   entity: any
@@ -9,16 +10,7 @@ type Props = {
 }
 
 const CC: React.FC<Props> = props => {
-  const { entity, list, initValues } = props
-  const formApi = useFormApi()
-
-  useEffect(() => {
-    if (initValues) {
-      Object.entries(initValues).forEach(([key, value]) => {
-        formApi.setValue(key, value)
-      })
-    }
-  }, [initValues, formApi])
+  const { entity, list } = props
 
   return (
     <>

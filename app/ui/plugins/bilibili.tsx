@@ -1,6 +1,7 @@
 'use client'
-import React, { useEffect } from 'react'
-import { Form, Select, Collapse, useFormApi } from '@douyinfe/semi-ui'
+import React from 'react'
+import { Form, Select, Collapse } from '@douyinfe/semi-ui'
+import OverrideSwitch from '@/app/ui/components/OverrideSwitch'
 
 type Props = {
   entity: any
@@ -9,16 +10,7 @@ type Props = {
 }
 
 const Bilibili: React.FC<Props> = props => {
-  const { entity, list, initValues } = props
-  const formApi = useFormApi()
-
-  useEffect(() => {
-    if (initValues) {
-      Object.entries(initValues).forEach(([key, value]) => {
-        formApi.setValue(key, value)
-      })
-    }
-  }, [initValues, formApi])
+  const { entity, list } = props
 
   return (
     <>
@@ -62,32 +54,26 @@ const Bilibili: React.FC<Props> = props => {
           <Select.Option value={80}>80（流畅）</Select.Option>
           <Select.Option value={0}>0（最低画质）</Select.Option>
         </Form.Select>
-        <Form.Switch
+        <OverrideSwitch
           field="bilibili_danmaku"
-          extraText="录制哔哩哔哩弹幕，目前不支持视频按时长分段下的弹幕文件自动分段。仅限下载插件为非 stream-gears 时生效，默认关闭。"
           label="录制弹幕（bilibili_danmaku）"
-          fieldStyle={{
-            alignSelf: 'stretch',
-            padding: 0,
-          }}
+          extraText="录制哔哩哔哩弹幕，目前不支持视频按时长分段下的弹幕文件自动分段。仅限下载插件为非 stream-gears 时生效，默认关闭。"
+          fieldStyle={{alignSelf: 'stretch',
+            padding: 0,}}
         />
-        <Form.Switch
+        <OverrideSwitch
           field="bilibili_danmaku_detail"
-          extraText="录制的弹幕信息中包含发送者昵称、用户UID，同时保存醒目留言、上舰、礼物信息。仅 bilibili_danmaku 开启时生效，默认关闭（实验性质：可能与弹幕转ass工具不兼容）"
           label="录制详细弹幕（bilibili_danmaku_detail）"
-          fieldStyle={{
-            alignSelf: 'stretch',
-            padding: 0,
-          }}
+          extraText="录制的弹幕信息中包含发送者昵称、用户UID，同时保存醒目留言、上舰、礼物信息。仅 bilibili_danmaku 开启时生效，默认关闭（实验性质：可能与弹幕转ass工具不兼容）"
+          fieldStyle={{alignSelf: 'stretch',
+            padding: 0,}}
         />
-        <Form.Switch
+        <OverrideSwitch
           field="bilibili_danmaku_raw"
-          extraText="录制B站服务器返回的原始弹幕信息，方便有技术能力的用户对主播弹幕数据进行统计。仅 bilibili_danmaku 开启时生效，默认关闭，开启后弹幕文件会每隔5分钟写入一次（实验性质：可能导致弹幕文件巨大）"
           label="录制完整弹幕（bilibili_danmaku_raw）"
-          fieldStyle={{
-            alignSelf: 'stretch',
-            padding: 0,
-          }}
+          extraText="录制B站服务器返回的原始弹幕信息，方便有技术能力的用户对主播弹幕数据进行统计。仅 bilibili_danmaku 开启时生效，默认关闭，开启后弹幕文件会每隔5分钟写入一次（实验性质：可能导致弹幕文件巨大）"
+          fieldStyle={{alignSelf: 'stretch',
+            padding: 0,}}
         />
         <Form.Input
           field="user.bili_cookie"
@@ -218,23 +204,19 @@ const Bilibili: React.FC<Props> = props => {
             },
           ]}
         />
-        <Form.Switch
+        <OverrideSwitch
           field="bili_cdn_fallback"
-          extraText="CDN 回退（Fallback），默认为关闭。例如海外机器优选 ov05 之后，如果 ov05 流一直无法下载，将会自动回退到 ov07 进行下载。仅限相同流协议。"
           label="CDN 回退（bili_cdn_fallback）"
-          fieldStyle={{
-            alignSelf: 'stretch',
-            padding: 0,
-          }}
+          extraText="CDN 回退（Fallback），默认为关闭。例如海外机器优选 ov05 之后，如果 ov05 流一直无法下载，将会自动回退到 ov07 进行下载。仅限相同流协议。"
+          fieldStyle={{alignSelf: 'stretch',
+            padding: 0,}}
         />
-        <Form.Switch
+        <OverrideSwitch
           field="bili_anonymous_origin"
-          extraText="使用自定义API获取 master playlist 内的 hls_fmp4 原画流，无法录制特殊直播。默认关闭。"
           label="免登录原画（bili_anonymous_origin）"
-          fieldStyle={{
-            alignSelf: 'stretch',
-            padding: 0,
-          }}
+          extraText="使用自定义API获取 master playlist 内的 hls_fmp4 原画流，无法录制特殊直播。默认关闭。"
+          fieldStyle={{alignSelf: 'stretch',
+            padding: 0,}}
         />
         {/* <Form.Switch
           field="bili_ov2cn"

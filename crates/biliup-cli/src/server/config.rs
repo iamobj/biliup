@@ -432,6 +432,111 @@ pub struct UserConfig {
     pub afreecatv_password: Option<String>,
 }
 
+
+
+/// 显式 null 有语义的配置项（ConfigPatch 用 deserialize_option_patch 区分 missing/null）。
+const OVERRIDE_NULLABLE_KEYS: &[&str] = &["file_size"];
+
+fn compact_override_object(
+    raw: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    for (key, value) in raw {
+        match value {
+            serde_json::Value::Null => {
+                if OVERRIDE_NULLABLE_KEYS.contains(&key.as_str()) {
+                    out.insert(key, serde_json::Value::Null);
+                }
+            }
+            serde_json::Value::Object(obj) => {
+                let nested = compact_override_object(obj);
+                if !nested.is_empty() {
+                    out.insert(key, serde_json::Value::Object(nested));
+                }
+            }
+            other => {
+                out.insert(key, other);
+            }
+        }
+    }
+    out
+}
+
+/// 压缩 override JSON：去掉无意义的 null，以及空对象。
+/// 兼容历史数据里 ConfigPatch 全量序列化产生的“整表 null”。
+pub fn compact_override_value(raw: Option<serde_json::Value>) -> Option<serde_json::Value> {
+    let Some(value) = raw else {
+        return None;
+    };
+    match value {
+        serde_json::Value::Object(obj) => {
+            let compact = compact_override_object(obj);
+            if compact.is_empty() {
+                None
+            } else {
+                Some(serde_json::Value::Object(compact))
+            }
+        }
+        serde_json::Value::Null => None,
+        other => Some(other),
+    }
+}
+
+/// 将主播稀疏 override JSON 解析为 ConfigPatch。
+/// 仅包含显式出现的 key；null 表示对该可空配置的显式清空（如 file_size）。
+pub fn config_patch_from_override_value(raw: &serde_json::Value) -> AppResult<ConfigPatch> {
+    let compact = compact_override_value(Some(raw.clone())).unwrap_or_else(|| serde_json::json!({}));
+    serde_json::from_value(compact)
+        .change_context(AppError::Unknown)
+        .attach("parse streamer override config")
+}
+
+/// 将主播 override 中的 user 字段合并进全局 user。
+/// 仅应用 patch 中为 Some 的字段，避免整对象替换把其他 cookie 清掉。
+/// 省略字段表示继承全局；如需清空某字段，请在全局配置中处理或写入空字符串。
+pub fn merge_user_config(base: Option<UserConfig>, patch: UserConfig) -> UserConfig {
+    let mut merged = base.unwrap_or_default();
+
+    if patch.bili_cookie.is_some() {
+        merged.bili_cookie = patch.bili_cookie;
+    }
+    if patch.bili_cookie_file.is_some() {
+        merged.bili_cookie_file = patch.bili_cookie_file;
+    }
+    if patch.douyin_cookie.is_some() {
+        merged.douyin_cookie = patch.douyin_cookie;
+    }
+    if patch.twitch_cookie.is_some() {
+        merged.twitch_cookie = patch.twitch_cookie;
+    }
+    if patch.twitcasting_cookie.is_some() {
+        merged.twitcasting_cookie = patch.twitcasting_cookie;
+    }
+    if patch.youtube_cookie.is_some() {
+        merged.youtube_cookie = patch.youtube_cookie;
+    }
+    if patch.niconico_email.is_some() {
+        merged.niconico_email = patch.niconico_email;
+    }
+    if patch.niconico_password.is_some() {
+        merged.niconico_password = patch.niconico_password;
+    }
+    if patch.niconico_user_session.is_some() {
+        merged.niconico_user_session = patch.niconico_user_session;
+    }
+    if patch.niconico_purge_credentials.is_some() {
+        merged.niconico_purge_credentials = patch.niconico_purge_credentials;
+    }
+    if patch.afreecatv_username.is_some() {
+        merged.afreecatv_username = patch.afreecatv_username;
+    }
+    if patch.afreecatv_password.is_some() {
+        merged.afreecatv_password = patch.afreecatv_password;
+    }
+
+    merged
+}
+
 /// 默认文件大小：2.5GB
 fn default_file_size() -> Option<u64> {
     Some(2_621_440_000)
@@ -634,5 +739,109 @@ mod tests {
         assert_eq!(config.file_size, None);
         assert_eq!(config.segment_time, Some("01:00:00".to_string()));
         assert!(config.validate_segment_limits().is_ok());
+    }
+
+    #[test]
+    fn merge_user_config_keeps_unrelated_fields() {
+        let base = UserConfig {
+            bili_cookie: Some("bili".into()),
+            douyin_cookie: Some("old-douyin".into()),
+            ..UserConfig::default()
+        };
+        let patch = UserConfig {
+            douyin_cookie: Some("new-douyin".into()),
+            ..UserConfig::default()
+        };
+
+        let merged = merge_user_config(Some(base), patch);
+        assert_eq!(merged.bili_cookie.as_deref(), Some("bili"));
+        assert_eq!(merged.douyin_cookie.as_deref(), Some("new-douyin"));
+    }
+
+    #[test]
+    fn apply_override_merges_user_instead_of_replacing() {
+        let mut config = Config::default();
+        config.user = Some(UserConfig {
+            bili_cookie: Some("bili".into()),
+            ..UserConfig::default()
+        });
+
+        let mut patch: ConfigPatch =
+            serde_json::from_str(r#"{"douyin_danmaku": true, "user": {"douyin_cookie": "dy"}}"#)
+                .unwrap();
+        let user_patch = patch.user.take();
+        config.apply(patch);
+        match user_patch {
+            Some(Some(user_patch)) => {
+                config.user = Some(merge_user_config(config.user, user_patch));
+            }
+            Some(None) => config.user = None,
+            None => {}
+        }
+
+        assert_eq!(config.douyin_danmaku, Some(true));
+        let user = config.user.expect("user");
+        assert_eq!(user.bili_cookie.as_deref(), Some("bili"));
+        assert_eq!(user.douyin_cookie.as_deref(), Some("dy"));
+    }
+
+    #[test]
+    fn sparse_override_map_roundtrip_keeps_only_explicit_keys() {
+        let raw = serde_json::json!({
+            "huya_cdn": "AL",
+            "huya_use_wup": false,
+            "file_size": null
+        });
+        let patch = config_patch_from_override_value(&raw).unwrap();
+        let compact = compact_override_value(Some(raw)).unwrap();
+        let obj = compact.as_object().unwrap();
+        assert_eq!(obj.len(), 3);
+        assert_eq!(obj.get("huya_cdn").unwrap(), "AL");
+        assert_eq!(obj.get("huya_use_wup").unwrap(), false);
+        assert!(obj.get("file_size").unwrap().is_null());
+        assert!(!obj.contains_key("huya_danmaku"));
+
+        let mut config = Config::default();
+        config.file_size = Some(123);
+        config.huya_cdn = Some("TX".into());
+        config.huya_use_wup = Some(true);
+        config.apply(patch);
+        assert_eq!(config.file_size, None);
+        assert_eq!(config.huya_cdn.as_deref(), Some("AL"));
+        assert_eq!(config.huya_use_wup, Some(false));
+    }
+
+    #[test]
+    fn config_patch_serialize_is_dense_with_nulls() {
+        // document why we store Map instead of ConfigPatch in DB/API
+        let patch: ConfigPatch =
+            serde_json::from_str(r#"{"huya_cdn":"AL"}"#).unwrap();
+        let value = serde_json::to_value(&patch).unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(obj.contains_key("huya_cdn"));
+        // generated Serialize keeps absent fields as null
+        assert!(obj.values().any(|v| v.is_null()));
+    }
+
+    #[test]
+    fn compact_override_value_drops_noise_nulls() {
+        let raw = serde_json::json!({
+            "huya_cdn": "AL",
+            "huya_danmaku": null,
+            "file_size": null,
+            "user": {
+                "douyin_cookie": "x",
+                "bili_cookie": null
+            }
+        });
+        let compact = compact_override_value(Some(raw)).unwrap();
+        let obj = compact.as_object().unwrap();
+        assert_eq!(obj.len(), 3);
+        assert_eq!(obj.get("huya_cdn").unwrap(), "AL");
+        assert!(obj.get("file_size").unwrap().is_null());
+        assert!(!obj.contains_key("huya_danmaku"));
+        let user = obj.get("user").unwrap().as_object().unwrap();
+        assert_eq!(user.get("douyin_cookie").unwrap(), "x");
+        assert!(!user.contains_key("bili_cookie"));
     }
 }

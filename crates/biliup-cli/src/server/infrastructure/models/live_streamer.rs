@@ -1,4 +1,3 @@
-use crate::server::config::ConfigPatch;
 use crate::server::infrastructure::models::hook_step::HookStep;
 use ormlite::{Insert, Model};
 use serde::{Deserialize, Serialize};
@@ -25,9 +24,10 @@ pub struct LiveStreamer {
     /// 录制格式
     pub format: Option<String>,
     /// 覆盖配置（"override"为关键字，字段名避让）
+    /// 使用稀疏 JSON 对象存储，避免 ConfigPatch 序列化把未覆写字段写成 null
     #[ormlite(column = "override", json)]
     #[serde(rename = "override")]
-    pub override_cfg: Option<ConfigPatch>,
+    pub override_cfg: Option<Value>,
 
     /// 预处理器列表（JSON格式）
     /// 注意：数据库空与json空有区别，所以这里不能用#[ormlite(json)]
@@ -63,7 +63,7 @@ pub struct InsertLiveStreamer {
     #[ormlite(column = "override", json)]
     // “override” 是字段名，这里改为 override_cfg 避免与保留字混淆
     #[serde(rename = "override")]
-    pub override_cfg: Option<ConfigPatch>, // "override" 为关键字，字段名避让
+    pub override_cfg: Option<Value>, // 稀疏 JSON 对象，仅含显式覆写项
 
     // #[ormlite(json)] 数据库空与json空有区别所以这里不能用
     // pub preprocessor: Option<Vec<String>>,

@@ -95,7 +95,6 @@ export default function Home() {
   }
 
   const handleUpdate = async (values: any) => {
-    console.log(values);
     delete values.status
     delete values.statusTag
     delete values.upload_status
@@ -105,7 +104,7 @@ export default function Home() {
       )
     }
     try {
-      const res = await updateStreamers(values)
+      await updateStreamers(values)
     } catch (e: any) {
       Notification.error({
         title: '更新失败',
@@ -269,7 +268,10 @@ export default function Home() {
                         <Button theme="borderless" icon={<IconDeleteStroked />}></Button>
                       </Popconfirm>
                       <span className="semi-button-group-line semi-button-group-line-borderless semi-button-group-line-primary"></span>
-                      <OverrideModal onOk={handleUpdate} entity={item}>
+                      <OverrideModal
+                        onOk={handleUpdate}
+                        entity={streamers?.find(streamer => streamer.id === item.id) ?? item}
+                      >
                         <Button theme="borderless" icon={<IconWrench />}></Button>
                       </OverrideModal>
                     </ButtonGroup>

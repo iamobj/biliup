@@ -34,6 +34,18 @@
   - 保留上游 room_id 缓存、CDN 健康检查回退、回放标题过滤，以及本仓 `huya_cdn`、
     `huya_max_ratio`、`huya_imgplus` 与 `HY/HUYA/HYZJ` 过滤。
   - 主播配置覆写里的布尔开关（如 `huya_use_wup=false`）必须从 `entity.override` 回填，不能只读顶层字段后回退默认值。
+- 主播「配置覆写」使用稀疏 override，而不是完整配置快照：
+  - 前端 `OverrideModal` 以原始主播 entity 为底稿，只替换 `override`，避免保存时清空
+    `filename_prefix` / `upload_streamers_id` 等主播字段。
+  - JSON 与表单双源同步，但真源是显式覆写集合：只收集打开时已有 key、用户改过的字段、
+    以及 JSON 手写 key；未改动的表单默认值不进 override。
+  - 布尔为三态 `unset | true | false`：未覆写继承全局；`OverrideSwitch` 可清除覆写。
+  - 后端 `livestreamers.override` 存稀疏 JSON 对象（`Option<serde_json::Value>`），
+    不要再按 `ConfigPatch` 全量序列化入库，否则未设置字段会变成 `null` 污染回读。
+  - 读写时用 `compact_override_value` 去掉无意义 null；`file_size: null` 这类有语义清空保留。
+  - 运行时 `Worker.get_config()` 将稀疏 override 解析为 `ConfigPatch` 后 apply；
+    `user` 做字段级合并，避免只覆写一个 cookie 时整对象替换清掉其它全局 cookie。
+  - `kuaishou_cookie` 是顶层配置字段，不要写成 `user.kuaishou_cookie`。
 - 抖音弹幕默认使用基于 `v1.0.7` 恢复的 Python 链路，而不是
   `crates/danmaku/src/protocols/douyin.rs` 中的 Rust 协议实现。
   - Rust 下载流程通过 `python-bridge` 和 PyO3 创建
@@ -61,6 +73,12 @@
   - `crates/biliup/src/downloader/live/huya_wup.rs`
   - `app/ui/plugins/huya.tsx`
   - `app/ui/OverrideModal.tsx`
+  - `app/lib/override-config.ts`
+  - `app/ui/components/OverrideSwitch.tsx`
+  - `crates/biliup-cli/src/server/infrastructure/models/live_streamer.rs`
+  - `crates/biliup-cli/src/server/infrastructure/context.rs`
+  - `crates/biliup-cli/src/server/config.rs`
+  - `crates/biliup-cli/src/server/api/endpoints.rs`
 - 上游如改动任何抖音弹幕相关逻辑，包括 Rust/Python 协议、签名算法、WebSocket
   参数或节点、Cookie/UA/room_id 传递、protobuf/ACK、重连、XML rolling、依赖或
   打包配置，不得直接采用上游版本，也不得静默保留本分支版本。
@@ -75,6 +93,12 @@
     `crates/stream-gears/Cargo.toml`。
 - 上游如改动虎牙取流、WUP/TARS、anticode、mobile API 或相关配置/UI，需优先核对本分支
   是否仍对齐 DanmakuRender 的 WUP 默认路径与 anticode 规则，以及主播覆写布尔值回填。
+- 上游如改动主播配置覆写、`LiveStreamer.override`、`ConfigPatch` apply、配置导入或
+  录播管理前端表单，需优先核对本分支稀疏 override 语义是否保留：
+  - 保存不丢主播本体字段
+  - JSON 只含显式覆写项，不会回读成整表 null
+  - 布尔三态与 `user` 字段级合并
+  - `kuaishou_cookie` 顶层路径
 
 ## 开发规范
 

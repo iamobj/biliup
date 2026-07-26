@@ -1,3 +1,4 @@
+'use client'
 import {
   Form,
   Modal,
@@ -5,18 +6,29 @@ import {
   Collapse,
   Select,
   Avatar,
+  Button,
+  Typography,
 } from '@douyinfe/semi-ui'
 import { FormApi } from '@douyinfe/semi-ui/lib/es/form'
-import React, { useRef } from 'react'
-import { useState } from 'react'
+import React, { useMemo, useRef, useState } from 'react'
 import { LiveStreamerEntity } from '../lib/api-streamer'
 import { SupportedPlatforms } from '@/app/ui/plugins'
 import { useBiliUsers } from '../lib/use-streamers'
+import {
+  applyChangedValuesToOverride,
+  cloneOverride,
+  compactOverrideRecord,
+  formatOverrideText,
+  parseOverrideText,
+  pickStreamerPayload,
+  type OverrideRecord,
+} from '@/app/lib/override-config'
+import { IsOverrideFormContext } from '@/app/ui/components/OverrideSwitch'
 
 type PluginProps = {
   entity?: LiveStreamerEntity
   list?: { value: number; label: React.ReactNode }[]
-  initValues?: any
+  initValues?: OverrideRecord
 }
 
 type TemplateModalProps = {
@@ -26,46 +38,15 @@ type TemplateModalProps = {
   onOk: (e: any) => Promise<void>
 }
 
-const removeCircularReferences = (obj: any, seen = new WeakSet()): any => {
-  // 处理 null 或非对象类型
-  if (obj === null || typeof obj !== 'object') return obj
-
-  // 检测循环引用
-  if (seen.has(obj)) return '[Circular Reference]'
-  seen.add(obj)
-
-  if (Array.isArray(obj)) {
-    return obj.map((item: any) => removeCircularReferences(item, seen))
-  }
-
-  const result: Record<string, any> = {}
-  for (const [key, value] of Object.entries(obj)) {
-    // 跳过 React 相关的属性
-    if (key === '_context' || key === 'Provider' || key === 'Consumer') continue
-    result[key] = removeCircularReferences(value, seen)
-  }
-  return result
-}
+type LastEdited = 'form' | 'json'
 
 const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk }) => {
-  const [isOpen, setOpen] = useState(false)
-
-  const toggle = () => {
-    setOpen(!isOpen)
-  }
-
-  const platformSetting = () => {
-    for (const [pattern, Plugin] of Object.entries(SupportedPlatforms)) {
-      if (entity?.url.match(new RegExp(pattern))) {
-        // console.log('匹配到平台:', pattern)
-        return Plugin as React.ComponentType<PluginProps>
-      }
-    }
-    // console.log('未匹配到平台')
-    return null
-  }
-
   const api = useRef<FormApi>()
+  const lastEditedRef = useRef<LastEdited>('form')
+  const overrideRef = useRef<OverrideRecord>({})
+  const syncingRef = useRef(false)
+  const [visible, setVisible] = useState(false)
+  const [formKey, setFormKey] = useState(0)
 
   const { biliUsers } = useBiliUsers()
   const list = biliUsers?.map(item => {
@@ -80,68 +61,114 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
     }
   })
 
-  const [visible, setVisible] = useState(false)
+  const initialOverride = useMemo(
+    () => compactOverrideRecord(entity?.override as OverrideRecord | undefined),
+    // re-init only when opening a different entity or after external entity change while closed
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [entity?.id, visible]
+  )
+
+  const platformPlugin = useMemo(() => {
+    if (!entity?.url) return null
+    for (const [pattern, Plugin] of Object.entries(SupportedPlatforms)) {
+      if (entity.url.match(new RegExp(pattern))) {
+        return Plugin as React.ComponentType<PluginProps>
+      }
+    }
+    return null
+  }, [entity?.url])
+
   const showDialog = () => {
+    const current = compactOverrideRecord(entity?.override as OverrideRecord | undefined)
+    overrideRef.current = current
+    lastEditedRef.current = 'form'
+    setFormKey(prev => prev + 1)
     setVisible(true)
   }
+
+  const applyOverrideToForm = (override: OverrideRecord, source: LastEdited) => {
+    const formApi = api.current
+    if (!formApi) return
+
+    syncingRef.current = true
+    lastEditedRef.current = source
+    overrideRef.current = cloneOverride(override)
+
+    const nextValues: Record<string, any> = {
+      ...cloneOverride(override),
+      override_text: formatOverrideText(override),
+    }
+    formApi.setValues(nextValues, { isOverride: true })
+    // allow form fields to settle before accepting user edits again
+    queueMicrotask(() => {
+      syncingRef.current = false
+    })
+  }
+
+  const writeOverrideText = (override: OverrideRecord) => {
+    const text = formatOverrideText(override)
+    const currentText = api.current?.getValue('override_text')
+    if (currentText === text) return
+    syncingRef.current = true
+    api.current?.setValue('override_text', text)
+    queueMicrotask(() => {
+      syncingRef.current = false
+    })
+  }
+
+  // Only merge explicitly changed form paths into override.
+  // Untouched controls never enter JSON.
+  const syncFormChangeToOverride = (changedValue?: Record<string, any>) => {
+    if (syncingRef.current) return
+    const override = applyChangedValuesToOverride(overrideRef.current, changedValue)
+    overrideRef.current = override
+    lastEditedRef.current = 'form'
+    writeOverrideText(override)
+  }
+
+  const syncJsonToForm = (text?: string) => {
+    if (syncingRef.current) return
+    const parsed = parseOverrideText(text)
+    if (!parsed.ok) {
+      return false
+    }
+    applyOverrideToForm(parsed.value, 'json')
+    return true
+  }
+
   const handleOk = async () => {
-    let values = await api.current?.validate()
-    // 从 LiveStreamerEntity 接口定义中获取所有字段
-    const entityFields = new Set([
-      'id',
-      'url',
-      'remark',
-      'filename',
-      'split_time',
-      'split_size',
-      'upload_id',
-      'status',
-      'format',
-      'time_range',
-      'excluded_keywords',
-      'preprocessor',
-      'segment_processor',
-      'downloaded_processor',
-      'postprocessor',
-      'opt_args',
-      'override',
-    ])
-
-    if (values) {
-      // 处理 override_text
-      if (values.override_text) {
-        try {
-          values.override = JSON.parse(values.override_text)
-          delete values.override_text
-        } catch (e) {
-          Notification.error({
-            title: '错误',
-            content: '配置格式不正确，请检查 JSON 格式',
-          })
-          return
-        }
-      }
-
-      const overrideConfig = { ...(values.override || {}) }
-      Object.keys(values).forEach(key => {
-        console.log(key, values[key])
-        if (!entityFields.has(key)) {
-          if (values[key] !== undefined) {
-            overrideConfig[key] = values[key] === '' ? null : values[key]
-          }
-          delete values[key]
-        }
-      })
-      values.override = overrideConfig
-
-      // 处理循环引用
-      const cleanValues = removeCircularReferences(values)
-      await onOk(cleanValues)
-      setVisible(false)
+    try {
+      await api.current?.validate()
+    } catch {
       return
     }
+
+    let override: OverrideRecord
+    if (lastEditedRef.current === 'json') {
+      const text = api.current?.getValue('override_text')
+      const parsed = parseOverrideText(text)
+      if (!parsed.ok) {
+        Notification.error({
+          title: '错误',
+          content: parsed.error,
+        })
+        return
+      }
+      override = compactOverrideRecord(parsed.value)
+    } else {
+      // form edits already merged into overrideRef via onValueChange
+      override = compactOverrideRecord(overrideRef.current)
+    }
+
+    const payload = {
+      ...pickStreamerPayload(entity as Record<string, any>),
+      override,
+    }
+
+    await onOk(payload)
     setVisible(false)
   }
+
   const handleCancel = () => {
     setVisible(false)
   }
@@ -237,6 +264,8 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
     </Collapse.Panel>
   )
 
+  const Plugin = platformPlugin
+
   return (
     <>
       {childrenWithProps}
@@ -253,47 +282,93 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
           paddingRight: 10,
         }}
       >
-        <Form
-          initValues={{
-            ...(entity || {}),
-            ...((entity?.override as Record<string, any>) || {}),
-          }}
-          getFormApi={formApi => (api.current = formApi)}
-        >
-          <Form.TextArea
-            field="override_text"
-            label="配置覆写"
-            placeholder="请输入 JSON 格式的配置"
-            style={{ marginBottom: 12 }}
-            initValue={entity?.override ? JSON.stringify(entity.override, null, 2) : ''}
-            rules={[
-              { required: false },
-              {
-                validator: (rule, value) => {
-                  if (!value) return true
-                  try {
-                    JSON.parse(value)
-                    return true
-                  } catch (e) {
-                    return false
-                  }
+        {visible ? (
+          <IsOverrideFormContext.Provider value={true}>
+          <Form
+            key={`${entity?.id ?? 'new'}-${formKey}`}
+            initValues={{
+              ...cloneOverride(initialOverride),
+              override_text: formatOverrideText(initialOverride),
+            }}
+            getFormApi={formApi => {
+              api.current = formApi
+              overrideRef.current = compactOverrideRecord(initialOverride)
+            }}
+            onValueChange={(_values, changedValue) => {
+              if (syncingRef.current) return
+              const changedKeys = Object.keys(changedValue || {})
+              if (changedKeys.length === 1 && changedKeys[0] === 'override_text') {
+                lastEditedRef.current = 'json'
+                return
+              }
+              // Ignore bulk setValues payloads that only refresh override_text
+              const meaningful = Object.keys(changedValue || {}).filter(
+                key => key !== 'override_text'
+              )
+              if (!meaningful.length) return
+              syncFormChangeToOverride(changedValue)
+            }}
+          >
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                marginBottom: 8,
+              }}
+            >
+              <Typography.Text type="tertiary" size="small">
+                仅保存显式覆写项；清除字段后继承全局配置
+              </Typography.Text>
+              <Button
+                theme="borderless"
+                type="tertiary"
+                size="small"
+                onClick={() => applyOverrideToForm({}, 'form')}
+              >
+                清空全部覆写
+              </Button>
+            </div>
+            <Form.TextArea
+              field="override_text"
+              label="配置覆写"
+              placeholder="请输入 JSON 格式的配置"
+              style={{ marginBottom: 12 }}
+              onBlur={e => {
+                const text = (e?.target as HTMLTextAreaElement | undefined)?.value
+                  ?? api.current?.getValue('override_text')
+                const parsed = parseOverrideText(text)
+                if (!parsed.ok) {
+                  Notification.error({
+                    title: '错误',
+                    content: parsed.error,
+                  })
+                  return
+                }
+                syncJsonToForm(text)
+              }}
+              rules={[
+                { required: false },
+                {
+                  validator: (_rule, value) => {
+                    if (!value) return true
+                    return parseOverrideText(value).ok
+                  },
+                  message: '请输入有效的 JSON 格式',
                 },
-                message: '请输入有效的 JSON 格式',
-              },
-            ]}
-          />
-          <Form.Section>
-            <Collapse defaultActiveKey={['plugin']}>
-              {downloadSettings}
-              {(() => {
-                const Plugin = platformSetting()
-                return Plugin ? (
-                  <Plugin entity={entity} list={list} initValues={entity?.override} />
-                ) : null
-              })()}
-            </Collapse>
-          </Form.Section>
-        </Form>
+              ]}
+            />
+            <Form.Section>
+              <Collapse defaultActiveKey={['plugin', 'download']}>
+                {downloadSettings}
+                {Plugin ? (
+                  <Plugin entity={entity} list={list} initValues={initialOverride} />
+                ) : null}
+              </Collapse>
+            </Form.Section>
+          </Form>
+          </IsOverrideFormContext.Provider>
+        ) : null}
       </Modal>
     </>
   )

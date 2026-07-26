@@ -1,6 +1,7 @@
 'use client'
-import React, { useEffect } from 'react'
-import { Form, Select, Collapse, useFormApi } from '@douyinfe/semi-ui'
+import React from 'react'
+import { Form, Select, Collapse } from '@douyinfe/semi-ui'
+import OverrideSwitch from '@/app/ui/components/OverrideSwitch'
 
 type Props = {
   entity: any
@@ -9,16 +10,7 @@ type Props = {
 }
 
 const Huya: React.FC<Props> = props => {
-  const { entity, list, initValues } = props
-  const formApi = useFormApi()
-
-  useEffect(() => {
-    if (initValues) {
-      Object.entries(initValues).forEach(([key, value]) => {
-        formApi.setValue(key, value)
-      })
-    }
-  }, [initValues, formApi])
+  const { entity, list } = props
 
   return (
     <>
@@ -52,10 +44,10 @@ const Huya: React.FC<Props> = props => {
           <Select.Option value={2000}>超清（2000）</Select.Option>
           <Select.Option value={500}>流畅（500）</Select.Option>
         </Form.Select>
-        <Form.Switch
+        <OverrideSwitch
           field="huya_danmaku"
-          extraText="录制虎牙弹幕，默认关闭"
           label="录制弹幕（huya_danmaku）"
+          extraText="录制虎牙弹幕，默认关闭"
         />
         <Form.Select
           allowCreate={true}
@@ -89,10 +81,10 @@ const Huya: React.FC<Props> = props => {
           <Select.Option value="TX15">直播线路15（TX15）</Select.Option>
           {/* <Select.Option value="HW16">直播线路16（HW16）</Select.Option> */}
         </Form.Select>
-        <Form.Switch
+        <OverrideSwitch
           field="huya_cdn_fallback"
-          extraText="当访问线路（huya_cdn）不可用时，尝试其他线路（huya_cdn_fallback）"
           label="CDN 回退（huya_cdn_fallback）"
+          extraText="当访问线路（huya_cdn）不可用时，尝试其他线路（huya_cdn_fallback）"
         />
         <Form.Select
           field="huya_protocol"
@@ -108,42 +100,26 @@ const Huya: React.FC<Props> = props => {
           <Select.Option value="Flv">Flv（默认）</Select.Option>
           <Select.Option value="Hls">Hls</Select.Option>
         </Form.Select>
-        <Form.Switch
+        <OverrideSwitch
           field="huya_imgplus"
-          extraText="是否录制二次编码的直播流。默认为启用，关闭后可能无法下载。部分直播间的分辨率超分（如2k/4k）和HDR画质依赖于二次编码，请谨慎关闭。"
           label="虎牙二次编码（huya_imgplus）"
-          initValue={
-            (initValues ?? entity)?.hasOwnProperty('huya_imgplus')
-              ? (initValues ?? entity)['huya_imgplus']
-              : true
-          }
-          fieldStyle={{
-            alignSelf: 'stretch',
-            padding: 0,
-          }}
+          extraText="是否录制二次编码的直播流。默认为启用，关闭后可能无法下载。部分直播间的分辨率超分（如2k/4k）和HDR画质依赖于二次编码，请谨慎关闭。"
+          fieldStyle={{alignSelf: 'stretch',
+            padding: 0,}}
         />
-        <Form.Switch
+        <OverrideSwitch
           field="huya_mobile_api"
-          extraText="移动端 API 请求直播间信息，可能解决部分直播分区 2 分钟分段问题"
           label="使用移动端 API（huya_mobile_api）"
-          fieldStyle={{
-            alignSelf: 'stretch',
-            padding: 0,
-          }}
+          extraText="移动端 API 请求直播间信息，可能解决部分直播分区 2 分钟分段问题"
+          fieldStyle={{alignSelf: 'stretch',
+            padding: 0,}}
         />
-        <Form.Switch
+        <OverrideSwitch
           field="huya_use_wup"
-          extraText="使用 WUP 协议获取直播流，可能解决部分直播分区 2 分钟分段问题"
           label="使用 WUP 协议（huya_use_wup）"
-          initValue={
-            (initValues ?? entity)?.hasOwnProperty('huya_use_wup')
-              ? (initValues ?? entity)['huya_use_wup']
-              : true
-          }
-          fieldStyle={{
-            alignSelf: 'stretch',
-            padding: 0,
-          }}
+          extraText="使用 WUP 协议获取直播流，可能解决部分直播分区 2 分钟分段问题"
+          fieldStyle={{alignSelf: 'stretch',
+            padding: 0,}}
         />
       </Collapse.Panel>
     </>

@@ -1,6 +1,6 @@
 use crate::server::common::upload::{build_studio, submit_to_bilibili, upload};
 use crate::server::common::util::Recorder;
-use crate::server::config::Config;
+use crate::server::config::{compact_override_value, Config};
 use crate::server::core::download_manager::DownloadManager;
 use crate::server::errors::{AppError, report_to_response};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
@@ -37,6 +37,12 @@ use tokio::io::AsyncWriteExt;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+
+fn normalize_streamer_override(mut streamer: LiveStreamer) -> LiveStreamer {
+    streamer.override_cfg = compact_override_value(streamer.override_cfg.take());
+    streamer
+}
+
 pub async fn get_streamers_endpoint(
     State(pool): State<ConnectionPool>,
     State(managers): State<Arc<DownloadManager>>,
@@ -57,7 +63,7 @@ pub async fn get_streamers_endpoint(
 
         results.push(LiveStreamerResponse {
             status,
-            inner: x,
+            inner: normalize_streamer_override(x),
             upload_status: option
                 .map(|t| format!("{:?}", *t.uploader_status.read().unwrap()))
                 .unwrap_or_default(),
@@ -74,6 +80,8 @@ pub async fn post_streamers_endpoint(
 ) -> Result<Json<LiveStreamer>, Response> {
     let url = &payload.url.clone();
     // You can insert the model directly.
+    let mut payload = payload;
+    payload.override_cfg = compact_override_value(payload.override_cfg.take());
     let live_streamers = payload
         .insert(&pool)
         .await
@@ -100,7 +108,7 @@ pub async fn put_streamers_endpoint(
     State(pool): State<ConnectionPool>,
     Json(payload): Json<LiveStreamer>,
 ) -> Result<Json<LiveStreamer>, Response> {
-    let streamer = payload
+    let streamer = normalize_streamer_override(payload)
         .update_all_fields(&pool)
         .await
         .change_context(AppError::Unknown)

@@ -96,22 +96,21 @@ export interface LiveStreamerEntity {
 	id: number;
 	url: string;
 	remark: string;
-	filename: string;
-	split_time?: number;
-	split_size?: number;
-	upload_id?: number;
-	status?: string;
-	upload_status?: string;
-	statusTag?: React.ReactNode;
+	filename_prefix?: string;
+	time_range?: string | Date[];
+	upload_streamers_id?: number;
 	format?: string;
-    time_range?: string | Date[];
-    excluded_keywords?: string[];
+	excluded_keywords?: string[];
 	preprocessor?: Record<'run', string>[];
 	segment_processor?: Record<'run', string>[];
 	downloaded_processor?: Record<'run', string>[];
 	postprocessor?: (Record<'run' | 'mv', string> | 'rm')[];
 	opt_args?: string[];
 	override?: Record<string, any>;
+	// runtime / UI-only fields returned by list API
+	status?: string;
+	upload_status?: string;
+	statusTag?: React.ReactNode;
 }
 
 export interface BiliType {

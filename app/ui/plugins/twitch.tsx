@@ -1,6 +1,7 @@
 'use client'
-import React, { useEffect } from 'react'
-import { Form, Select, Collapse, useFormApi } from '@douyinfe/semi-ui'
+import React from 'react'
+import { Form, Select, Collapse } from '@douyinfe/semi-ui'
+import OverrideSwitch from '@/app/ui/components/OverrideSwitch'
 
 type Props = {
   entity: any
@@ -9,38 +10,24 @@ type Props = {
 }
 
 const Twitch: React.FC<Props> = props => {
-  const { entity, list, initValues } = props
-  const formApi = useFormApi()
-
-  useEffect(() => {
-    if (initValues) {
-      Object.entries(initValues).forEach(([key, value]) => {
-        formApi.setValue(key, value)
-      })
-    }
-  }, [initValues, formApi])
+  const { entity, list } = props
 
   return (
     <>
       <Collapse.Panel header="Twitch" itemKey="twitch">
-        <Form.Switch
+        <OverrideSwitch
           field="twitch_danmaku"
-          extraText="录制Twitch弹幕，默认关闭"
           label="录制弹幕（twitch_danmaku）"
+          extraText="录制Twitch弹幕，默认关闭"
         />
-        <Form.Switch
-          initValue={
-            entity?.hasOwnProperty('twitch_disable_ads') ? entity['twitch_disable_ads'] : true
-          }
+        <OverrideSwitch
           field="twitch_disable_ads"
+          label="去除广告（twitch_disable_ads）"
           extraText="去除Twitch广告功能，默认开启
 这个功能会导致Twitch录播分段，因为遇到广告就自动断开了，这就是去广告。若需要录播完整一整段可以关闭这个，但是关了之后就会有紫色屏幕的CommercialTime
 还有一个办法是去花钱开一个Turbo会员，然后下面的user里把twitch的cookie填上，也能去除广告"
-          label="去除广告（twitch_disable_ads）"
-          fieldStyle={{
-            alignSelf: 'stretch',
-            padding: 0,
-          }}
+          fieldStyle={{alignSelf: 'stretch',
+            padding: 0,}}
         />
         <Form.Input
           field="user.twitch_cookie"

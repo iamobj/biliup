@@ -1,6 +1,7 @@
 'use client'
-import React, { useEffect } from 'react'
-import { Form, Select, Collapse, useFormApi } from '@douyinfe/semi-ui'
+import React from 'react'
+import { Form, Select, Collapse } from '@douyinfe/semi-ui'
+import OverrideSwitch from '@/app/ui/components/OverrideSwitch'
 
 type Props = {
   entity: any
@@ -9,16 +10,7 @@ type Props = {
 }
 
 const TwitCasting: React.FC<Props> = props => {
-  const { entity, list, initValues } = props
-  const formApi = useFormApi()
-
-  useEffect(() => {
-    if (initValues) {
-      Object.entries(initValues).forEach(([key, value]) => {
-        formApi.setValue(key, value)
-      })
-    }
-  }, [initValues, formApi])
+  const { entity, list } = props
 
   return (
     <>
@@ -42,14 +34,12 @@ const TwitCasting: React.FC<Props> = props => {
           <Select.Option value="medium">中画质（medium）</Select.Option>
           <Select.Option value="low">低画质（low）</Select.Option>
         </Form.Select>
-        <Form.Switch
+        <OverrideSwitch
           field="twitcasting_danmaku"
-          extraText="录制TwitCasting弹幕，默认关闭"
           label="录制弹幕（twitcasting_danmaku）"
-          fieldStyle={{
-            alignSelf: 'stretch',
-            padding: 0,
-          }}
+          extraText="录制TwitCasting弹幕，默认关闭"
+          fieldStyle={{alignSelf: 'stretch',
+            padding: 0,}}
         />
       <Form.Input
           field="user.twitcasting_cookie"
