@@ -104,6 +104,19 @@ pub async fn download(
         let resp = client.retryable(media_url.as_str()).await?;
         let bs = resp.bytes().await?;
         if let Ok((_, playlist)) = m3u8_rs::parse_media_playlist(&bs) {
+            if splitting.split_on_timestamp_anomaly()
+                && previous_last_segment > 0
+                && playlist.media_sequence > 0
+                && playlist.media_sequence + 1 < previous_last_segment
+            {
+                warn!(
+                    "media sequence reset detected: previous_last={previous_last_segment}, new_seq={}",
+                    playlist.media_sequence
+                );
+                ts_file.create_new()?;
+                splitting.reset();
+                previous_last_segment = 0;
+            }
             pl = playlist;
         }
     }

@@ -23,7 +23,7 @@ import {
   pickStreamerPayload,
   type OverrideRecord,
 } from '@/app/lib/override-config'
-import { IsOverrideFormContext } from '@/app/ui/components/OverrideSwitch'
+import OverrideSwitch, { IsOverrideFormContext } from '@/app/ui/components/OverrideSwitch'
 
 type PluginProps = {
   entity?: LiveStreamerEntity
@@ -248,6 +248,16 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
           },
         ]}
         stopValidateWithError={true}
+      />
+
+      <OverrideSwitch
+        field="split_on_timestamp_anomaly"
+        label="时间戳异常自动切文件（split_on_timestamp_anomaly）"
+        extraText={
+          <div style={{ fontSize: '14px' }}>
+            检测到直播流时间戳异常时自动切文件。未覆写时继承全局配置（默认开启）。
+          </div>
+        }
       />
 
       <Form.InputNumber

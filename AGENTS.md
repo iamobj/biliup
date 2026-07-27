@@ -13,6 +13,15 @@
   - `uploader=Noop` 与无投稿模板一致：跳过实际上传，但仍执行 `segment_processor`。
   - 单个分段处理失败时只跳过该分段，不中断后续分段处理。
   - 成功处理后的路径会继续交给 `postprocessor`。
+- 时间戳异常时自动切文件（默认开启，`split_on_timestamp_anomaly`）：
+  - 适用于 `ffmpeg` / `stream-gears`；streamlink、sync-downloader 不改。
+  - 触发条件：DTS 回退、时间戳跳变 ≥ 2 秒，或 FFmpeg 报
+    `Non-monotonous DTS` / `non monotonically increasing dts` / `out of order`。
+  - FFmpeg：解析 stderr 命中后结束当前进程并落盘，由现有仍在播重试循环立刻开新文件；
+    5 秒冷却防抖。
+  - stream-gears FLV：关键帧边界检测异常后 `create_new`；HLS 保留 discontinuity，
+    并在 media sequence 明显回退时切段。
+  - 全局配置与主播 override 均可开关；override 布尔三态 `unset | true | false`。
 - `download.log` 按 50 MiB 自动分割，保留当前文件和最新 1 份历史分片。
   - 当前文件名固定为 `download.log`，历史文件为 `download.log.1`。
   - tracing 下载日志和 Hook 的 stdout/stderr 共用进程级写入器，避免并发轮转时

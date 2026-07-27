@@ -25,6 +25,10 @@ pub struct Config {
     #[serde(default)]
     pub segment_time: Option<String>,
 
+    /// 时间戳异常时自动切文件（开延迟/DTS 回退等）
+    #[serde(default = "default_split_on_timestamp_anomaly")]
+    pub split_on_timestamp_anomaly: Option<bool>,
+
     /// 过滤阈值（MB）
     #[builder(default = default_filtering_threshold())]
     #[serde(default = "default_filtering_threshold")]
@@ -555,6 +559,11 @@ pub fn default_segment_time() -> Option<String> {
     None
 }
 
+/// 默认开启时间戳异常自动切文件
+fn default_split_on_timestamp_anomaly() -> Option<bool> {
+    Some(true)
+}
+
 /// 默认过滤阈值：20MB
 fn default_filtering_threshold() -> u64 {
     20
@@ -655,7 +664,15 @@ mod tests {
 
         assert_eq!(config.file_size, default_file_size());
         assert_eq!(config.segment_time, None);
+        assert_eq!(config.split_on_timestamp_anomaly, Some(true));
         assert!(config.validate_segment_limits().is_ok());
+    }
+
+    #[test]
+    fn split_on_timestamp_anomaly_can_be_disabled() {
+        let config: Config =
+            serde_json::from_str(r#"{"split_on_timestamp_anomaly": false}"#).unwrap();
+        assert_eq!(config.split_on_timestamp_anomaly, Some(false));
     }
 
     #[test]

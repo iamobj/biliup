@@ -3,7 +3,7 @@ use crate::downloader::flv_parser::{
     aac_audio_packet_header, avc_video_packet_header, script_data, tag_data, tag_header,
 };
 use crate::downloader::flv_writer::{FlvFile, FlvTag, TagDataHeader};
-use crate::downloader::util::{LifecycleFile, Segmentable};
+use crate::downloader::util::{is_timestamp_anomaly, LifecycleFile, Segmentable};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use nom::{Err, IResult};
 use reqwest::Response;
@@ -150,7 +150,15 @@ pub(crate) async fn parse_flv(
                 }
                 segment.set_time_position(Duration::from_millis(timestamp));
                 for (tag_header, flv_tag_data, previous_tag_size_bytes) in &flv_tags_cache {
-                    if tag_header.timestamp < prev_timestamp {
+                    if segment.split_on_timestamp_anomaly()
+                        && is_timestamp_anomaly(prev_timestamp, tag_header.timestamp)
+                    {
+                        warn!(
+                            "timestamp anomaly before keyframe flush; previous: {prev_timestamp}, current: {}; splitting",
+                            tag_header.timestamp
+                        );
+                        create_new = true;
+                    } else if tag_header.timestamp < prev_timestamp {
                         warn!(
                             "Non-monotonous DTS in output stream; previous: {prev_timestamp}, current: {};",
                             tag_header.timestamp
@@ -163,6 +171,16 @@ pub(crate) async fn parse_flv(
                     // println!("{downloaded_size}");
                 }
                 flv_tags_cache.clear();
+
+                if segment.split_on_timestamp_anomaly()
+                    && is_timestamp_anomaly(prev_timestamp, flv_tag.header.timestamp)
+                {
+                    warn!(
+                        "timestamp anomaly at keyframe; previous: {prev_timestamp}, current: {}; splitting",
+                        flv_tag.header.timestamp
+                    );
+                    create_new = true;
+                }
 
                 if segment.needed() || create_new {
                     segment.set_start_time(Duration::from_millis(timestamp));

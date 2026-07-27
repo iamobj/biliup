@@ -158,6 +158,22 @@ const Global: React.FC = () => {
           ]}
           stopValidateWithError={true}
         />
+
+        <Form.Switch
+          field="split_on_timestamp_anomaly"
+          extraText={
+            <div style={{ fontSize: '14px' }}>
+              检测到直播流时间戳回退/大幅跳变（如主播中途开延迟）时自动切分文件，避免音画不同步写进同一文件。
+              <br />
+              默认开启；适用于 ffmpeg / stream-gears。
+            </div>
+          }
+          label="时间戳异常自动切文件（split_on_timestamp_anomaly）"
+          fieldStyle={{
+            alignSelf: 'stretch',
+            padding: 0,
+          }}
+        />
         <Form.Input
           field="filename_prefix"
           extraText={

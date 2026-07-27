@@ -7,6 +7,21 @@ use tracing::{error, info};
 
 pub type CallbackFn<'a> = Box<dyn FnMut(&str) + Send + Sync + 'a>;
 
+/// 时间戳前跳阈值：2 秒
+pub const TIMESTAMP_JUMP_THRESHOLD_MS: u32 = 2000;
+/// 时间戳异常切文件冷却：5 秒
+pub const TIMESTAMP_ANOMALY_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// 判断流时间戳是否异常（回退或大幅跳变）
+///
+/// `prev_ms == 0` 视为首包，不触发。
+pub fn is_timestamp_anomaly(prev_ms: u32, current_ms: u32) -> bool {
+    if prev_ms == 0 {
+        return false;
+    }
+    current_ms < prev_ms || current_ms.abs_diff(prev_ms) >= TIMESTAMP_JUMP_THRESHOLD_MS
+}
+
 #[derive(Debug)]
 pub enum Segment {
     Time(Duration, Duration),
@@ -18,6 +33,8 @@ pub enum Segment {
 pub struct Segmentable {
     time: Time,
     size: Size,
+    /// 时间戳异常时是否自动切文件
+    split_on_timestamp_anomaly: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -45,7 +62,16 @@ impl Segmentable {
                 expected: expected_size,
                 current: 0,
             },
+            split_on_timestamp_anomaly: true,
         }
+    }
+
+    pub fn set_split_on_timestamp_anomaly(&mut self, enabled: bool) {
+        self.split_on_timestamp_anomaly = enabled;
+    }
+
+    pub fn split_on_timestamp_anomaly(&self) -> bool {
+        self.split_on_timestamp_anomaly
     }
 
     /// 检查是否需要分割 - 只要时间或大小任一条件满足就返回 true
@@ -222,6 +248,7 @@ impl Default for Segmentable {
                 expected: None,
                 current: 0,
             },
+            split_on_timestamp_anomaly: true,
         }
     }
 }
@@ -350,5 +377,14 @@ mod tests {
         assert!(seg.size_needed());
 
         Ok(())
+    }
+
+    #[test]
+    fn is_timestamp_anomaly_detects_regression_and_jump() {
+        assert!(!is_timestamp_anomaly(0, 5000));
+        assert!(!is_timestamp_anomaly(1000, 1200));
+        assert!(is_timestamp_anomaly(3000, 1000));
+        assert!(is_timestamp_anomaly(1000, 4000));
+        assert!(!is_timestamp_anomaly(1000, 2999));
     }
 }

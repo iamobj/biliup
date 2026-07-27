@@ -122,6 +122,7 @@ impl Context {
             url: stream.raw_stream_url.to_string(),
             segment_time: config.segment_time,
             file_size: config.file_size,
+            split_on_timestamp_anomaly: config.split_on_timestamp_anomaly.unwrap_or(true),
             headers: stream.stream_headers.clone(),
             recorder: self.recorder(stream_info),
             // output_dir: PathBuf::from("./downloads")

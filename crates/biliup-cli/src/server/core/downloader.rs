@@ -27,7 +27,7 @@ use pyo3::types::PyDict;
 
 /// 下载器配置
 /// 包含下载过程中需要的各种参数和设置
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DownloadConfig {
     /// 流 URL
     pub(crate) url: String,
@@ -36,6 +36,10 @@ pub struct DownloadConfig {
 
     /// 分段文件大小限制 (字节)
     pub file_size: Option<u64>,
+
+    /// 时间戳异常时自动切文件
+    #[serde(default = "default_split_on_timestamp_anomaly_enabled")]
+    pub split_on_timestamp_anomaly: bool,
 
     /// HTTP请求头
     pub headers: HashMap<String, String>,
@@ -47,6 +51,25 @@ pub struct DownloadConfig {
     pub output_dir: PathBuf,
 
     pub suffix: String,
+}
+
+fn default_split_on_timestamp_anomaly_enabled() -> bool {
+    true
+}
+
+impl Default for DownloadConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            segment_time: None,
+            file_size: None,
+            split_on_timestamp_anomaly: true,
+            headers: HashMap::new(),
+            recorder: Default::default(),
+            output_dir: PathBuf::new(),
+            suffix: String::new(),
+        }
+    }
 }
 
 impl DownloadConfig {

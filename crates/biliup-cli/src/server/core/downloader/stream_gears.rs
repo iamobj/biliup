@@ -48,10 +48,11 @@ impl StreamGears {
         let file_name = download_config.recorder.filename_template();
         let headers_in = construct_headers(&download_config.headers).map_err(AppError::Custom)?;
         let proxy = self.proxy.clone();
-        let segment = Segmentable::new(
+        let mut segment = Segmentable::new(
             download_config.segment_time.as_deref().map(parse_time),
             download_config.file_size,
         );
+        segment.set_split_on_timestamp_anomaly(download_config.split_on_timestamp_anomaly);
 
         // 创建HTTP客户端
         let client = StatelessClient::new(headers_in, proxy.as_deref());
