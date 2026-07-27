@@ -110,7 +110,7 @@ pub async fn download(
                 && playlist.media_sequence + 1 < previous_last_segment
             {
                 warn!(
-                    "media sequence reset detected: previous_last={previous_last_segment}, new_seq={}",
+                    "检测到 HLS media sequence 回退，准备切分文件 previous_last={previous_last_segment} new_seq={}",
                     playlist.media_sequence
                 );
                 ts_file.create_new()?;

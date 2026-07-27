@@ -154,13 +154,13 @@ pub(crate) async fn parse_flv(
                         && is_timestamp_anomaly(prev_timestamp, tag_header.timestamp)
                     {
                         warn!(
-                            "timestamp anomaly before keyframe flush; previous: {prev_timestamp}, current: {}; splitting",
+                            "关键帧刷新前检测到时间戳异常，准备切分文件 previous={prev_timestamp} current={}",
                             tag_header.timestamp
                         );
                         create_new = true;
                     } else if tag_header.timestamp < prev_timestamp {
                         warn!(
-                            "Non-monotonous DTS in output stream; previous: {prev_timestamp}, current: {};",
+                            "输出流 DTS 非单调 previous={prev_timestamp} current={}",
                             tag_header.timestamp
                         );
                     }
@@ -176,7 +176,7 @@ pub(crate) async fn parse_flv(
                     && is_timestamp_anomaly(prev_timestamp, flv_tag.header.timestamp)
                 {
                     warn!(
-                        "timestamp anomaly at keyframe; previous: {prev_timestamp}, current: {}; splitting",
+                        "关键帧处检测到时间戳异常，准备切分文件 previous={prev_timestamp} current={}",
                         flv_tag.header.timestamp
                     );
                     create_new = true;

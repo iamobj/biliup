@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::RwLock;
@@ -158,7 +158,7 @@ impl FfmpegDownloader {
         let child = cmd.spawn().change_context(AppError::Unknown)?;
         let (status, anomaly) = spawn_log(
             child,
-            &self.process_handle,
+            Arc::clone(&self.process_handle),
             download_config.split_on_timestamp_anomaly,
         )
         .await?;
@@ -241,12 +241,9 @@ impl FfmpegDownloader {
                     *guard = Some(path);
                 }
                 if detector.observe(&line) {
-                    warn!("FFmpeg timestamp anomaly detected, splitting current segment");
+                    warn!("检测到 FFmpeg 时间戳异常，正在优雅结束当前文件以便收尾落盘");
                     anomaly_flag.store(true, Ordering::SeqCst);
-                    let mut handle = process_handle.write().await;
-                    if let Some(child) = handle.as_mut() {
-                        let _ = child.start_kill();
-                    }
+                    stop_ffmpeg_for_split(Arc::clone(&process_handle)).await;
                 }
             }
         });
@@ -293,7 +290,7 @@ impl FfmpegDownloader {
             && let Some(final_path) = finalize_part_file(&part_path).await?
             && finalized.insert(final_path.clone())
         {
-            info!("finalized leftover part: {part_path:?} -> {final_path:?}");
+            info!("补齐未回调的分段文件: {part_path:?} -> {final_path:?}");
             callback(SegmentEvent::Segment(SegmentInfo {
                 prev_file_path: final_path,
                 danmaku_file_path: None,
@@ -374,7 +371,9 @@ impl TimestampAnomalyDetector {
 
 fn is_ffmpeg_timestamp_anomaly_line(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
-    lower.contains("non-monotonous dts")
+    // FFmpeg 新旧文案都有：Non-monotonic / Non-monotonous
+    lower.contains("non-monotonic dts")
+        || lower.contains("non-monotonous dts")
         || lower.contains("non monotonically increasing dts")
         || lower.contains("out of order")
 }
@@ -428,7 +427,7 @@ fn strip_part_suffix(path: &Path) -> PathBuf {
 
 async fn spawn_log(
     mut child: tokio::process::Child,
-    process_handle: &RwLock<Option<tokio::process::Child>>,
+    process_handle: Arc<RwLock<Option<tokio::process::Child>>>,
     split_on_timestamp_anomaly: bool,
 ) -> AppResult<(ExitStatus, bool)> {
     let stderr = child.stderr.take().ok_or(AppError::Custom(
@@ -446,12 +445,9 @@ async fn spawn_log(
     while let Ok(Some(line)) = stderr_lines.next_line().await {
         info!("[ffmpeg] {line}");
         if detector.observe(&line) {
-            warn!("FFmpeg timestamp anomaly detected, splitting current segment");
+            warn!("检测到 FFmpeg 时间戳异常，正在优雅结束当前文件以便收尾落盘");
             anomaly = true;
-            let mut handle = process_handle.write().await;
-            if let Some(child) = handle.as_mut() {
-                let _ = child.start_kill();
-            }
+            stop_ffmpeg_for_split(Arc::clone(&process_handle)).await;
         }
     }
 
@@ -466,6 +462,55 @@ async fn spawn_log(
     Ok((status, anomaly))
 }
 
+/// 时间戳异常切分时优先让 FFmpeg 优雅退出，以便写完 moov 等容器尾部。
+/// 若超时仍未退出，再强制结束，避免卡死整场录制。
+async fn stop_ffmpeg_for_split(process_handle: Arc<RwLock<Option<tokio::process::Child>>>) {
+    let interrupted = {
+        let handle = process_handle.read().await;
+        match handle.as_ref() {
+            Some(child) => interrupt_ffmpeg_child(child),
+            None => false,
+        }
+    };
+
+    if interrupted {
+        info!("已向 FFmpeg 发送中断信号，等待容器正常收尾");
+        let force_handle = Arc::clone(&process_handle);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            let mut handle = force_handle.write().await;
+            if let Some(child) = handle.as_mut() {
+                warn!("FFmpeg 未在时限内退出，改为强制结束");
+                let _ = child.start_kill();
+            }
+        });
+        return;
+    }
+
+    let mut handle = process_handle.write().await;
+    if let Some(child) = handle.as_mut() {
+        warn!("无法发送中断信号，改为强制结束 FFmpeg");
+        let _ = child.start_kill();
+    }
+}
+
+fn interrupt_ffmpeg_child(child: &tokio::process::Child) -> bool {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            // SIGINT 对应 ffmpeg 的正常中断路径，通常会完成 muxer trailer 写入。
+            let rc = unsafe { libc::kill(pid as i32, libc::SIGINT) };
+            return rc == 0;
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child;
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,6 +523,9 @@ mod tests {
         ));
         assert!(is_ffmpeg_timestamp_anomaly_line(
             "[mp4 @ 0x] Non-monotonous DTS in output stream"
+        ));
+        assert!(is_ffmpeg_timestamp_anomaly_line(
+            "[vost#0:0/copy @ 0x] Non-monotonic DTS; previous: 27189520, current: 27074992; changing to 27189521."
         ));
         assert!(is_ffmpeg_timestamp_anomaly_line(
             "Packet is out of order, dropping"

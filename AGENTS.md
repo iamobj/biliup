@@ -16,7 +16,7 @@
 - 时间戳异常时自动切文件（默认开启，`split_on_timestamp_anomaly`）：
   - 适用于 `ffmpeg` / `stream-gears`；streamlink、sync-downloader 不改。
   - 触发条件：DTS 回退、时间戳跳变 ≥ 2 秒，或 FFmpeg 报
-    `Non-monotonous DTS` / `non monotonically increasing dts` / `out of order`。
+    `Non-monotonous DTS` / `non monotonically increasing dts` / `out of order` / `non-monotonic dts`。
   - FFmpeg：解析 stderr 命中后结束当前进程并落盘，由现有仍在播重试循环立刻开新文件；
     5 秒冷却防抖。
   - stream-gears FLV：关键帧边界检测异常后 `create_new`；HLS 保留 discontinuity，
