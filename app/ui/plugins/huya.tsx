@@ -117,7 +117,7 @@ const Huya: React.FC<Props> = props => {
         <OverrideSwitch
           field="huya_use_wup"
           label="使用 WUP 协议（huya_use_wup）"
-          extraText="使用 WUP 协议获取直播流，可能解决部分直播分区 2 分钟分段问题"
+          extraText="使用 WUP 协议获取直播流，默认开启；可能解决部分直播分区 2 分钟分段问题"
           fieldStyle={{alignSelf: 'stretch',
             padding: 0,}}
         />

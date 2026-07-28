@@ -42,6 +42,8 @@
   - `huya_wup.rs` 采用上游最小 TARS/WUP 编解码；请求逻辑在 `huya.rs`。
   - 同一场次 anticode 只计算一次并缓存复用到各 CDN；签名使用 `lPresenterUid`。
   - `huya_use_wup` 默认 `true`；关闭后回退页面 anti_code + `lPresenterUid` 重建。
+  - `huya_imgplus` 默认 `true`。二者与空间配置 UI 开关一致：缺失/`null` 读配置时
+    归一为 `Some(true)`，显式 `false` 保留；不要只依赖运行时 `unwrap_or(true)` 而让 UI 显示关。
   - 仅当 `huya_mobile_api && huya_imgplus` 时保留页面/API 原始 anti_code。
   - `use_wup=true` 且走 WUP 时，`LiveStream.stream_headers` 会带 WUP UA。
   - 保留上游 room_id 缓存、CDN 健康检查回退、回放标题过滤，以及本仓 `huya_cdn`、
@@ -69,6 +71,16 @@
   - 运行时 `Worker.get_config()` 将稀疏 override 解析为 `ConfigPatch` 后 apply；
     `user` 做字段级合并，避免只覆写一个 cookie 时整对象替换清掉其它全局 cookie。
   - `kuaishou_cookie` 是顶层配置字段，不要写成 `user.kuaishou_cookie`。
+- 全局“默认开启”布尔配置需保持 UI 与运行时一致（读时补全，不主动写回历史库）：
+  - 字段：`split_on_timestamp_anomaly`、`huya_use_wup`、`huya_imgplus`、
+    `twitch_disable_ads`、`youtube_enable_download_live`、
+    `youtube_enable_download_playback`。
+  - `Config` 使用 `serde(default = ...)` 填缺失；`normalize_default_true_options`
+    （经 `normalize_segment_limits` 调用）把旧库显式 `null` 也归一为 `Some(true)`。
+  - 读/写回读路径（`get_config`、`put_configuration` 等）都会 normalize，
+    因此 `/v1/configuration` 返回值与空间配置 Switch 显示为开。
+  - 显式 `false` 始终保留；稀疏主播 override / `ConfigPatch` 不走此归一，
+    未覆写仍继承全局。
 - 抖音弹幕默认使用基于 `v1.0.7` 恢复的 Python 链路，而不是
   `crates/danmaku/src/protocols/douyin.rs` 中的 Rust 协议实现。
   - Rust 下载流程通过 `python-bridge` 和 PyO3 创建
@@ -127,6 +139,11 @@
   - JSON 只含显式覆写项，不会回读成整表 null
   - 布尔三态与 `user` 字段级合并
   - `kuaishou_cookie` 顶层路径
+- 上游如改动全局配置默认值、`Config` 反序列化或空间配置表单，需核对本分支
+  “默认开启”开关的 UI/运行时一致性是否仍保留：
+  - 缺失/`null` 读时为 `Some(true)`，UI 显示开
+  - 显式 `false` 不被改回 true
+  - 稀疏 override 不因全局默认归一而污染
 
 ## 开发规范
 

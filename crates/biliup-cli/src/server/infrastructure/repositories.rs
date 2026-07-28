@@ -94,7 +94,8 @@ pub async fn get_config(pool: &ConnectionPool) -> AppResult<Config> {
         Ok(json)
     } else {
         // 如果数据库中没有配置，返回默认配置
-        let config = Config::default();
+        let mut config = Config::default();
+        config.normalize_segment_limits();
         Ok(config)
     }
 }

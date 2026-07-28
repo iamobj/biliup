@@ -124,7 +124,7 @@ pub struct Config {
     #[serde(default)]
     pub huya_protocol: Option<String>,
     /// 虎牙是否保留 imgplus 流名
-    #[serde(default)]
+    #[serde(default = "default_true_option")]
     pub huya_imgplus: Option<bool>,
     /// 虎牙走小程序 API 获取房间信息
     #[serde(default)]
@@ -133,7 +133,7 @@ pub struct Config {
     #[serde(default)]
     pub huya_codec: Option<String>,
     /// 虎牙使用 WUP 协议获取流 token
-    #[serde(default)]
+    #[serde(default = "default_true_option")]
     pub huya_use_wup: Option<bool>,
 
     // 抖音平台设置
@@ -229,10 +229,10 @@ pub struct Config {
     #[serde(default)]
     pub youtube_before_date: Option<String>,
     /// YouTube启用直播下载
-    #[serde(default)]
+    #[serde(default = "default_true_option")]
     pub youtube_enable_download_live: Option<bool>,
     /// YouTube启用回放下载
-    #[serde(default)]
+    #[serde(default = "default_true_option")]
     pub youtube_enable_download_playback: Option<bool>,
     /// YouTube弹幕录制
     #[serde(default)]
@@ -246,7 +246,7 @@ pub struct Config {
     #[serde(default)]
     pub twitch_danmaku: Option<bool>,
     /// Twitch禁用广告
-    #[serde(default)]
+    #[serde(default = "default_true_option")]
     pub twitch_disable_ads: Option<bool>,
 
     // TwitCasting平台设置
@@ -564,6 +564,11 @@ fn default_split_on_timestamp_anomaly() -> Option<bool> {
     Some(true)
 }
 
+/// 运行时与 UI 共用的“默认开启”布尔配置
+fn default_true_option() -> Option<bool> {
+    Some(true)
+}
+
 /// 默认过滤阈值：20MB
 fn default_filtering_threshold() -> u64 {
     20
@@ -622,6 +627,30 @@ impl Config {
             .is_some_and(|value| value.trim().is_empty())
         {
             self.segment_time = None;
+        }
+        self.normalize_default_true_options();
+    }
+
+    /// 将缺失/null 的“默认开启”开关归一为 Some(true)，避免 UI 显示关而运行时仍开启。
+    /// 显式 false 保持不变；稀疏 override/ConfigPatch 不走此路径。
+    pub fn normalize_default_true_options(&mut self) {
+        if self.split_on_timestamp_anomaly.is_none() {
+            self.split_on_timestamp_anomaly = Some(true);
+        }
+        if self.huya_imgplus.is_none() {
+            self.huya_imgplus = Some(true);
+        }
+        if self.huya_use_wup.is_none() {
+            self.huya_use_wup = Some(true);
+        }
+        if self.twitch_disable_ads.is_none() {
+            self.twitch_disable_ads = Some(true);
+        }
+        if self.youtube_enable_download_live.is_none() {
+            self.youtube_enable_download_live = Some(true);
+        }
+        if self.youtube_enable_download_playback.is_none() {
+            self.youtube_enable_download_playback = Some(true);
         }
     }
 
@@ -739,10 +768,96 @@ mod tests {
     }
 
     #[test]
-    fn huya_use_wup_defaults_to_none_when_missing() {
-        let config: Config = serde_json::from_str("{}").unwrap();
-        assert_eq!(config.huya_use_wup, None);
+    fn default_true_options_fill_when_missing() {
+        let mut config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.huya_use_wup, Some(true));
+        assert_eq!(config.huya_imgplus, Some(true));
+        assert_eq!(config.twitch_disable_ads, Some(true));
+        assert_eq!(config.youtube_enable_download_live, Some(true));
+        assert_eq!(config.youtube_enable_download_playback, Some(true));
+        assert_eq!(config.split_on_timestamp_anomaly, Some(true));
+        // 默认 false 的开关仍保持 None，避免被误写成 true
         assert_eq!(config.huya_mobile_api, None);
+
+        config.normalize_segment_limits();
+        assert_eq!(config.huya_use_wup, Some(true));
+        assert_eq!(config.huya_mobile_api, None);
+    }
+
+    #[test]
+    fn default_true_options_fill_null_on_normalize() {
+        let mut config: Config = serde_json::from_str(
+            r#"{
+                "huya_use_wup": null,
+                "huya_imgplus": null,
+                "twitch_disable_ads": null,
+                "youtube_enable_download_live": null,
+                "youtube_enable_download_playback": null,
+                "split_on_timestamp_anomaly": null
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.huya_use_wup, None);
+        assert_eq!(config.split_on_timestamp_anomaly, None);
+
+        config.normalize_segment_limits();
+
+        assert_eq!(config.huya_use_wup, Some(true));
+        assert_eq!(config.huya_imgplus, Some(true));
+        assert_eq!(config.twitch_disable_ads, Some(true));
+        assert_eq!(config.youtube_enable_download_live, Some(true));
+        assert_eq!(config.youtube_enable_download_playback, Some(true));
+        assert_eq!(config.split_on_timestamp_anomaly, Some(true));
+    }
+
+    #[test]
+    fn default_true_options_preserve_explicit_false() {
+        let mut config: Config = serde_json::from_str(
+            r#"{
+                "huya_use_wup": false,
+                "huya_imgplus": false,
+                "twitch_disable_ads": false,
+                "youtube_enable_download_live": false,
+                "youtube_enable_download_playback": false,
+                "split_on_timestamp_anomaly": false
+            }"#,
+        )
+        .unwrap();
+        config.normalize_segment_limits();
+        assert_eq!(config.huya_use_wup, Some(false));
+        assert_eq!(config.huya_imgplus, Some(false));
+        assert_eq!(config.twitch_disable_ads, Some(false));
+        assert_eq!(config.youtube_enable_download_live, Some(false));
+        assert_eq!(config.youtube_enable_download_playback, Some(false));
+        assert_eq!(config.split_on_timestamp_anomaly, Some(false));
+
+        let encoded = serde_json::to_string(&config).unwrap();
+        let again: Config = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(again.huya_use_wup, Some(false));
+        assert_eq!(again.split_on_timestamp_anomaly, Some(false));
+    }
+
+    #[test]
+    fn sparse_override_without_default_true_keys_does_not_patch_them() {
+        let raw = serde_json::json!({
+            "huya_cdn": "AL",
+            "file_size": null
+        });
+        let patch = config_patch_from_override_value(&raw).unwrap();
+        let mut config = Config::default();
+        config.huya_use_wup = Some(true);
+        config.huya_imgplus = Some(true);
+        config.twitch_disable_ads = Some(true);
+        config.youtube_enable_download_live = Some(true);
+        config.youtube_enable_download_playback = Some(true);
+        config.apply(patch);
+        assert_eq!(config.huya_cdn.as_deref(), Some("AL"));
+        assert_eq!(config.file_size, None);
+        assert_eq!(config.huya_use_wup, Some(true));
+        assert_eq!(config.huya_imgplus, Some(true));
+        assert_eq!(config.twitch_disable_ads, Some(true));
+        assert_eq!(config.youtube_enable_download_live, Some(true));
+        assert_eq!(config.youtube_enable_download_playback, Some(true));
     }
 
     #[test]
