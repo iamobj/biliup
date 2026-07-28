@@ -584,9 +584,18 @@ impl RoomsActor {
 
     fn add(&mut self, worker: Arc<Worker>) -> Option<Arc<dyn LivePlugin + Send + Sync>> {
         let plugin = self.matches(&worker.live_streamer.url)?;
-        let platform_name = plugin.name().to_owned();
         self.all_workers.push(worker.clone());
 
+        // 用户主动暂停的房间只注册，不进入监测队列
+        if matches!(
+            *worker.downloader_status.read().unwrap(),
+            WorkerStatus::Pause
+        ) {
+            debug!("Added paused room [{}]", worker.live_streamer.url);
+            return Some(plugin);
+        }
+
+        let platform_name = plugin.name().to_owned();
         match self.platforms.entry(platform_name) {
             Entry::Occupied(mut entry) => {
                 entry.get_mut().push_back(worker.clone());
@@ -657,9 +666,16 @@ impl RoomsActor {
         }
 
         let plugin = self.matches(&worker.live_streamer.url)?;
-        self.platforms
-            .get_mut(plugin.name())?
-            .push_back(worker.clone());
+        // 重启后仅暂停房间时 platforms 可能尚无该平台队列，需创建后再入队
+        let platform_name = plugin.name().to_owned();
+        match self.platforms.entry(platform_name) {
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().push_back(worker.clone());
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(VecDeque::from([worker.clone()]));
+            }
+        }
         *worker.downloader_status.write().unwrap() = WorkerStatus::Idle;
         Some(plugin)
     }

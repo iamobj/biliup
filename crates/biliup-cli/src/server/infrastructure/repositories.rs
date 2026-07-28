@@ -72,6 +72,25 @@ pub async fn get_all_streamer(pool: &ConnectionPool) -> AppResult<Vec<LiveStream
         .change_context(AppError::Unknown)
 }
 
+/// 更新主播的暂停状态
+///
+/// # 参数
+/// * `pool` - 数据库连接池
+/// * `id` - 主播 ID
+/// * `paused` - 是否暂停
+pub async fn set_streamer_paused(
+    pool: &ConnectionPool,
+    id: i64,
+    paused: bool,
+) -> AppResult<LiveStreamer> {
+    let mut streamer = get_streamer(pool, id).await?;
+    streamer.paused = paused;
+    streamer
+        .update_all_fields(pool)
+        .await
+        .change_context(AppError::Unknown)
+}
+
 /// 从数据库获取全局配置
 ///
 /// # 参数

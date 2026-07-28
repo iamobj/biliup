@@ -47,6 +47,9 @@ pub struct LiveStreamer {
     pub opt_args: Option<Value>,
     /// 排除关键词
     pub excluded_keywords: Option<Value>,
+    /// 是否用户主动暂停录制（持久化，重启后仍保持）
+    #[serde(default)]
+    pub paused: bool,
 }
 
 /// 插入直播主播的数据结构
@@ -78,4 +81,7 @@ pub struct InsertLiveStreamer {
     pub postprocessor: Option<Vec<HookStep>>,
     pub opt_args: Option<Value>,
     pub excluded_keywords: Option<Value>,
+    /// 是否用户主动暂停录制；新建默认 false
+    #[serde(default)]
+    pub paused: bool,
 }

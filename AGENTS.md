@@ -7,6 +7,10 @@
   - `url`：开播地址
   - `title`：直播间标题
   - `start_time`：开播时间，Unix 秒级时间戳
+- 主播“暂停录制”状态持久化到 `livestreamers.paused`：
+  - 仅 pause API 写入；表单/配置覆写保存不得覆盖。
+  - 启动时按 DB 恢复 `WorkerStatus::Pause`，暂停房间不进入监测队列。
+  - 列表 UI 仍以 runtime `status === 'Pause'` 显示。
 - `segment_processor` Hook 在没有配置投稿模板时仍会执行。
   - 每个分段事件都会先生成视频/弹幕路径列表。
   - 如配置了 `segment_processor`，会在无上传流程下照常执行。

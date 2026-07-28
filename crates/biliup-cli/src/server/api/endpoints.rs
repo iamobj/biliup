@@ -14,7 +14,7 @@ use crate::server::infrastructure::models::{
     Configuration, FileItem, InsertConfiguration, StreamerInfo,
 };
 use crate::server::infrastructure::repositories::{
-    del_streamer, get_all_streamer, get_upload_config,
+    del_streamer, get_all_streamer, get_streamer, get_upload_config, set_streamer_paused,
 };
 use crate::server::infrastructure::service_register::ServiceRegister;
 use crate::{LogHandle, UploadLine};
@@ -82,6 +82,8 @@ pub async fn post_streamers_endpoint(
     // You can insert the model directly.
     let mut payload = payload;
     payload.override_cfg = compact_override_value(payload.override_cfg.take());
+    // 新建主播始终未暂停
+    payload.paused = false;
     let live_streamers = payload
         .insert(&pool)
         .await
@@ -108,7 +110,15 @@ pub async fn put_streamers_endpoint(
     State(pool): State<ConnectionPool>,
     Json(payload): Json<LiveStreamer>,
 ) -> Result<Json<LiveStreamer>, Response> {
-    let streamer = normalize_streamer_override(payload)
+    // 暂停状态仅由 pause API 维护，表单/覆写保存不得覆盖
+    let existing_paused = get_streamer(&pool, payload.id)
+        .await
+        .map_err(report_to_response)?
+        .paused;
+    let mut payload = normalize_streamer_override(payload);
+    payload.paused = existing_paused;
+
+    let streamer = payload
         .update_all_fields(&pool)
         .await
         .change_context(AppError::Unknown)
@@ -146,31 +156,29 @@ pub async fn delete_streamers_endpoint(
 // #[axum::debug_handler(state = ServiceRegister)]
 pub async fn pause_streamers_endpoint(
     State(managers): State<Arc<DownloadManager>>,
+    State(pool): State<ConnectionPool>,
     Path(id): Path<i64>,
 ) -> Result<Json<()>, Response> {
     let worker = managers.get_room_by_id(id).await;
     if let Some(w) = worker {
         let worker_status = w.downloader_status.read().unwrap().clone();
         match worker_status {
-            WorkerStatus::Working(_) => {
+            WorkerStatus::Working(_) | WorkerStatus::Pending | WorkerStatus::Idle => {
+                // 先落库，避免运行时已暂停但重启后丢失
+                set_streamer_paused(&pool, id, true)
+                    .await
+                    .map_err(report_to_response)?;
                 w.change_status(Stage::Download, WorkerStatus::Pause).await;
-                info!(url=?&w.live_streamer.url, "successfully pause live streamers");
                 managers.make_waker(id).await;
+                info!(url=?&w.live_streamer.url, "successfully pause live streamers");
             }
             WorkerStatus::Pause => {
+                set_streamer_paused(&pool, id, false)
+                    .await
+                    .map_err(report_to_response)?;
                 w.change_status(Stage::Download, WorkerStatus::Idle).await;
                 managers.wake_waker(id).await;
                 info!(url=?&w.live_streamer.url, "successfully start live streamers");
-            }
-            WorkerStatus::Pending => {
-                w.change_status(Stage::Download, WorkerStatus::Pause).await;
-                managers.make_waker(id).await;
-                info!(url=?&w.live_streamer.url, "successfully pause live streamers");
-            }
-            WorkerStatus::Idle => {
-                w.change_status(Stage::Download, WorkerStatus::Pause).await;
-                managers.make_waker(id).await;
-                info!(url=?&w.live_streamer.url, "successfully pause live streamers");
             }
         };
     }

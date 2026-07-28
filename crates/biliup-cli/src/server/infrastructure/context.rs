@@ -163,8 +163,13 @@ impl Worker {
         config: Arc<RwLock<Config>>,
         client: StatelessClient,
     ) -> Self {
+        let downloader_status = if live_streamer.paused {
+            WorkerStatus::Pause
+        } else {
+            WorkerStatus::default()
+        };
         Self {
-            downloader_status: RwLock::new(Default::default()),
+            downloader_status: RwLock::new(downloader_status),
             uploader_status: Default::default(),
             live_streamer,
             upload_streamer,

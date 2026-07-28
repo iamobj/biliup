@@ -107,6 +107,8 @@ export interface LiveStreamerEntity {
 	postprocessor?: (Record<'run' | 'mv', string> | 'rm')[];
 	opt_args?: string[];
 	override?: Record<string, any>;
+	/** 用户主动暂停（DB 持久化）；列表 UI 仍以 status 为准 */
+	paused?: boolean;
 	// runtime / UI-only fields returned by list API
 	status?: string;
 	upload_status?: string;

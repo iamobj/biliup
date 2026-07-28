@@ -293,6 +293,7 @@ fn to_live_streamer_insert(
         excluded_keywords: streamer.excluded_keywords.as_ref().map(|keywords| {
             serde_json::Value::Array(keywords.iter().cloned().map(Into::into).collect())
         }),
+        paused: false,
     })
 }
 
