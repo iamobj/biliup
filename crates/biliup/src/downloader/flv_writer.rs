@@ -36,6 +36,8 @@ impl<'a> FlvFile<'a> {
     }
 
     pub fn create_new(&mut self) -> std::io::Result<()> {
+        // 先把缓冲刷到磁盘再 rename，避免切段瞬间旧文件尾部未落盘。
+        self.buf_writer.flush()?;
         self.file.rename();
         let path = self.file.create()?;
         self.buf_writer = Self::create(path)?;
@@ -92,6 +94,7 @@ impl<'a> FlvFile<'a> {
 
 impl Drop for FlvFile<'_> {
     fn drop(&mut self) {
+        let _ = self.buf_writer.flush();
         self.file.rename()
     }
 }

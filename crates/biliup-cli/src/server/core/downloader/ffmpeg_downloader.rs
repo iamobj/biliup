@@ -63,7 +63,23 @@ impl FfmpegDownloader {
             args.extend(["-segment_time".to_string(), seconds.to_string()]);
         }
 
-        self.append_common_output_args(&mut args, "segment");
+        // segment muxer 不会走上面的 "mp4" 分支；mp4 分段需单独附加 movflags。
+        if download_config.suffix.eq_ignore_ascii_case("mp4") {
+            if download_config.split_on_timestamp_anomaly {
+                args.extend([
+                    "-movflags".to_string(),
+                    "+frag_keyframe+empty_moov+default_base_moof".to_string(),
+                ]);
+            } else {
+                args.extend(["-movflags".to_string(), "+faststart".to_string()]);
+            }
+        }
+
+        self.append_common_output_args(
+            &mut args,
+            "segment",
+            download_config.split_on_timestamp_anomaly,
+        );
         args
     }
 
@@ -89,7 +105,11 @@ impl FfmpegDownloader {
             args.extend(["-fs".to_string(), file_size.to_string()]);
         }
 
-        self.append_common_output_args(&mut args, &download_config.suffix);
+        self.append_common_output_args(
+            &mut args,
+            &download_config.suffix,
+            download_config.split_on_timestamp_anomaly,
+        );
         args
     }
 
@@ -114,13 +134,27 @@ impl FfmpegDownloader {
         args.extend(["-i".to_string(), download_config.url.clone()]);
     }
 
-    fn append_common_output_args(&self, args: &mut Vec<String>, format: &str) {
+    fn append_common_output_args(
+        &self,
+        args: &mut Vec<String>,
+        format: &str,
+        split_on_timestamp_anomaly: bool,
+    ) {
         args.extend(["-c".to_string(), "copy".to_string()]);
 
         match format {
             "mp4" => {
                 args.extend(["-bsf:a".to_string(), "aac_adtstoasc".to_string()]);
-                args.extend(["-movflags".to_string(), "+faststart".to_string()]);
+                // 开启时间戳异常切段时用 fMP4：打断后即使 trailer 未写完通常仍可打开。
+                // 未开启时保持 faststart 常规 mp4，兼容投稿/常规播放器。
+                if split_on_timestamp_anomaly {
+                    args.extend([
+                        "-movflags".to_string(),
+                        "+frag_keyframe+empty_moov+default_base_moof".to_string(),
+                    ]);
+                } else {
+                    args.extend(["-movflags".to_string(), "+faststart".to_string()]);
+                }
                 args.extend(["-f".to_string(), "mp4".to_string()]);
             }
             "ts" => {
@@ -164,16 +198,32 @@ impl FfmpegDownloader {
         .await?;
 
         if Path::new(&part_file).exists() {
-            tokio::fs::rename(&part_file, &output_file)
+            let meta = tokio::fs::metadata(&part_file)
                 .await
-                .change_context(AppError::Custom(String::from("退出时，重命名文件")))?;
+                .change_context(AppError::Custom(String::from("读取分段文件元数据失败")))?;
+            if meta.len() == 0 {
+                warn!("时间戳异常切分后分段文件为空，丢弃: {part_file}");
+                let _ = tokio::fs::remove_file(&part_file).await;
+            } else {
+                tokio::fs::rename(&part_file, &output_file)
+                    .await
+                    .change_context(AppError::Custom(String::from("退出时，重命名文件")))?;
 
-            callback(SegmentEvent::Segment(SegmentInfo {
-                prev_file_path: output_file,
-                danmaku_file_path: None,
-                segment_index: 0,
-                next_file_path: None,
-            }));
+                if anomaly {
+                    info!(
+                        "时间戳异常切分完成，已落盘 {} ({} bytes)",
+                        output_file.display(),
+                        meta.len()
+                    );
+                }
+
+                callback(SegmentEvent::Segment(SegmentInfo {
+                    prev_file_path: output_file,
+                    danmaku_file_path: None,
+                    segment_index: 0,
+                    next_file_path: None,
+                }));
+            }
         }
 
         if anomaly {
@@ -403,6 +453,19 @@ async fn finalize_part_file(path: &Path) -> AppResult<Option<PathBuf>> {
         return Ok(None);
     }
 
+    match tokio::fs::metadata(path).await {
+        Ok(meta) if meta.len() == 0 => {
+            warn!("跳过空分段文件: {}", path.display());
+            let _ = tokio::fs::remove_file(path).await;
+            return Ok(None);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!("读取分段文件失败 {}: {e}", path.display());
+            return Ok(None);
+        }
+    }
+
     let final_path = strip_part_suffix(path);
     if path == final_path {
         return Ok(Some(final_path));
@@ -462,24 +525,45 @@ async fn spawn_log(
     Ok((status, anomaly))
 }
 
-/// 时间戳异常切分时优先让 FFmpeg 优雅退出，以便写完 moov 等容器尾部。
-/// 若超时仍未退出，再强制结束，避免卡死整场录制。
+/// 时间戳异常切分时优先让 FFmpeg 优雅退出。
+///
+/// 这里不再 fire-and-forget 强制 kill：`spawn_log` / `download_internal`
+/// 会在 stderr 结束后 `wait()` 同一 Child；若另起任务在 wait 后仍持有旧句柄
+/// 再 `start_kill()`，可能误伤下一段录制，或在收尾窗口直接打断 trailer 写入。
 async fn stop_ffmpeg_for_split(process_handle: Arc<RwLock<Option<tokio::process::Child>>>) {
-    let interrupted = {
+    let (pid, interrupted) = {
         let handle = process_handle.read().await;
         match handle.as_ref() {
-            Some(child) => interrupt_ffmpeg_child(child),
-            None => false,
+            Some(child) => {
+                let pid = child.id();
+                (pid, interrupt_ffmpeg_child(child))
+            }
+            None => (None, false),
         }
     };
 
     if interrupted {
-        info!("已向 FFmpeg 发送中断信号，等待容器正常收尾");
+        info!(
+            "已向 FFmpeg 发送中断信号，等待容器正常收尾{}",
+            pid.map(|p| format!(" (pid={p})")).unwrap_or_default()
+        );
+        // 给 muxer 一点时间写 trailer；若超时仍未退出，再对同一 pid 强制结束。
+        // 注意：只在 process_handle 仍指向同一 pid 时 kill，避免误杀新分段进程。
         let force_handle = Arc::clone(&process_handle);
+        let expected_pid = pid;
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(8)).await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
             let mut handle = force_handle.write().await;
-            if let Some(child) = handle.as_mut() {
+            let Some(child) = handle.as_mut() else {
+                return;
+            };
+            // 主流程 wait() 后会 take 句柄；若 pid 已变说明是下一段，绝不能误杀。
+            if expected_pid.is_some() && child.id() != expected_pid {
+                return;
+            }
+            // 不要在这里 try_wait/reap：会与主流程的 child.wait() 抢状态。
+            // id() 仍在说明进程句柄尚未被 wait 收割，此时再强杀。
+            if child.id().is_some() {
                 warn!("FFmpeg 未在时限内退出，改为强制结束");
                 let _ = child.start_kill();
             }
@@ -499,8 +583,12 @@ fn interrupt_ffmpeg_child(child: &tokio::process::Child) -> bool {
     {
         if let Some(pid) = child.id() {
             // SIGINT 对应 ffmpeg 的正常中断路径，通常会完成 muxer trailer 写入。
-            let rc = unsafe { libc::kill(pid as i32, libc::SIGINT) };
-            return rc == 0;
+            // 连续发两次，兼容个别构建对单次信号响应较慢的情况。
+            let first = unsafe { libc::kill(pid as i32, libc::SIGINT) } == 0;
+            if first {
+                let _ = unsafe { libc::kill(pid as i32, libc::SIGINT) };
+            }
+            return first;
         }
         false
     }

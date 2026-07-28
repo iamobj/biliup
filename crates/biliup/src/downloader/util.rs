@@ -7,19 +7,34 @@ use tracing::{error, info};
 
 pub type CallbackFn<'a> = Box<dyn FnMut(&str) + Send + Sync + 'a>;
 
-/// 时间戳前跳阈值：2 秒
+/// 时间戳前跳阈值：2 秒。
+///
+/// 仅用于“相邻媒体 tag”的前跳检测。FLV 新段写入的 sequence header
+/// 必须使用 timestamp=0，否则会和后续媒体 tag 形成假跳变。
 pub const TIMESTAMP_JUMP_THRESHOLD_MS: u32 = 2000;
 /// 时间戳异常切文件冷却：5 秒
 pub const TIMESTAMP_ANOMALY_COOLDOWN: Duration = Duration::from_secs(5);
 
-/// 判断流时间戳是否异常（回退或大幅跳变）
+/// 判断流时间戳是否异常（回退或大幅前跳）
 ///
-/// `prev_ms == 0` 视为首包，不触发。
+/// `prev_ms == 0` 视为新段首个参考点，不触发。
 pub fn is_timestamp_anomaly(prev_ms: u32, current_ms: u32) -> bool {
     if prev_ms == 0 {
         return false;
     }
-    current_ms < prev_ms || current_ms.abs_diff(prev_ms) >= TIMESTAMP_JUMP_THRESHOLD_MS
+    // DTS 回退：明确异常
+    if current_ms < prev_ms {
+        return true;
+    }
+    // 相邻 tag 前跳过大：通常是断流/重推后的时间基变化
+    current_ms - prev_ms >= TIMESTAMP_JUMP_THRESHOLD_MS
+}
+
+/// 把 FLV tag 的时间戳改写为指定值，用于新段写入 header。
+pub fn retimestamp_tag_header(header: &crate::downloader::flv_parser::TagHeader, timestamp: u32) -> crate::downloader::flv_parser::TagHeader {
+    let mut header = *header;
+    header.timestamp = timestamp;
+    header
 }
 
 #[derive(Debug)]
@@ -386,5 +401,7 @@ mod tests {
         assert!(is_timestamp_anomaly(3000, 1000));
         assert!(is_timestamp_anomaly(1000, 4000));
         assert!(!is_timestamp_anomaly(1000, 2999));
+        // 恰好 2 秒前跳视为异常
+        assert!(is_timestamp_anomaly(1000, 3000));
     }
 }

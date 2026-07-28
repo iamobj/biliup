@@ -17,9 +17,13 @@
   - 适用于 `ffmpeg` / `stream-gears`；streamlink、sync-downloader 不改。
   - 触发条件：DTS 回退、时间戳跳变 ≥ 2 秒，或 FFmpeg 报
     `Non-monotonous DTS` / `non monotonically increasing dts` / `out of order` / `non-monotonic dts`。
-  - FFmpeg：解析 stderr 命中后结束当前进程并落盘，由现有仍在播重试循环立刻开新文件；
-    5 秒冷却防抖。
-  - stream-gears FLV：关键帧边界检测异常后 `create_new`；HLS 保留 discontinuity，
+  - FFmpeg：解析 stderr 命中后优先 SIGINT 优雅退出并落盘，由现有仍在播重试循环立刻开新文件；
+    5 秒冷却防抖。强制结束仅在同 pid 超时未退出时触发，避免误杀下一段。
+  - FFmpeg 输出 mp4 使用 `frag_keyframe+empty_moov+default_base_moof`，打断时仍尽量可播；
+    空 `.part` 不晋升为最终文件。
+  - stream-gears FLV：关键帧边界检测异常后 `create_new`，新段始终写入 H264/AAC sequence header
+    （header 时间戳改写为 0，且不参与媒体时间轴推进，避免假跳变连切）；
+    异常后的残帧不写入旧文件，切段前 flush 缓冲。HLS 保留 discontinuity，
     并在 media sequence 明显回退时切段。
   - 全局配置与主播 override 均可开关；override 布尔三态 `unset | true | false`。
 - `download.log` 按 50 MiB 自动分割，保留当前文件和最新 1 份历史分片。

@@ -154,6 +154,7 @@ impl<'a> TsFile<'a> {
     }
 
     pub fn create_new(&mut self) -> std::io::Result<()> {
+        self.buf_writer.flush()?;
         self.file.rename();
         let path = self.file.create()?;
         self.buf_writer = Self::create(path)?;
@@ -178,6 +179,7 @@ impl<'a> TsFile<'a> {
 
 impl Drop for TsFile<'_> {
     fn drop(&mut self) {
+        let _ = self.buf_writer.flush();
         self.file.rename()
     }
 }
