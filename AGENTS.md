@@ -11,6 +11,13 @@
   - 仅 pause API 写入；表单/配置覆写保存不得覆盖。
   - 启动时按 DB 恢复 `WorkerStatus::Pause`，暂停房间不进入监测队列。
   - 列表 UI 仍以 runtime `status === 'Pause'` 显示。
+- 录播管理支持「复制新建」：
+  - 卡片操作栏复制按钮打开与新建相同的 `TemplateModal`，标题为「复制录播」。
+  - `cloneStreamerForCreate` 深拷贝可配置字段（含 `url`/`remark`/各类 processor/`override` 等），
+    剔除 `id`、`status`、`statusTag`、`upload_status`、`paused`；提交走 `POST /v1/streamers`。
+  - 后端创建仍强制 `paused=false`；不新增 API。
+  - `TemplateModal` 以克隆 `initValues` 预填，避免原地改写列表 `time_range`；
+    Form 未登记的 `override` 提交时从 entity 补回。
 - `segment_processor` Hook 在没有配置投稿模板时仍会执行。
   - 每个分段事件都会先生成视频/弹幕路径列表。
   - 如配置了 `segment_processor`，会在无上传流程下照常执行。
@@ -115,6 +122,9 @@
   - `crates/biliup/src/downloader/live/huya_wup.rs`
   - `app/ui/plugins/huya.tsx`
   - `app/ui/OverrideModal.tsx`
+  - `app/ui/TemplateModal.tsx`
+  - `app/(app)/streamers/page.tsx`
+  - `app/lib/api-streamer.ts`
   - `app/lib/override-config.ts`
   - `app/ui/components/OverrideSwitch.tsx`
   - `crates/biliup-cli/src/server/infrastructure/models/live_streamer.rs`
@@ -143,6 +153,7 @@
   - JSON 只含显式覆写项，不会回读成整表 null
   - 布尔三态与 `user` 字段级合并
   - `kuaishou_cookie` 顶层路径
+  - 「复制新建」仍走创建 API，预填含 override，且不带入 id/暂停/运行时状态
 - 上游如改动全局配置默认值、`Config` 反序列化或空间配置表单，需核对本分支
   “默认开启”开关的 UI/运行时一致性是否仍保留：
   - 缺失/`null` 读时为 `Some(true)`，UI 显示开

@@ -16,13 +16,14 @@ import {
     IconEdit2Stroked,
     IconDeleteStroked,
     IconWrench, IconTreeTriangleDown, IconPause, IconPlay, IconLock, IconUpload,
+    IconCopyStroked,
 } from '@douyinfe/semi-icons'
 import { List, ButtonGroup } from '@douyinfe/semi-ui'
 import React, { useState } from 'react'
 import useStreamers from '../../lib/use-streamers'
 import TemplateModal from '../../ui/TemplateModal'
 import OverrideModal from '../../ui/OverrideModal'
-import { LiveStreamerEntity, put, requestDelete, sendRequest } from '../../lib/api-streamer'
+import { LiveStreamerEntity, cloneStreamerForCreate, put, requestDelete, sendRequest } from '../../lib/api-streamer'
 import useSWRMutation from 'swr/mutation'
 import {PauseButton} from "@/app/ui/StreamerActions/PauseButton";
 
@@ -255,6 +256,10 @@ export default function Home() {
                     >
                       <TemplateModal onOk={handleUpdate} entity={item}>
                         <Button theme="borderless" icon={<IconEdit2Stroked />}></Button>
+                      </TemplateModal>
+                      <span className="semi-button-group-line semi-button-group-line-borderless semi-button-group-line-primary"></span>
+                      <TemplateModal onOk={handleOk} entity={cloneStreamerForCreate(item)}>
+                        <Button theme="borderless" icon={<IconCopyStroked />}></Button>
                       </TemplateModal>
                       <span className="semi-button-group-line semi-button-group-line-borderless semi-button-group-line-primary"></span>
                       <PauseButton streamer={item}/>

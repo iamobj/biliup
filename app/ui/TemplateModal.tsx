@@ -11,15 +11,17 @@ import {
 } from '@douyinfe/semi-ui'
 import { IconPlusCircle, IconMinusCircle } from '@douyinfe/semi-icons'
 import { FormApi } from '@douyinfe/semi-ui/lib/es/form'
-import React, { CSSProperties, useRef } from 'react'
+import React, { CSSProperties, useMemo, useRef } from 'react'
 import { useState } from 'react'
-import { fetcher, LiveStreamerEntity, sendRequest, StudioEntity } from '../lib/api-streamer'
+import { fetcher, LiveStreamerEntity, StudioEntity } from '../lib/api-streamer'
 import useSWR from 'swr'
 import useSWRMutation from 'swr/mutation'
 
+type TemplateModalEntity = Omit<LiveStreamerEntity, 'id'> & { id?: number }
+
 type TemplateModalProps = {
   visible?: boolean
-  entity?: LiveStreamerEntity
+  entity?: TemplateModalEntity
   children?: React.ReactNode
   onOk: (e: any) => Promise<void>
 }
@@ -78,7 +80,32 @@ const TemplateModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
   } = useSWR<StudioEntity[]>('/v1/upload/streamers', fetcher)
 
   const [visible, setVisible] = useState(false)
+  const [formKey, setFormKey] = useState(0)
+  const isCopy = Boolean(entity && entity.id == null)
+  const modalTitle = isCopy ? '复制录播' : '录播管理'
+
+  const initValues = useMemo(() => {
+    if (!entity) return undefined
+    const values: TemplateModalEntity = JSON.parse(JSON.stringify(entity))
+    try {
+      if (values.time_range) {
+        if (typeof values.time_range === 'string') {
+          const tr: string[] = JSON.parse(values.time_range)
+          values.time_range = tr.map(t => new Date(t))
+        } else if (Array.isArray(values.time_range)) {
+          values.time_range = values.time_range.map(
+            (t: string | Date) => (t instanceof Date ? t : new Date(t))
+          )
+        }
+      }
+    } catch (e) {
+      console.error(e)
+    }
+    return values
+  }, [entity, formKey])
+
   const showDialog = () => {
+    setFormKey(prev => prev + 1)
     setVisible(true)
   }
   const handleOk = async () => {
@@ -89,6 +116,10 @@ const TemplateModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
       url: values?.url?.trim(),
       format: values?.format?.trim(),
       time_range: JSON.stringify(values?.time_range?.map((date: Date) => date.toISOString())),
+    }
+    // Form 可能不登记 override 字段；复制新建时从 entity 补上
+    if (values?.override === undefined && entity?.override !== undefined) {
+      values.override = JSON.parse(JSON.stringify(entity.override))
     }
     await onOk(values)
     setVisible(false)
@@ -115,20 +146,11 @@ const TemplateModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
     }
   })
 
-  try {
-    if (entity && entity.time_range && typeof entity.time_range === "string") {
-      const tr: string[] = JSON.parse(entity.time_range)
-      entity.time_range = tr.map(t => new Date(t))
-    }
-  } catch (e) {
-    console.error(e)
-  }
-
   return (
     <>
       {childrenWithProps}
       <Modal
-        title="录播管理"
+        title={modalTitle}
         visible={visible}
         onOk={handleOk}
         style={{ width: 'min(600px, 90vw)' }}
@@ -140,7 +162,7 @@ const TemplateModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
           paddingRight: 10,
         }}
       >
-        <Form initValues={entity} getFormApi={formApi => (api.current = formApi)}>
+        <Form key={formKey} initValues={initValues} getFormApi={formApi => (api.current = formApi)}>
           <Form.Input
             field="remark"
             label="录播备注"

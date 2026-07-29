@@ -115,6 +115,21 @@ export interface LiveStreamerEntity {
 	statusTag?: React.ReactNode;
 }
 
+/** 从已有录播复制新建：深拷贝可配置字段，剔除 id/运行时状态/暂停。 */
+export function cloneStreamerForCreate(
+	source: LiveStreamerEntity
+): Omit<LiveStreamerEntity, 'id' | 'status' | 'statusTag' | 'upload_status' | 'paused'> {
+	const {
+		id: _id,
+		status: _status,
+		statusTag: _statusTag,
+		upload_status: _uploadStatus,
+		paused: _paused,
+		...rest
+	} = source;
+	return JSON.parse(JSON.stringify(rest));
+}
+
 export interface BiliType {
 	id: number;
 	children: BiliType[];
