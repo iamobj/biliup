@@ -1,9 +1,14 @@
 import gzip
+import asyncio
+from contextlib import suppress
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
 from biliup.Danmaku.douyin import Douyin
+from biliup.Danmaku import DanmakuClient
 from biliup.Danmaku.douyin_util import DouyinDanmakuUtils
 from biliup.Danmaku.douyin_util.dy_pb2 import (
     ChatMessage,
@@ -65,6 +70,69 @@ class DouyinProtocolTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ack.logId, 12345)
         self.assertEqual(ack.payloadType, "ack")
         self.assertEqual(ack.payload, b"internal_src:dim|seq:1")
+
+    async def test_writer_drops_gap_messages_and_resets_segment_time(self):
+        with TemporaryDirectory() as directory:
+            client = DanmakuClient("unused", str(Path(directory) / "capture"))
+            client._queue = asyncio.Queue()
+            clock = [3.0]
+
+            async def command(msg_type, file_name=None):
+                completed = asyncio.Event()
+
+                def done(*_args):
+                    completed.set()
+
+                await client._queue.put(
+                    {
+                        "msg_type": msg_type,
+                        "file_name": file_name,
+                        "callback": done,
+                    }
+                )
+                await asyncio.wait_for(completed.wait(), timeout=1)
+
+            with patch("biliup.Danmaku.time.monotonic", side_effect=lambda: clock[0]):
+                writer = asyncio.create_task(client._write_danmaku())
+                await client._queue.put(
+                    {"msg_type": "danmaku", "content": "preroll", "received_at": 3.0}
+                )
+                await command("start_segment")
+
+                clock[0] = 4.0
+                await client._queue.put(
+                    {"msg_type": "danmaku", "content": "first", "received_at": 4.0}
+                )
+                first = str(Path(directory) / "first.xml")
+                await command("end_segment", first)
+
+                clock[0] = 6.0
+                await client._queue.put(
+                    {"msg_type": "danmaku", "content": "gap", "received_at": 6.0}
+                )
+                clock[0] = 9.0
+                await command("start_segment")
+
+                clock[0] = 10.0
+                await client._queue.put(
+                    {"msg_type": "danmaku", "content": "second", "received_at": 10.0}
+                )
+                second = str(Path(directory) / "second.xml")
+                await command("end_segment", second)
+
+                writer.cancel()
+                with suppress(asyncio.CancelledError):
+                    await writer
+
+            first_xml = Path(first).read_text()
+            second_xml = Path(second).read_text()
+            self.assertIn("first", first_xml)
+            self.assertNotIn("preroll", first_xml)
+            self.assertNotIn("gap", second_xml)
+            self.assertIn('p="1.000,', second_xml)
+            all_xml = "".join(path.read_text() for path in Path(directory).glob("*.xml"))
+            self.assertNotIn("preroll", all_xml)
+            self.assertNotIn("gap", all_xml)
 
 
 if __name__ == "__main__":

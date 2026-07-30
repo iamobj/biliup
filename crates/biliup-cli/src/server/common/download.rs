@@ -14,6 +14,7 @@ use async_channel::Sender;
 use biliup::downloader::live::{LivePlugin, LiveStatus, LiveStream};
 use error_stack::ResultExt;
 use serde_json::json;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -261,15 +262,40 @@ impl DownloadTask {
 
         // 执行下载
         // let hook = processor.create_hook(danmaku_client.clone());
+        let mut ended_danmaku = HashSet::<PathBuf>::new();
         let hook = |event| {
             match event {
-                SegmentEvent::Start { .. } => {
-                    warn!("Ignoring unexpected segment start event");
+                SegmentEvent::Start { next_file_path } => {
+                    if let Some(ref client) = danmaku_client
+                        && let Err(e) = client.start_segment()
+                    {
+                        error!(file = ?next_file_path, "Danmaku segment start error: {e}");
+                    }
+                }
+                SegmentEvent::End { prev_file_path } => {
+                    if let Some(ref client) = danmaku_client {
+                        let danmaku_file_path = prev_file_path.with_extension("xml");
+                        match client.end_segment(&danmaku_file_path.display().to_string()) {
+                            Ok(true) => {
+                                ended_danmaku.insert(prev_file_path);
+                            }
+                            Ok(false) if danmaku_file_path.exists() => {
+                                ended_danmaku.insert(prev_file_path);
+                            }
+                            Ok(false) => {}
+                            Err(e) => error!("Danmaku segment end error: {e}"),
+                        }
+                    }
                 }
                 SegmentEvent::Segment(mut event) => {
-                    // 分段时，获取到的是已下载的文件名
-                    // 触发弹幕滚动保存
-                    if let Some(ref client) = danmaku_client {
+                    if ended_danmaku.remove(&event.prev_file_path) {
+                        let path = event.prev_file_path.with_extension("xml");
+                        if path.exists() {
+                            event.danmaku_file_path = Some(path);
+                        }
+                    } else if let Some(ref client) = danmaku_client {
+                        // Compatibility path for downloaders that only report a
+                        // finalized file and do not expose media boundaries.
                         attach_danmaku_file_path(&mut event, |danmaku_file_path| {
                             client.rolling(&danmaku_file_path.display().to_string())
                         });
@@ -295,8 +321,21 @@ impl DownloadTask {
         let result = self
             .downloader
             .download(Box::new(hook), download_config)
-            .await
-            .change_context(AppError::Custom("Failed to download segment".into()))?;
+            .await;
+
+        // An End without a later Segment means the downloader discarded or
+        // failed to finalize that video. Do not leave its XML behind.
+        for video_path in ended_danmaku {
+            let danmaku_path = video_path.with_extension("xml");
+            if danmaku_path.exists()
+                && let Err(error) = std::fs::remove_file(&danmaku_path)
+            {
+                warn!(file = ?danmaku_path, "Failed to remove unpaired danmaku: {error}");
+            }
+        }
+
+        let result =
+            result.change_context(AppError::Custom("Failed to download segment".into()))?;
 
         // 处理结果
         info!(url=streamer.url,result=?result, "finished downloading");
@@ -416,8 +455,7 @@ mod tests {
             "",
         );
 
-        let payload: Value =
-            serde_json::from_slice(&preprocessor_payload(&streamer_info)).unwrap();
+        let payload: Value = serde_json::from_slice(&preprocessor_payload(&streamer_info)).unwrap();
 
         assert_eq!(payload["name"], "主播A");
         assert_eq!(payload["url"], "https://live.example/room");

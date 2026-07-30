@@ -6,8 +6,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
 
@@ -83,6 +83,14 @@ enum RecorderCommand {
         new_file_name: Option<PathBuf>,
         done: oneshot::Sender<Result<bool>>,
     },
+    /// Discard any unpaired messages and start a writer for a video segment.
+    StartSegment { done: oneshot::Sender<Result<()>> },
+    /// Finalize the writer paired with the current video segment without
+    /// opening the next writer yet.
+    EndSegment {
+        new_file_name: PathBuf,
+        done: oneshot::Sender<Result<bool>>,
+    },
     /// Stop recording.
     Stop,
 }
@@ -120,6 +128,30 @@ impl RecorderHandle {
         let (done, rx) = oneshot::channel();
         self.cmd_tx
             .send(RecorderCommand::Rolling {
+                new_file_name,
+                done,
+            })
+            .await
+            .map_err(|_| DanmakuError::ChannelSend)?;
+        rx.await.map_err(|_| DanmakuError::ChannelSend)?
+    }
+
+    /// Start a danmaku segment at the current video boundary.
+    pub async fn start_segment(&self) -> Result<()> {
+        let (done, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(RecorderCommand::StartSegment { done })
+            .await
+            .map_err(|_| DanmakuError::ChannelSend)?;
+        rx.await.map_err(|_| DanmakuError::ChannelSend)?
+    }
+
+    /// Finalize the current danmaku segment and suspend writing until the
+    /// next `start_segment` command.
+    pub async fn end_segment(&self, new_file_name: PathBuf) -> Result<bool> {
+        let (done, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(RecorderCommand::EndSegment {
                 new_file_name,
                 done,
             })
@@ -189,7 +221,10 @@ impl DanmakuRecorder {
         };
 
         let output_path = format_output_path(&self.config.output_file);
-        let mut xml_writer = XmlWriter::new(&output_path, xml_config.clone())?;
+        // Keep the historical eager writer for standalone callers. The server
+        // sends StartSegment at the first video-media boundary, which discards
+        // this pre-roll file and resets the XML clock.
+        let mut xml_writer = Some(XmlWriter::new(&output_path, xml_config.clone())?);
 
         // Main loop with reconnection
         if is_polling_url(&self.config.url) {
@@ -243,18 +278,20 @@ impl DanmakuRecorder {
             }
         }
 
-        let discard_current = discard_current_on_stop.load(Ordering::SeqCst);
-        let (final_path, _) = finish_xml_writer(xml_writer, discard_current)?;
-        if discard_current {
-            info!(
-                "{}: Recording finished. Discarded output: {:?}",
-                platform_name, final_path
-            );
-        } else {
-            info!(
-                "{}: Recording finished. Output: {:?}",
-                platform_name, final_path
-            );
+        if let Some(xml_writer) = xml_writer {
+            let discard_current = discard_current_on_stop.load(Ordering::SeqCst);
+            let (final_path, _) = finish_xml_writer(xml_writer, discard_current)?;
+            if discard_current {
+                info!(
+                    "{}: Recording finished. Discarded output: {:?}",
+                    platform_name, final_path
+                );
+            } else {
+                info!(
+                    "{}: Recording finished. Output: {:?}",
+                    platform_name, final_path
+                );
+            }
         }
 
         Ok(())
@@ -265,7 +302,7 @@ impl DanmakuRecorder {
         &self,
         cmd_rx: &mut mpsc::Receiver<RecorderCommand>,
         stop_rx: &mut watch::Receiver<bool>,
-        xml_writer: &mut XmlWriter,
+        xml_writer: &mut Option<XmlWriter>,
         xml_config: &XmlWriterConfig,
     ) -> Result<()> {
         let platform_name = self.platform.name();
@@ -302,7 +339,9 @@ impl DanmakuRecorder {
                 _ = ticker.tick() => {
                     let events = self.platform.poll_messages(&self.config.url, &mut context).await?;
                     for event in events {
-                        if let Err(e) = xml_writer.write_event(&event) {
+                        if let Some(xml_writer) = xml_writer.as_mut()
+                            && let Err(e) = xml_writer.write_event(&event)
+                        {
                             warn!("Failed to write event: {}", e);
                         }
                     }
@@ -316,7 +355,7 @@ impl DanmakuRecorder {
         &self,
         cmd_rx: &mut mpsc::Receiver<RecorderCommand>,
         stop_rx: &mut watch::Receiver<bool>,
-        xml_writer: &mut XmlWriter,
+        xml_writer: &mut Option<XmlWriter>,
         xml_config: &XmlWriterConfig,
     ) -> Result<()> {
         let platform_name = self.platform.name();
@@ -358,7 +397,7 @@ impl DanmakuRecorder {
         conn_info: ConnectionInfo,
         cmd_rx: &mut mpsc::Receiver<RecorderCommand>,
         stop_rx: &mut watch::Receiver<bool>,
-        xml_writer: &mut XmlWriter,
+        xml_writer: &mut Option<XmlWriter>,
         xml_config: &XmlWriterConfig,
         platform_name: &str,
     ) -> Result<()> {
@@ -461,7 +500,9 @@ impl DanmakuRecorder {
                                 Ok(result) => {
                                     // Write decoded events
                                     for event in result.events {
-                                        if let Err(e) = xml_writer.write_event(&event) {
+                                        if let Some(xml_writer) = xml_writer.as_mut()
+                                            && let Err(e) = xml_writer.write_event(&event)
+                                        {
                                             warn!("Failed to write event: {}", e);
                                         }
                                     }
@@ -499,7 +540,7 @@ impl DanmakuRecorder {
         conn_info: ConnectionInfo,
         cmd_rx: &mut mpsc::Receiver<RecorderCommand>,
         stop_rx: &mut watch::Receiver<bool>,
-        xml_writer: &mut XmlWriter,
+        xml_writer: &mut Option<XmlWriter>,
         xml_config: &XmlWriterConfig,
         platform_name: &str,
     ) -> Result<()> {
@@ -574,7 +615,9 @@ impl DanmakuRecorder {
                     match self.platform.decode_message(&frame) {
                         Ok(result) => {
                             for event in result.events {
-                                if let Err(e) = xml_writer.write_event(&event) {
+                                if let Some(xml_writer) = xml_writer.as_mut()
+                                    && let Err(e) = xml_writer.write_event(&event)
+                                {
                                     warn!("Failed to write event: {}", e);
                                 }
                             }
@@ -723,7 +766,7 @@ fn is_polling_url(url: &str) -> bool {
 fn handle_command(
     command: RecorderCommand,
     template: &Path,
-    xml_writer: &mut XmlWriter,
+    xml_writer: &mut Option<XmlWriter>,
     xml_config: &XmlWriterConfig,
 ) -> Result<bool> {
     match command {
@@ -731,7 +774,41 @@ fn handle_command(
             new_file_name,
             done,
         } => {
-            let result = roll_writer(xml_writer, template, xml_config, new_file_name);
+            let result = if let Some(writer) = xml_writer.as_mut() {
+                roll_writer(writer, template, xml_config, new_file_name)
+            } else {
+                *xml_writer = Some(XmlWriter::new(
+                    next_output_path(template),
+                    xml_config.clone(),
+                )?);
+                Ok(false)
+            };
+            let _ = done.send(result);
+            Ok(false)
+        }
+        RecorderCommand::StartSegment { done } => {
+            let result = (|| {
+                if let Some(writer) = xml_writer.take() {
+                    let _ = finish_xml_writer(writer, true)?;
+                }
+                *xml_writer = Some(XmlWriter::new(
+                    next_output_path(template),
+                    xml_config.clone(),
+                )?);
+                Ok(())
+            })();
+            let _ = done.send(result);
+            Ok(false)
+        }
+        RecorderCommand::EndSegment {
+            new_file_name,
+            done,
+        } => {
+            let result = if let Some(mut writer) = xml_writer.take() {
+                finalize_current_writer(&mut writer, Some(new_file_name))
+            } else {
+                Ok(false)
+            };
             let _ = done.send(result);
             Ok(false)
         }
@@ -745,15 +822,22 @@ fn roll_writer(
     xml_config: &XmlWriterConfig,
     new_file_name: Option<PathBuf>,
 ) -> Result<bool> {
+    let produced = finalize_current_writer(xml_writer, new_file_name)?;
+    *xml_writer = XmlWriter::new(next_output_path(template), xml_config.clone())?;
+    Ok(produced)
+}
+
+fn finalize_current_writer(
+    xml_writer: &mut XmlWriter,
+    new_file_name: Option<PathBuf>,
+) -> Result<bool> {
     let current_path = xml_writer.file_path().to_path_buf();
     xml_writer.finalize()?;
     let current_exists = current_path.exists();
 
     let mut produced = current_exists;
 
-    if current_exists
-        && let Some(new_path) = new_file_name
-    {
+    if current_exists && let Some(new_path) = new_file_name {
         if current_path != new_path {
             if new_path.exists() {
                 warn!(
@@ -770,8 +854,6 @@ fn roll_writer(
             }
         }
     }
-
-    *xml_writer = XmlWriter::new(next_output_path(template), xml_config.clone())?;
 
     Ok(produced)
 }
@@ -843,7 +925,8 @@ mod tests {
 
         assert!(roll_writer(&mut writer, &template, &config, Some(new_path.clone())).unwrap());
 
-        assert!(!current_path.exists());
+        assert_eq!(writer.file_path(), current_path.as_path());
+        assert!(current_path.exists());
         assert!(new_path.exists());
         let content = std::fs::read_to_string(&new_path).unwrap();
         assert!(content.contains("<i>"));
@@ -865,15 +948,19 @@ mod tests {
         let config = XmlWriterConfig::default();
         let mut writer = XmlWriter::new(&current_path, config.clone()).unwrap();
 
-        assert!(
-            roll_writer(&mut writer, &template, &config, Some(first_segment.clone())).unwrap()
-        );
+        assert!(roll_writer(&mut writer, &template, &config, Some(first_segment.clone())).unwrap());
         assert!(first_segment.exists());
         assert_ne!(writer.file_path(), first_segment.as_path());
         assert!(writer.file_path().exists());
 
         assert!(
-            roll_writer(&mut writer, &template, &config, Some(second_segment.clone())).unwrap()
+            roll_writer(
+                &mut writer,
+                &template,
+                &config,
+                Some(second_segment.clone())
+            )
+            .unwrap()
         );
         assert!(first_segment.exists());
         assert!(second_segment.exists());
@@ -905,7 +992,10 @@ mod tests {
             .unwrap()
         );
 
-        assert_eq!(std::fs::read_to_string(&existing_target).unwrap(), "existing");
+        assert_eq!(
+            std::fs::read_to_string(&existing_target).unwrap(),
+            "existing"
+        );
         assert!(current_path.exists());
         assert!(writer.file_path().exists());
         assert_ne!(writer.file_path(), current_path.as_path());
@@ -953,6 +1043,100 @@ mod tests {
         assert_eq!(final_path, output_path);
         assert!(removed);
         assert!(!final_path.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn segment_commands_discard_preroll_and_reset_the_xml_clock() {
+        let dir = std::env::temp_dir().join(format!(
+            "danmaku-segment-boundary-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let template = dir.join("capture");
+        let first_segment = dir.join("first.xml");
+        let second_segment = dir.join("second.xml");
+        let config = XmlWriterConfig::default();
+        let initial_path = format_output_path(&template);
+        let mut writer = Some(XmlWriter::new(&initial_path, config.clone()).unwrap());
+        writer
+            .as_mut()
+            .unwrap()
+            .write_event(&DanmakuEvent::Chat(ChatMessage::new("preroll".to_string())))
+            .unwrap();
+
+        let (done, _rx) = oneshot::channel();
+        handle_command(
+            RecorderCommand::StartSegment { done },
+            &template,
+            &mut writer,
+            &config,
+        )
+        .unwrap();
+        assert!(
+            !std::fs::read_to_string(&initial_path)
+                .unwrap_or_default()
+                .contains("preroll")
+        );
+
+        writer
+            .as_mut()
+            .unwrap()
+            .write_event(&DanmakuEvent::Chat(ChatMessage::new("first".to_string())))
+            .unwrap();
+        let (done, _rx) = oneshot::channel();
+        handle_command(
+            RecorderCommand::EndSegment {
+                new_file_name: first_segment.clone(),
+                done,
+            },
+            &template,
+            &mut writer,
+            &config,
+        )
+        .unwrap();
+        assert!(writer.is_none(), "End must suspend danmaku recording");
+
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let (done, _rx) = oneshot::channel();
+        handle_command(
+            RecorderCommand::StartSegment { done },
+            &template,
+            &mut writer,
+            &config,
+        )
+        .unwrap();
+        writer
+            .as_mut()
+            .unwrap()
+            .write_event(&DanmakuEvent::Chat(ChatMessage::new("second".to_string())))
+            .unwrap();
+        let (done, _rx) = oneshot::channel();
+        handle_command(
+            RecorderCommand::EndSegment {
+                new_file_name: second_segment.clone(),
+                done,
+            },
+            &template,
+            &mut writer,
+            &config,
+        )
+        .unwrap();
+
+        let first_xml = std::fs::read_to_string(&first_segment).unwrap();
+        let second_xml = std::fs::read_to_string(&second_segment).unwrap();
+        assert!(first_xml.contains("first"));
+        assert!(!first_xml.contains("preroll"));
+        assert!(second_xml.contains("second"));
+        let p = second_xml
+            .split("p=\"")
+            .nth(1)
+            .and_then(|value| value.split(',').next())
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
+        assert!(p < 0.5, "new segment clock was not reset: {p}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

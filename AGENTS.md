@@ -36,6 +36,16 @@
     （header 时间戳改写为 0，且不参与媒体时间轴推进，避免假跳变连切）；
     异常后的残帧不写入旧文件，切段前 flush 缓冲。HLS 保留 discontinuity，
     并在 media sequence 明显回退时切段。
+  - 视频与弹幕使用明确的 Start/End 边界同步：Start 只在新段首批媒体实际到达时触发，
+    End 后到下一次 Start 前的弹幕直接丢弃，新 XML 的相对时间从 Start 重新计时。
+  - FFmpeg 内部分段同时读取 Opening 日志和 segment list，并按路径去重边界事件；
+    两条管道乱序时也必须保证 End 先于 Segment，未落盘视频对应的孤立 XML 会被清理。
+  - stream-gears HLS 的 media sequence 使用 `Option` 表示未初始化，合法序号 0 不得漏录；
+    正常滑动窗口不切段，明显回退或启用异常检测时的向前跳号才切段。
+  - stream-gears FLV 每段媒体 DTS 按首个媒体 tag 重基到 0，header 不设置时间基；
+    EOF 必须刷出最后一个 GOP，缺少 metadata/AAC/H264 header 时不得 panic。
+  - stream-gears 同一秒连续切段时，若最终文件或 `.part` 已存在需追加数字序号，
+    不得复用路径覆盖上一段。
   - 全局配置与主播 override 均可开关；override 布尔三态 `unset | true | false`。
 - `download.log` 按 50 MiB 自动分割，保留当前文件和最新 1 份历史分片。
   - 当前文件名固定为 `download.log`，历史文件为 `download.log.1`。

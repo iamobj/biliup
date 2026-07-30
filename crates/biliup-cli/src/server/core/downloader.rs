@@ -189,6 +189,10 @@ pub enum SegmentEvent {
         /// 分段文件路径
         next_file_path: PathBuf,
     },
+    End {
+        /// 当前分段最终会落盘到此路径。
+        prev_file_path: PathBuf,
+    },
     Segment(SegmentInfo),
 }
 
@@ -221,6 +225,17 @@ pub trait DanmakuClient {
     /// 返回 true 表示本次滚动保存产生了可交给后处理的弹幕文件。
     fn rolling(&self, _file_name: &str) -> Result<bool, Box<dyn std::error::Error>> {
         Ok(false)
+    }
+
+    /// Align the danmaku clock with the first media of a new video segment.
+    fn start_segment(&self) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
+
+    /// Finalize the danmaku paired with the current video segment and suspend
+    /// writing until `start_segment` is called again.
+    fn end_segment(&self, file_name: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        self.rolling(file_name)
     }
 }
 
@@ -273,6 +288,37 @@ impl DanmakuClient for RustDanmakuClient {
             return tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
                     .block_on(handle.rolling(Some(PathBuf::from(file_name))))
+            })
+            .map_err(Into::into);
+        }
+        Ok(false)
+    }
+
+    fn start_segment(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let handle = self
+            .handle
+            .lock()
+            .map_err(|_| "danmaku handle lock poisoned")?
+            .clone();
+        if let Some(handle) = handle {
+            return tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(handle.start_segment())
+            })
+            .map_err(Into::into);
+        }
+        Ok(())
+    }
+
+    fn end_segment(&self, file_name: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        let handle = self
+            .handle
+            .lock()
+            .map_err(|_| "danmaku handle lock poisoned")?
+            .clone();
+        if let Some(handle) = handle {
+            return tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(handle.end_segment(PathBuf::from(file_name)))
             })
             .map_err(Into::into);
         }
@@ -335,7 +381,10 @@ impl DanmakuClient for PythonDanmakuClient {
             }
             context.set_item(
                 "user_agent",
-                self.extra.get("user-agent").map(String::as_str).unwrap_or(""),
+                self.extra
+                    .get("user-agent")
+                    .map(String::as_str)
+                    .unwrap_or(""),
             )?;
             context.set_item(
                 "referer",
@@ -359,11 +408,7 @@ impl DanmakuClient for PythonDanmakuClient {
     }
 
     async fn stop(&self) -> AppResult<()> {
-        let client = self
-            .client
-            .lock()
-            .map_err(Self::python_error)?
-            .take();
+        let client = self.client.lock().map_err(Self::python_error)?.take();
         if let Some(client) = client {
             Python::attach(|py| -> PyResult<()> {
                 client.bind(py).call_method0("stop")?;
@@ -386,6 +431,35 @@ impl DanmakuClient for PythonDanmakuClient {
             client
                 .bind(py)
                 .call_method1("save", (file_name,))?
+                .extract::<bool>()
+        })
+        .map_err(Into::into)
+    }
+
+    fn start_segment(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let client = self
+            .client
+            .lock()
+            .map_err(|_| "python danmaku client lock poisoned")?;
+        let Some(client) = client.as_ref() else {
+            return Ok(());
+        };
+        Python::attach(|py| client.bind(py).call_method0("start_segment").map(|_| ()))
+            .map_err(Into::into)
+    }
+
+    fn end_segment(&self, file_name: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        let client = self
+            .client
+            .lock()
+            .map_err(|_| "python danmaku client lock poisoned")?;
+        let Some(client) = client.as_ref() else {
+            return Ok(false);
+        };
+        Python::attach(|py| {
+            client
+                .bind(py)
+                .call_method1("end_segment", (file_name,))?
                 .extract::<bool>()
         })
         .map_err(Into::into)

@@ -84,6 +84,7 @@ class DanmakuClient:
                 if ack is not None:
                     await self._ws.send_bytes(ack)
                 for item in messages:
+                    item["received_at"] = time.monotonic()
                     await self._queue.put(item)
             except asyncio.CancelledError:
                 raise
@@ -91,11 +92,12 @@ class DanmakuClient:
                 logger.exception("DanmakuClient:%s: 弹幕接收异常", self._url)
 
     async def _write_danmaku(self):
+        active = True
         while True:
             root = etree.Element("i")
             etree.indent(root, "\t")
             tree = etree.ElementTree(root, parser=etree.XMLParser(recover=True))
-            start_time = time.time()
+            start_time = time.monotonic()
             file_name = _next_output_path(self._file_name)
             message_count = 0
             last_save_time = int(start_time)
@@ -115,7 +117,7 @@ class DanmakuClient:
                 while True:
                     item = await self._queue.get()
                     item_type = item.get("msg_type")
-                    if item_type == "save":
+                    if item_type in {"save", "end_segment"}:
                         write_file()
                         target = item.get("file_name")
                         produced = bool(message_count and os.path.exists(file_name))
@@ -130,6 +132,20 @@ class DanmakuClient:
                                 os.rename(file_name, target)
                                 file_name = target
                         item["callback"](produced)
+                        active = item_type == "save"
+                        break
+                    if item_type == "start_segment":
+                        if file_name:
+                            try:
+                                os.remove(file_name)
+                            except FileNotFoundError:
+                                pass
+                        # The finally block below persists the current tree.
+                        # Clear the path so pre-roll/gap messages cannot be
+                        # recreated after this command discards them.
+                        file_name = None
+                        item["callback"]()
+                        active = True
                         break
                     if item_type == "stop":
                         if file_name:
@@ -143,22 +159,24 @@ class DanmakuClient:
                         return
                     if item_type != "danmaku":
                         continue
+                    if not active:
+                        continue
 
-                    message_time = time.time()
-                    timestamp = str(int(message_time))
+                    received_at = item.get("received_at", time.monotonic())
+                    timestamp = str(int(time.time()))
                     color = item.get("color", "16777215")
                     uid = str(item.get("uid", 0))
                     node = etree.SubElement(root, "d")
                     node.set(
                         "p",
-                        f"{message_time - start_time:.3f},1,25,{color},{timestamp},0,{uid},0",
+                        f"{max(0.0, received_at - start_time):.3f},1,25,{color},{timestamp},0,{uid},0",
                     )
                     node.text = item["content"]
                     message_count += 1
 
-                    if int(message_time) - last_save_time >= 10:
+                    if int(time.monotonic()) - last_save_time >= 10:
                         write_file()
-                        last_save_time = int(message_time)
+                        last_save_time = int(time.monotonic())
             finally:
                 write_file()
 
@@ -182,6 +200,25 @@ class DanmakuClient:
             raise RuntimeError("等待 Python 弹幕客户端启动超时")
 
     def save(self, file_name: Optional[str] = None) -> bool:
+        return self._request_writer_command("save", file_name)
+
+    def start_segment(self):
+        if not self._record_task or not self._loop or not self._queue:
+            return
+        completed = threading.Event()
+        self._loop.call_soon_threadsafe(
+            self._queue.put_nowait,
+            {"msg_type": "start_segment", "callback": completed.set},
+        )
+        if not completed.wait(timeout=30):
+            raise RuntimeError("等待 Python 弹幕开始分段超时")
+
+    def end_segment(self, file_name: str) -> bool:
+        return self._request_writer_command("end_segment", file_name)
+
+    def _request_writer_command(
+        self, command: str, file_name: Optional[str] = None
+    ) -> bool:
         if not self._record_task or not self._loop or not self._queue:
             return False
         completed = threading.Event()
@@ -193,7 +230,7 @@ class DanmakuClient:
 
         self._loop.call_soon_threadsafe(
             self._queue.put_nowait,
-            {"msg_type": "save", "file_name": file_name, "callback": done},
+            {"msg_type": command, "file_name": file_name, "callback": done},
         )
         if not completed.wait(timeout=30):
             raise RuntimeError("等待 Python 弹幕 rolling 超时")

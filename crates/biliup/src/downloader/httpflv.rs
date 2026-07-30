@@ -4,20 +4,39 @@ use crate::downloader::flv_parser::{
 };
 use crate::downloader::flv_writer::{FlvFile, FlvTag, TagDataHeader};
 use crate::downloader::util::{
-    is_timestamp_anomaly, retimestamp_tag_header, LifecycleFile, Segmentable,
-    TIMESTAMP_ANOMALY_COOLDOWN,
+    LifecycleFile, Segmentable, is_timestamp_anomaly, retimestamp_tag_header,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use nom::{Err, IResult};
 use reqwest::Response;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{info, warn};
 
 pub async fn download(connection: Connection, file: LifecycleFile<'_>, segment: Segmentable) {
+    download_with_boundaries(
+        connection,
+        file,
+        segment,
+        Box::new(|_| {}),
+        Box::new(|_| {}),
+    )
+    .await;
+}
+
+pub type SegmentBoundaryHook<'a> = Box<dyn FnMut(&str) + Send + Sync + 'a>;
+
+pub async fn download_with_boundaries(
+    connection: Connection,
+    file: LifecycleFile<'_>,
+    segment: Segmentable,
+    segment_started: SegmentBoundaryHook<'_>,
+    segment_ended: SegmentBoundaryHook<'_>,
+) {
     let file_name = file.file_name.clone();
-    match parse_flv(connection, file, segment).await {
+    match parse_flv_with_boundaries(connection, file, segment, segment_started, segment_ended).await
+    {
         Ok(_) => {
             info!("Done... {}", file_name);
         }
@@ -27,10 +46,12 @@ pub async fn download(connection: Connection, file: LifecycleFile<'_>, segment: 
     }
 }
 
-pub(crate) async fn parse_flv(
+async fn parse_flv_with_boundaries(
     mut connection: Connection,
     file: LifecycleFile<'_>,
     mut segment: Segmentable,
+    mut segment_started: SegmentBoundaryHook<'_>,
+    mut segment_ended: SegmentBoundaryHook<'_>,
 ) -> crate::downloader::error::Result<()> {
     let mut flv_tags_cache: Vec<(TagHeader, Bytes, Bytes)> = Vec::new();
     // println!("parse_flv Segment: {:?}", segment);
@@ -43,8 +64,9 @@ pub(crate) async fn parse_flv(
     let mut aac_sequence_header = None;
     let mut h264_sequence_header: Option<(TagHeader, Bytes, Bytes)> = None;
     let mut prev_timestamp = 0;
+    let mut output_timestamp_base = None::<u32>;
+    let mut current_file_started = false;
     let mut create_new = false;
-    let mut last_anomaly_split: Option<Instant> = None;
     loop {
         let tag_header_bytes = connection.read_frame(11).await?;
         if tag_header_bytes.is_empty() {
@@ -158,7 +180,8 @@ pub(crate) async fn parse_flv(
                 // 否则新段写入的 header(ts=0 或旧 ts) 会和后续媒体帧形成假跳变。
                 let mut discard_rest_of_cache = false;
                 let mut dropped_after_anomaly = 0usize;
-                for (tag_header, flv_tag_data, previous_tag_size_bytes) in flv_tags_cache.drain(..) {
+                for (tag_header, flv_tag_data, previous_tag_size_bytes) in flv_tags_cache.drain(..)
+                {
                     let is_media_for_ts = is_media_timestamp_tag(&tag_header, &flv_tag_data);
 
                     if !discard_rest_of_cache
@@ -166,21 +189,12 @@ pub(crate) async fn parse_flv(
                         && segment.split_on_timestamp_anomaly()
                         && is_timestamp_anomaly(prev_timestamp, tag_header.timestamp)
                     {
-                        if should_split_on_anomaly(last_anomaly_split) {
-                            warn!(
-                                "关键帧刷新前检测到时间戳异常，准备切分文件 previous={prev_timestamp} current={}",
-                                tag_header.timestamp
-                            );
-                            create_new = true;
-                            discard_rest_of_cache = true;
-                        } else {
-                            // 冷却期内只丢掉异常后的残帧，不重复切段，避免 1.5KB 碎片连切。
-                            warn!(
-                                "关键帧刷新前检测到时间戳异常，但处于冷却期，丢弃后续残帧 previous={prev_timestamp} current={}",
-                                tag_header.timestamp
-                            );
-                            discard_rest_of_cache = true;
-                        }
+                        warn!(
+                            "关键帧刷新前检测到时间戳异常，准备切分文件 previous={prev_timestamp} current={}",
+                            tag_header.timestamp
+                        );
+                        create_new = true;
+                        discard_rest_of_cache = true;
                     } else if !discard_rest_of_cache
                         && is_media_for_ts
                         && prev_timestamp > 0
@@ -197,38 +211,37 @@ pub(crate) async fn parse_flv(
                         continue;
                     }
 
-                    out.write_tag(&tag_header, &flv_tag_data, &previous_tag_size_bytes)?;
+                    if is_media_for_ts && !current_file_started {
+                        segment_started(&out.file.file_name);
+                        current_file_started = true;
+                    }
+                    let output_header = rebase_media_timestamp(
+                        &tag_header,
+                        is_media_for_ts,
+                        &mut output_timestamp_base,
+                    );
+                    out.write_tag(&output_header, &flv_tag_data, &previous_tag_size_bytes)?;
                     segment.increase_size((11 + tag_header.data_size + 4) as u64);
                     if is_media_for_ts {
                         prev_timestamp = tag_header.timestamp;
                     }
                 }
                 if dropped_after_anomaly > 0 {
-                    warn!(
-                        "时间戳异常后丢弃 {dropped_after_anomaly} 个缓存 tag，避免写入损坏帧"
-                    );
+                    warn!("时间戳异常后丢弃 {dropped_after_anomaly} 个缓存 tag，避免写入损坏帧");
                 }
 
                 // 当前关键帧本身也参与检测；它一定是媒体帧。
                 let keyframe_anomaly = segment.split_on_timestamp_anomaly()
                     && is_timestamp_anomaly(prev_timestamp, flv_tag.header.timestamp);
                 if keyframe_anomaly {
-                    if should_split_on_anomaly(last_anomaly_split) {
-                        warn!(
-                            "关键帧处检测到时间戳异常，准备切分文件 previous={prev_timestamp} current={}",
-                            flv_tag.header.timestamp
-                        );
-                        create_new = true;
-                    } else {
-                        warn!(
-                            "关键帧处检测到时间戳异常，但处于冷却期，继续写入当前文件 previous={prev_timestamp} current={}",
-                            flv_tag.header.timestamp
-                        );
-                    }
+                    warn!(
+                        "关键帧处检测到时间戳异常，准备切分文件 previous={prev_timestamp} current={}",
+                        flv_tag.header.timestamp
+                    );
+                    create_new = true;
                 }
 
                 if segment.needed() || create_new {
-                    let anomaly_split = create_new;
                     let reason = if create_new {
                         "timestamp anomaly / codec change"
                     } else {
@@ -236,33 +249,36 @@ pub(crate) async fn parse_flv(
                     };
                     info!("{} splitting ({reason}).{segment:?}", out.file.file_name);
 
-                    // 先落盘旧文件，再为新文件准备 header 缓存。
+                    if current_file_started {
+                        segment_ended(&out.file.file_name);
+                    }
                     out.create_new()?;
                     segment.set_start_time(Duration::from_millis(timestamp));
                     segment.set_size_position(9 + 4);
-                    // 新段媒体时间戳从本关键帧重新起算；header 不参与 prev。
                     prev_timestamp = 0;
-                    if anomaly_split {
-                        last_anomaly_split = Some(Instant::now());
-                    }
+                    output_timestamp_base = None;
+                    current_file_started = false;
 
-                    let (meta_header, meta_bytes, previous_meta_tag_size) =
-                        on_meta_data.as_ref().expect("on_meta_data does not exist");
-                    // onMetaData：新段统一用 ts=0
-                    flv_tags_cache.push((
-                        retimestamp_tag_header(meta_header, 0),
-                        meta_bytes.clone(),
-                        previous_meta_tag_size.clone(),
-                    ));
-                    // AACSequenceHeader：新段统一用 ts=0，避免旧时间戳污染检测。
-                    let aac_header = aac_sequence_header
-                        .as_ref()
-                        .expect("aac_sequence_header does not exist");
-                    flv_tags_cache.push((
-                        retimestamp_tag_header(&aac_header.0, 0),
-                        aac_header.1.clone(),
-                        aac_header.2.clone(),
-                    ));
+                    if let Some((meta_header, meta_bytes, previous_meta_tag_size)) =
+                        on_meta_data.as_ref()
+                    {
+                        flv_tags_cache.push((
+                            retimestamp_tag_header(meta_header, 0),
+                            meta_bytes.clone(),
+                            previous_meta_tag_size.clone(),
+                        ));
+                    } else {
+                        warn!("切分新文件时缺少 metadata");
+                    }
+                    if let Some(aac_header) = aac_sequence_header.as_ref() {
+                        flv_tags_cache.push((
+                            retimestamp_tag_header(&aac_header.0, 0),
+                            aac_header.1.clone(),
+                            aac_header.2.clone(),
+                        ));
+                    } else {
+                        warn!("切分新文件时缺少 AAC sequence header");
+                    }
                     // 始终写入 H264SequenceHeader，否则新段缺少 SPS/PPS 会无法解码。
                     if let Some(h264_header) = h264_sequence_header.as_ref() {
                         flv_tags_cache.push((
@@ -275,21 +291,71 @@ pub(crate) async fn parse_flv(
                     }
                     create_new = false;
                 }
-                flv_tags_cache.push((tag_header, bytes.clone(), previous_tag_size.clone()));
+                if !current_file_started {
+                    // A freshly split file only has sequence headers queued.
+                    // Persist them and the boundary keyframe immediately so
+                    // Start reflects the first media write, not the next GOP.
+                    for (cached_header, cached_data, cached_previous_size) in
+                        flv_tags_cache.drain(..)
+                    {
+                        let is_media = is_media_timestamp_tag(&cached_header, &cached_data);
+                        if is_media && !current_file_started {
+                            segment_started(&out.file.file_name);
+                            current_file_started = true;
+                        }
+                        let output_header = rebase_media_timestamp(
+                            &cached_header,
+                            is_media,
+                            &mut output_timestamp_base,
+                        );
+                        out.write_tag(&output_header, &cached_data, &cached_previous_size)?;
+                        segment.increase_size((11 + cached_header.data_size + 4) as u64);
+                    }
+
+                    if !current_file_started {
+                        segment_started(&out.file.file_name);
+                        current_file_started = true;
+                    }
+                    let output_header =
+                        rebase_media_timestamp(&tag_header, true, &mut output_timestamp_base);
+                    out.write_tag(&output_header, &bytes, &previous_tag_size)?;
+                    segment.increase_size((11 + tag_header.data_size + 4) as u64);
+                    prev_timestamp = tag_header.timestamp;
+                } else {
+                    flv_tags_cache.push((tag_header, bytes.clone(), previous_tag_size.clone()));
+                }
             }
             _ => {
                 flv_tags_cache.push((tag_header, bytes.clone(), previous_tag_size.clone()));
             }
         }
     }
+    for (tag_header, flv_tag_data, previous_tag_size_bytes) in flv_tags_cache.drain(..) {
+        let is_media = is_media_timestamp_tag(&tag_header, &flv_tag_data);
+        if is_media && !current_file_started {
+            segment_started(&out.file.file_name);
+            current_file_started = true;
+        }
+        let output_header =
+            rebase_media_timestamp(&tag_header, is_media, &mut output_timestamp_base);
+        out.write_tag(&output_header, &flv_tag_data, &previous_tag_size_bytes)?;
+    }
+    if current_file_started {
+        segment_ended(&out.file.file_name);
+    }
     Ok(())
 }
 
-fn should_split_on_anomaly(last_anomaly_split: Option<Instant>) -> bool {
-    match last_anomaly_split {
-        Some(last) if last.elapsed() < TIMESTAMP_ANOMALY_COOLDOWN => false,
-        _ => true,
+fn rebase_media_timestamp(
+    header: &TagHeader,
+    is_media: bool,
+    output_timestamp_base: &mut Option<u32>,
+) -> TagHeader {
+    if !is_media {
+        return retimestamp_tag_header(header, 0);
     }
+    let base = *output_timestamp_base.get_or_insert(header.timestamp);
+    retimestamp_tag_header(header, header.timestamp.saturating_sub(base))
 }
 
 fn is_media_timestamp_tag(tag_header: &TagHeader, body: &Bytes) -> bool {
@@ -438,6 +504,42 @@ mod tests {
         let zeroed = retimestamp_tag_header(&header, 0);
         assert_eq!(zeroed.timestamp, 0);
         assert_eq!(zeroed.data_size, 10);
+    }
+
+    #[test]
+    fn media_timestamps_are_rebased_for_each_output_segment() {
+        let first = TagHeader {
+            tag_type: TagType::Video,
+            data_size: 10,
+            timestamp: 9_000,
+            stream_id: 0,
+        };
+        let second = TagHeader {
+            timestamp: 9_040,
+            ..first
+        };
+        let header = TagHeader {
+            timestamp: 55_000,
+            ..first
+        };
+        let mut base = None;
+
+        assert_eq!(
+            rebase_media_timestamp(&header, false, &mut base).timestamp,
+            0
+        );
+        assert_eq!(base, None, "sequence headers must not set the media base");
+        assert_eq!(rebase_media_timestamp(&first, true, &mut base).timestamp, 0);
+        assert_eq!(
+            rebase_media_timestamp(&second, true, &mut base).timestamp,
+            40
+        );
+
+        base = None;
+        assert_eq!(
+            rebase_media_timestamp(&header, true, &mut base).timestamp,
+            0
+        );
     }
 
     #[test]

@@ -62,4 +62,35 @@ impl DanmakuClient for RustDanmakuClient {
         }
         Ok(false)
     }
+
+    fn start_segment(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let handle = self
+            .handle
+            .lock()
+            .map_err(|_| "danmaku handle lock poisoned")?
+            .clone();
+        if let Some(handle) = handle {
+            return tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(handle.start_segment())
+            })
+            .map_err(Into::into);
+        }
+        Ok(())
+    }
+
+    fn end_segment(&self, file_name: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        let handle = self
+            .handle
+            .lock()
+            .map_err(|_| "danmaku handle lock poisoned")?
+            .clone();
+        if let Some(handle) = handle {
+            return tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(handle.end_segment(PathBuf::from(file_name)))
+            })
+            .map_err(Into::into);
+        }
+        Ok(false)
+    }
 }

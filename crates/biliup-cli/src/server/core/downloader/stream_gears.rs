@@ -10,7 +10,7 @@ use biliup::downloader::{hls, httpflv};
 use error_stack::{ResultExt, bail};
 use nom::Err;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
@@ -41,7 +41,7 @@ impl StreamGears {
 
     async fn start_download<'a>(
         &self,
-        mut callback: Box<dyn FnMut(SegmentEvent) + Send + Sync + 'a>,
+        callback: Box<dyn FnMut(SegmentEvent) + Send + Sync + 'a>,
         download_config: DownloadConfig,
     ) -> AppResult<DownloadStatus> {
         let url = download_config.url.clone();
@@ -71,8 +71,10 @@ impl StreamGears {
         // let mut i = 0;
         // let mut prev_file_path = None;
         // 创建分段回调钩子
+        let callback = Arc::new(Mutex::new(callback));
         let hook = {
             let mut i = 0;
+            let callback = Arc::clone(&callback);
             move |s: &str| {
                 let file_path = PathBuf::from(s);
 
@@ -82,9 +84,31 @@ impl StreamGears {
                     next_file_path: None,
                     segment_index: i,
                 };
-                callback(SegmentEvent::Segment(event));
+                if let Ok(mut callback) = callback.lock() {
+                    callback(SegmentEvent::Segment(event));
+                }
 
                 i += 1;
+            }
+        };
+        let start_hook = {
+            let callback = Arc::clone(&callback);
+            move |s: &str| {
+                if let Ok(mut callback) = callback.lock() {
+                    callback(SegmentEvent::Start {
+                        next_file_path: PathBuf::from(s),
+                    });
+                }
+            }
+        };
+        let end_hook = {
+            let callback = Arc::clone(&callback);
+            move |s: &str| {
+                if let Ok(mut callback) = callback.lock() {
+                    callback(SegmentEvent::End {
+                        prev_file_path: PathBuf::from(s),
+                    });
+                }
             }
         };
         // 解析流头部，判断流类型
@@ -94,7 +118,14 @@ impl StreamGears {
                 info!("Downloading {}...", url);
                 // FLV流下载
                 let file = LifecycleFile::with_hook(&file_name, "flv", hook);
-                httpflv::download(connection, file, segment.clone()).await;
+                httpflv::download_with_boundaries(
+                    connection,
+                    file,
+                    segment.clone(),
+                    Box::new(start_hook),
+                    Box::new(end_hook),
+                )
+                .await;
             }
             Err(Err::Incomplete(needed)) => {
                 error!("needed: {needed:?}")
@@ -103,9 +134,16 @@ impl StreamGears {
                 error!("{e}");
                 // HLS流下载
                 let file = LifecycleFile::with_hook(&file_name, "ts", hook);
-                hls::download(&url, &client, file, segment.clone())
-                    .await
-                    .change_context(AppError::Unknown)?;
+                hls::download_with_boundaries(
+                    &url,
+                    &client,
+                    file,
+                    segment.clone(),
+                    Box::new(start_hook),
+                    Box::new(end_hook),
+                )
+                .await
+                .change_context(AppError::Unknown)?;
             }
         }
         Ok(DownloadStatus::StreamEnded)

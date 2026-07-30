@@ -31,7 +31,10 @@ pub fn is_timestamp_anomaly(prev_ms: u32, current_ms: u32) -> bool {
 }
 
 /// 把 FLV tag 的时间戳改写为指定值，用于新段写入 header。
-pub fn retimestamp_tag_header(header: &crate::downloader::flv_parser::TagHeader, timestamp: u32) -> crate::downloader::flv_parser::TagHeader {
+pub fn retimestamp_tag_header(
+    header: &crate::downloader::flv_parser::TagHeader,
+    timestamp: u32,
+) -> crate::downloader::flv_parser::TagHeader {
     let mut header = *header;
     header.timestamp = timestamp;
     header
@@ -296,15 +299,34 @@ impl<'a> LifecycleFile<'a> {
 
     pub fn create(&mut self) -> Result<&Path, std::io::Error> {
         // 构建最终文件名
-        self.file_name = format!(
+        let file_name = format!(
             "{}.{}",
             format_filename(&self.fmt_file_name),
             self.extension
         );
+        let mut final_path = PathBuf::from(file_name);
+        let mut part_path = part_path_for(&final_path, self.extension);
+        if final_path.exists() || part_path.exists() {
+            let parent = final_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
+            let stem = final_path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "segment".to_string());
+            for index in 1.. {
+                final_path = parent.join(format!("{stem}_{index}.{}", self.extension));
+                part_path = part_path_for(&final_path, self.extension);
+                if !final_path.exists() && !part_path.exists() {
+                    break;
+                }
+            }
+        }
+        self.file_name = final_path.to_string_lossy().into_owned();
 
         // 构建临时文件路径（带 .part 后缀）
-        self.path = PathBuf::from(&self.file_name);
-        self.path.set_extension(format!("{}.part", self.extension));
+        self.path = part_path;
 
         // 确保父目录存在
         if let Some(parent) = self.path.parent() {
@@ -324,6 +346,12 @@ impl<'a> LifecycleFile<'a> {
             }
         }
     }
+}
+
+fn part_path_for(final_path: &Path, extension: &str) -> PathBuf {
+    let mut part_path = final_path.to_path_buf();
+    part_path.set_extension(format!("{extension}.part"));
+    part_path
 }
 
 pub fn format_filename(file_name: &str) -> String {
@@ -350,6 +378,33 @@ mod tests {
         assert_eq!(Path::new("/feel/the"), p.as_path());
 
         Ok(())
+    }
+
+    #[test]
+    fn lifecycle_file_does_not_reuse_a_name_within_the_same_second() {
+        let dir = std::env::temp_dir().join(format!(
+            "biliup-lifecycle-file-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let template = dir.join("segment").to_string_lossy().into_owned();
+        let mut file = LifecycleFile::new(&template, "flv");
+
+        let first_part = file.create().unwrap().to_path_buf();
+        std::fs::write(&first_part, b"first").unwrap();
+        file.rename();
+        let first_final = PathBuf::from(&file.file_name);
+
+        let second_part = file.create().unwrap().to_path_buf();
+        std::fs::write(&second_part, b"second").unwrap();
+        file.rename();
+        let second_final = PathBuf::from(&file.file_name);
+
+        assert_ne!(first_final, second_final);
+        assert_eq!(std::fs::read(first_final).unwrap(), b"first");
+        assert_eq!(std::fs::read(second_final).unwrap(), b"second");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

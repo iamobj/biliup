@@ -10,11 +10,32 @@ use url::Url;
 
 use crate::client::StatelessClient;
 
+pub type SegmentBoundaryHook<'a> = Box<dyn FnMut(&str) + Send + Sync + 'a>;
+
 pub async fn download(
     url: &str,
     client: &StatelessClient,
     file: LifecycleFile<'_>,
+    splitting: Segmentable,
+) -> Result<()> {
+    download_with_boundaries(
+        url,
+        client,
+        file,
+        splitting,
+        Box::new(|_| {}),
+        Box::new(|_| {}),
+    )
+    .await
+}
+
+pub async fn download_with_boundaries(
+    url: &str,
+    client: &StatelessClient,
+    file: LifecycleFile<'_>,
     mut splitting: Segmentable,
+    mut segment_started: SegmentBoundaryHook<'_>,
+    mut segment_ended: SegmentBoundaryHook<'_>,
 ) -> Result<()> {
     info!("Downloading {}...", url);
     let resp = client.retryable(url).await?;
@@ -37,7 +58,12 @@ pub async fn download(
                 .iter()
                 .filter(|v| !v.is_i_frame && v.resolution.is_some())
                 .max_by_key(|v| v.bandwidth)
-                .or_else(|| pl.variants.iter().filter(|v| !v.is_i_frame).max_by_key(|v| v.bandwidth))
+                .or_else(|| {
+                    pl.variants
+                        .iter()
+                        .filter(|v| !v.is_i_frame)
+                        .max_by_key(|v| v.bandwidth)
+                })
                 .unwrap_or(&pl.variants[0]);
             info!(
                 "Selected variant: bandwidth={}, resolution={:?}, video={:?}",
@@ -66,38 +92,57 @@ pub async fn download(
         }
         Err(e) => return Err(Error::Custom(format!("Parsing playlist error: {e}"))),
     };
-    let mut previous_last_segment = 0;
-    loop {
+    let mut last_sequence = None::<u64>;
+    let mut current_file_started = false;
+    let result = async {
+      loop {
         if pl.segments.is_empty() {
             info!("Segments array is empty - stream finished");
             break;
         }
         let mut seq = pl.media_sequence;
         for segment in &pl.segments {
-            if seq > previous_last_segment {
-                if (previous_last_segment > 0) && (seq > (previous_last_segment + 1)) {
-                    warn!("SEGMENT INFO SKIPPED");
+            if should_download_sequence(last_sequence, seq) {
+                let sequence_gap = has_sequence_gap(last_sequence, seq);
+                if sequence_gap {
+                    warn!(last = ?last_sequence, current = seq, "HLS media sequence gap");
                 }
                 debug!("Yield segment");
-                if segment.discontinuity {
+                let anomaly_boundary =
+                    splitting.split_on_timestamp_anomaly() && sequence_gap;
+                if anomaly_boundary || segment.discontinuity {
+                    if current_file_started {
+                        segment_ended(&ts_file.file.file_name);
+                    }
                     warn!("#EXT-X-DISCONTINUITY");
                     ts_file.create_new()?;
-                    // splitting = Segment::from_seg(splitting);
                     splitting.reset();
+                    current_file_started = false;
                 }
+                let file_name = ts_file.file.file_name.clone();
                 let length = download_to_file(
                     media_url.join(&segment.uri)?,
                     client,
                     &mut ts_file.buf_writer,
+                    || {
+                        if !current_file_started {
+                            segment_started(&file_name);
+                            current_file_started = true;
+                        }
+                    },
                 )
                 .await?;
                 splitting.increase_size(length);
-                splitting.increase_time(Duration::from_secs(segment.duration as u64));
+                splitting.increase_time(Duration::from_secs_f64(segment.duration as f64));
                 if splitting.needed() {
+                    if current_file_started {
+                        segment_ended(&ts_file.file.file_name);
+                    }
                     ts_file.create_new()?;
                     splitting.reset();
+                    current_file_started = false;
                 }
-                previous_last_segment = seq;
+                last_sequence = Some(seq);
             }
             seq += 1;
         }
@@ -105,30 +150,75 @@ pub async fn download(
         let bs = resp.bytes().await?;
         if let Ok((_, playlist)) = m3u8_rs::parse_media_playlist(&bs) {
             if splitting.split_on_timestamp_anomaly()
-                && previous_last_segment > 0
-                && playlist.media_sequence > 0
-                && playlist.media_sequence + 1 < previous_last_segment
+                && is_sequence_regression(last_sequence, playlist_last_sequence(&playlist))
             {
                 warn!(
-                    "检测到 HLS media sequence 回退，准备切分文件 previous_last={previous_last_segment} new_seq={}",
-                    playlist.media_sequence
+                    "检测到 HLS media sequence 回退，准备切分文件 previous_last={:?} new_start={} new_last={:?}",
+                    last_sequence,
+                    playlist.media_sequence,
+                    playlist_last_sequence(&playlist)
                 );
+                if current_file_started {
+                    segment_ended(&ts_file.file.file_name);
+                }
                 ts_file.create_new()?;
                 splitting.reset();
-                previous_last_segment = 0;
+                current_file_started = false;
+                last_sequence = None;
             }
             pl = playlist;
         }
+      }
+      Ok(())
     }
+    .await;
+
+    if current_file_started {
+        segment_ended(&ts_file.file.file_name);
+    }
+    drop(ts_file);
     info!("Done...");
-    Ok(())
+    result
 }
 
-async fn download_to_file(url: Url, client: &StatelessClient, out: &mut impl Write) -> Result<u64> {
+fn playlist_last_sequence(playlist: &m3u8_rs::MediaPlaylist) -> Option<u64> {
+    (!playlist.segments.is_empty()).then(|| {
+        playlist
+            .media_sequence
+            .saturating_add(playlist.segments.len() as u64 - 1)
+    })
+}
+
+fn is_sequence_regression(previous: Option<u64>, current: Option<u64>) -> bool {
+    matches!((previous, current), (Some(previous), Some(current)) if current.saturating_add(1) < previous)
+}
+
+fn should_download_sequence(previous: Option<u64>, current: u64) -> bool {
+    previous.is_none_or(|previous| current > previous)
+}
+
+fn has_sequence_gap(previous: Option<u64>, current: u64) -> bool {
+    previous.is_some_and(|previous| current > previous.saturating_add(1))
+}
+
+async fn download_to_file<F>(
+    url: Url,
+    client: &StatelessClient,
+    out: &mut impl Write,
+    mut on_first_chunk: F,
+) -> Result<u64>
+where
+    F: FnMut(),
+{
     debug!("url: {url}");
     let mut response = client.retryable(url.as_str()).await?;
     let mut length: u64 = 0;
+    let mut started = false;
     while let Some(chunk) = response.chunk().await? {
+        if !started {
+            on_first_chunk();
+            started = true;
+        }
         length += chunk.len() as u64;
         out.write_all(&chunk)?;
     }
@@ -186,6 +276,7 @@ impl Drop for TsFile<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::{has_sequence_gap, is_sequence_regression, should_download_sequence};
     use reqwest::Url;
 
     #[test]
@@ -203,5 +294,31 @@ mod tests {
         // download(
         //     "test.ts")?;
         Ok(())
+    }
+
+    #[test]
+    fn media_sequence_zero_is_a_valid_first_segment() {
+        assert!(should_download_sequence(None, 0));
+        assert!(!should_download_sequence(Some(0), 0));
+        assert!(should_download_sequence(Some(0), 1));
+    }
+
+    #[test]
+    fn overlapping_playlist_window_does_not_regress_or_create_a_gap() {
+        // Previous playlist ended at 102; the next normal sliding window is
+        // 101, 102, 103. Only 103 is new.
+        assert!(!should_download_sequence(Some(102), 101));
+        assert!(!should_download_sequence(Some(102), 102));
+        assert!(should_download_sequence(Some(102), 103));
+        assert!(!has_sequence_gap(Some(102), 103));
+        assert!(!is_sequence_regression(Some(102), Some(103)));
+    }
+
+    #[test]
+    fn detects_large_regression_and_forward_gap() {
+        assert!(is_sequence_regression(Some(102), Some(2)));
+        assert!(!is_sequence_regression(Some(102), Some(101)));
+        assert!(has_sequence_gap(Some(102), 104));
+        assert!(!has_sequence_gap(Some(102), 103));
     }
 }

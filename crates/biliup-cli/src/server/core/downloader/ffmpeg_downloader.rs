@@ -5,9 +5,9 @@ use crate::server::core::downloader::{
 use crate::server::errors::{AppError, AppResult};
 use biliup::downloader::util::TIMESTAMP_ANOMALY_COOLDOWN;
 use error_stack::{ResultExt, bail};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -94,6 +94,13 @@ impl FfmpegDownloader {
             "quiet"
         };
         args.extend(["-loglevel".to_string(), loglevel.to_string()]);
+        args.extend([
+            "-progress".to_string(),
+            "pipe:1".to_string(),
+            "-stats_period".to_string(),
+            "0.25".to_string(),
+            "-nostats".to_string(),
+        ]);
 
         self.append_common_input_args(&mut args, download_config);
 
@@ -190,10 +197,36 @@ impl FfmpegDownloader {
             .kill_on_drop(true);
 
         let child = cmd.spawn().change_context(AppError::Unknown)?;
+        let mut segment_started = false;
+        let mut segment_ended = false;
         let (status, anomaly) = spawn_log(
             child,
             Arc::clone(&self.process_handle),
             download_config.split_on_timestamp_anomaly,
+            |event| match event {
+                FfmpegProcessEvent::Started => {
+                    if !segment_started {
+                        callback(SegmentEvent::Start {
+                            next_file_path: output_file.clone(),
+                        });
+                        segment_started = true;
+                    }
+                }
+                FfmpegProcessEvent::TimestampAnomaly => {
+                    if !segment_started {
+                        callback(SegmentEvent::Start {
+                            next_file_path: output_file.clone(),
+                        });
+                        segment_started = true;
+                    }
+                    if !segment_ended {
+                        callback(SegmentEvent::End {
+                            prev_file_path: output_file.clone(),
+                        });
+                        segment_ended = true;
+                    }
+                }
+            },
         )
         .await?;
 
@@ -205,6 +238,16 @@ impl FfmpegDownloader {
                 warn!("时间戳异常切分后分段文件为空，丢弃: {part_file}");
                 let _ = tokio::fs::remove_file(&part_file).await;
             } else {
+                if !segment_started {
+                    callback(SegmentEvent::Start {
+                        next_file_path: output_file.clone(),
+                    });
+                }
+                if !segment_ended {
+                    callback(SegmentEvent::End {
+                        prev_file_path: output_file.clone(),
+                    });
+                }
                 tokio::fs::rename(&part_file, &output_file)
                     .await
                     .change_context(AppError::Custom(String::from("退出时，重命名文件")))?;
@@ -264,67 +307,139 @@ impl FfmpegDownloader {
             .stdout
             .take()
             .ok_or(AppError::Custom("Failed to capture stdout".to_string()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or(AppError::Custom("failed to capture stderr pipe".to_string()))?;
+        let stderr = child.stderr.take().ok_or(AppError::Custom(
+            "failed to capture stderr pipe".to_string(),
+        ))?;
 
         {
             let mut handle = self.process_handle.write().await;
             *handle = Some(child);
         }
 
-        let anomaly_triggered = Arc::new(AtomicBool::new(false));
-        let current_part = Arc::new(RwLock::new(None::<PathBuf>));
-        let process_handle = Arc::clone(&self.process_handle);
-        let anomaly_flag = Arc::clone(&anomaly_triggered);
-        let current_part_for_stderr = Arc::clone(&current_part);
-        let split_enabled = download_config.split_on_timestamp_anomaly;
-
-        let stderr_task = tokio::spawn(async move {
-            let mut detector = TimestampAnomalyDetector::new(split_enabled);
-            let mut stderr_lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = stderr_lines.next_line().await {
-                info!("[ffmpeg] {line}");
-                if let Some(path) = parse_ffmpeg_opening_path(&line) {
-                    let mut guard = current_part_for_stderr.write().await;
-                    *guard = Some(path);
-                }
-                if detector.observe(&line) {
-                    warn!("检测到 FFmpeg 时间戳异常，正在优雅结束当前文件以便收尾落盘");
-                    anomaly_flag.store(true, Ordering::SeqCst);
-                    stop_ffmpeg_for_split(Arc::clone(&process_handle)).await;
-                }
-            }
-        });
-
-        let mut reader = BufReader::new(stdout).lines();
+        let mut detector =
+            TimestampAnomalyDetector::new(download_config.split_on_timestamp_anomaly);
+        let mut stdout_lines = BufReader::new(stdout).lines();
+        let mut stderr_lines = BufReader::new(stderr).lines();
+        let mut stdout_open = true;
+        let mut stderr_open = true;
+        let mut anomaly_triggered = false;
+        let mut pending_parts = Vec::<PathBuf>::new();
+        let mut listed_parts = Vec::<PathBuf>::new();
+        let mut active_final_path = None::<PathBuf>;
+        let mut started_paths = HashSet::<PathBuf>::new();
+        let mut ended_paths = HashSet::<PathBuf>::new();
         let mut segment_index = 0;
-        let mut finalized = std::collections::HashSet::<PathBuf>::new();
+        let mut finalized = HashSet::<PathBuf>::new();
 
-        while let Some(line) = reader.next_line().await.change_context(AppError::Unknown)? {
-            let file_path = PathBuf::from(line.trim());
-            if file_path.as_os_str().is_empty() {
-                continue;
-            }
-
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-            if let Some(final_path) = finalize_part_file(&file_path).await? {
-                if finalized.insert(final_path.clone()) {
-                    info!("renamed file: from {file_path:?} to {final_path:?}");
-                    callback(SegmentEvent::Segment(SegmentInfo {
-                        prev_file_path: final_path,
-                        danmaku_file_path: None,
-                        next_file_path: None,
-                        segment_index,
-                    }));
-                    segment_index += 1;
+        while stdout_open || stderr_open {
+            tokio::select! {
+                line = stdout_lines.next_line(), if stdout_open => {
+                    match line.change_context(AppError::Unknown)? {
+                        Some(line) => {
+                            let file_path = PathBuf::from(line.trim());
+                            if file_path.as_os_str().is_empty() {
+                                continue;
+                            }
+                            let expected_final = strip_part_suffix(&file_path);
+                            if started_paths.contains(&expected_final) {
+                                complete_internal_segment(
+                                    &file_path,
+                                    &mut callback,
+                                    &mut started_paths,
+                                    &mut ended_paths,
+                                    &mut finalized,
+                                    &mut segment_index,
+                                )
+                                .await?;
+                                if active_final_path.as_ref() == Some(&expected_final) {
+                                    active_final_path = None;
+                                }
+                                pending_parts.retain(|path| path != &file_path);
+                            } else if !listed_parts.contains(&file_path) {
+                                // stdout and stderr are independent pipes. Keep a
+                                // completion that overtook its Opening log pending,
+                                // otherwise Start would be emitted only after the
+                                // whole segment had already finished.
+                                listed_parts.push(file_path);
+                            }
+                        }
+                        None => stdout_open = false,
+                    }
+                }
+                line = stderr_lines.next_line(), if stderr_open => {
+                    match line.change_context(AppError::Unknown)? {
+                        Some(line) => {
+                            info!("[ffmpeg] {line}");
+                            if let Some(part_path) = parse_ffmpeg_opening_path(&line) {
+                                let final_path = strip_part_suffix(&part_path);
+                                // stdout and stderr are independent pipes. A completed
+                                // stdout entry can be observed before its Opening log.
+                                // Ignore that late log instead of starting the same XML twice.
+                                if finalized.contains(&final_path) {
+                                    continue;
+                                }
+                                if active_final_path.as_ref() != Some(&final_path) {
+                                    if let Some(previous) = active_final_path.as_ref()
+                                        && ended_paths.insert(previous.clone())
+                                    {
+                                        callback(SegmentEvent::End {
+                                            prev_file_path: previous.clone(),
+                                        });
+                                    }
+                                    if started_paths.insert(final_path.clone()) {
+                                        callback(SegmentEvent::Start {
+                                            next_file_path: final_path.clone(),
+                                        });
+                                    }
+                                    if !pending_parts.contains(&part_path) {
+                                        pending_parts.push(part_path.clone());
+                                    }
+                                    active_final_path = Some(final_path.clone());
+                                    if let Some(position) = listed_parts
+                                        .iter()
+                                        .position(|listed| listed == &part_path)
+                                    {
+                                        listed_parts.remove(position);
+                                        complete_internal_segment(
+                                            &part_path,
+                                            &mut callback,
+                                            &mut started_paths,
+                                            &mut ended_paths,
+                                            &mut finalized,
+                                            &mut segment_index,
+                                        )
+                                        .await?;
+                                        active_final_path = None;
+                                        pending_parts.retain(|path| path != &part_path);
+                                    }
+                                }
+                            }
+                            if detector.observe(&line) {
+                                warn!("检测到 FFmpeg 时间戳异常，正在优雅结束当前文件以便收尾落盘");
+                                anomaly_triggered = true;
+                                if let Some(current) = active_final_path.as_ref()
+                                    && ended_paths.insert(current.clone())
+                                {
+                                    callback(SegmentEvent::End {
+                                        prev_file_path: current.clone(),
+                                    });
+                                }
+                                stop_ffmpeg_for_split(Arc::clone(&self.process_handle)).await;
+                            }
+                        }
+                        None => stderr_open = false,
+                    }
                 }
             }
         }
 
-        let _ = stderr_task.await;
+        if let Some(current) = active_final_path.as_ref()
+            && ended_paths.insert(current.clone())
+        {
+            callback(SegmentEvent::End {
+                prev_file_path: current.clone(),
+            });
+        }
 
         let status = {
             let mut handle = self.process_handle.write().await;
@@ -335,21 +450,36 @@ impl FfmpegDownloader {
             }
         };
 
-        // 兜底：进程结束后仍有未回调的当前 .part
-        if let Some(part_path) = current_part.write().await.take()
-            && let Some(final_path) = finalize_part_file(&part_path).await?
-            && finalized.insert(final_path.clone())
-        {
-            info!("补齐未回调的分段文件: {part_path:?} -> {final_path:?}");
-            callback(SegmentEvent::Segment(SegmentInfo {
-                prev_file_path: final_path,
-                danmaku_file_path: None,
-                next_file_path: None,
-                segment_index,
-            }));
+        // If FFmpeg did not emit an Opening log, complete segment-list entries
+        // only after both pipes close. This preserves data while ensuring the
+        // normal path never starts danmaku at the end of a segment.
+        for part_path in listed_parts {
+            complete_internal_segment(
+                &part_path,
+                &mut callback,
+                &mut started_paths,
+                &mut ended_paths,
+                &mut finalized,
+                &mut segment_index,
+            )
+            .await?;
+            pending_parts.retain(|path| path != &part_path);
         }
 
-        if anomaly_triggered.load(Ordering::SeqCst) {
+        // 兜底：进程结束后补齐所有没有出现在 segment_list stdout 的 .part。
+        for part_path in pending_parts {
+            complete_internal_segment(
+                &part_path,
+                &mut callback,
+                &mut started_paths,
+                &mut ended_paths,
+                &mut finalized,
+                &mut segment_index,
+            )
+            .await?;
+        }
+
+        if anomaly_triggered {
             return Ok(DownloadStatus::SegmentCompleted);
         }
 
@@ -359,6 +489,43 @@ impl FfmpegDownloader {
             err => Ok(DownloadStatus::Error(format!("FFmpeg error: {err:?}"))),
         }
     }
+}
+
+async fn complete_internal_segment<F>(
+    part_path: &Path,
+    callback: &mut F,
+    started_paths: &mut HashSet<PathBuf>,
+    ended_paths: &mut HashSet<PathBuf>,
+    finalized: &mut HashSet<PathBuf>,
+    segment_index: &mut usize,
+) -> AppResult<()>
+where
+    F: FnMut(SegmentEvent) + ?Sized,
+{
+    let expected_final = strip_part_suffix(part_path);
+    if started_paths.insert(expected_final.clone()) {
+        callback(SegmentEvent::Start {
+            next_file_path: expected_final.clone(),
+        });
+    }
+    if ended_paths.insert(expected_final.clone()) {
+        callback(SegmentEvent::End {
+            prev_file_path: expected_final,
+        });
+    }
+    if let Some(final_path) = finalize_part_file(part_path).await?
+        && finalized.insert(final_path.clone())
+    {
+        info!("renamed file: from {part_path:?} to {final_path:?}");
+        callback(SegmentEvent::Segment(SegmentInfo {
+            prev_file_path: final_path,
+            danmaku_file_path: None,
+            next_file_path: None,
+            segment_index: *segment_index,
+        }));
+        *segment_index += 1;
+    }
+    Ok(())
 }
 
 impl FfmpegDownloader {
@@ -431,13 +598,10 @@ fn is_ffmpeg_timestamp_anomaly_line(line: &str) -> bool {
 fn parse_ffmpeg_opening_path(line: &str) -> Option<PathBuf> {
     // Example: Opening 'foo.mp4.part' for writing
     let lower = line.to_ascii_lowercase();
-    if !(lower.contains("opening '") && lower.contains("for writing")) {
-        return None;
-    }
-    let start = line.find('\'')? + 1;
-    let end = line[start..].find('\'')? + start;
+    let end = lower.rfind("' for writing")?;
+    let start = lower[..end].find("opening '")? + "opening '".len();
     let path = &line[start..end];
-    if path.is_empty() {
+    if path.is_empty() || !path.ends_with(".part") {
         return None;
     }
     Some(PathBuf::from(path))
@@ -488,11 +652,24 @@ fn strip_part_suffix(path: &Path) -> PathBuf {
     }
 }
 
-async fn spawn_log(
+#[derive(Debug, Clone, Copy)]
+enum FfmpegProcessEvent {
+    Started,
+    TimestampAnomaly,
+}
+
+async fn spawn_log<F>(
     mut child: tokio::process::Child,
     process_handle: Arc<RwLock<Option<tokio::process::Child>>>,
     split_on_timestamp_anomaly: bool,
-) -> AppResult<(ExitStatus, bool)> {
+    mut event_hook: F,
+) -> AppResult<(ExitStatus, bool)>
+where
+    F: FnMut(FfmpegProcessEvent),
+{
+    let stdout = child.stdout.take().ok_or(AppError::Custom(
+        "failed to capture stdout pipe".to_string(),
+    ))?;
     let stderr = child.stderr.take().ok_or(AppError::Custom(
         "failed to capture stderr pipe".to_string(),
     ))?;
@@ -504,13 +681,38 @@ async fn spawn_log(
 
     let mut detector = TimestampAnomalyDetector::new(split_on_timestamp_anomaly);
     let mut anomaly = false;
+    let mut progress_started = false;
+    let mut stdout_open = true;
+    let mut stderr_open = true;
+    let mut stdout_lines = BufReader::new(stdout).lines();
     let mut stderr_lines = BufReader::new(stderr).lines();
-    while let Ok(Some(line)) = stderr_lines.next_line().await {
-        info!("[ffmpeg] {line}");
-        if detector.observe(&line) {
-            warn!("检测到 FFmpeg 时间戳异常，正在优雅结束当前文件以便收尾落盘");
-            anomaly = true;
-            stop_ffmpeg_for_split(Arc::clone(&process_handle)).await;
+    while stdout_open || stderr_open {
+        tokio::select! {
+            line = stdout_lines.next_line(), if stdout_open => {
+                match line {
+                    Ok(Some(line)) => {
+                        if !progress_started && line.starts_with("progress=") {
+                            progress_started = true;
+                            event_hook(FfmpegProcessEvent::Started);
+                        }
+                    }
+                    _ => stdout_open = false,
+                }
+            }
+            line = stderr_lines.next_line(), if stderr_open => {
+                match line {
+                    Ok(Some(line)) => {
+                        info!("[ffmpeg] {line}");
+                        if detector.observe(&line) {
+                            warn!("检测到 FFmpeg 时间戳异常，正在优雅结束当前文件以便收尾落盘");
+                            anomaly = true;
+                            event_hook(FfmpegProcessEvent::TimestampAnomaly);
+                            stop_ffmpeg_for_split(Arc::clone(&process_handle)).await;
+                        }
+                    }
+                    _ => stderr_open = false,
+                }
+            }
         }
     }
 
@@ -626,7 +828,8 @@ mod tests {
         let mut detector = TimestampAnomalyDetector::new(true);
         assert!(detector.observe("Non-monotonous DTS in output stream"));
         assert!(!detector.observe("Non-monotonous DTS in output stream"));
-        detector.last_trigger = Some(Instant::now() - TIMESTAMP_ANOMALY_COOLDOWN - Duration::from_millis(1));
+        detector.last_trigger =
+            Some(Instant::now() - TIMESTAMP_ANOMALY_COOLDOWN - Duration::from_millis(1));
         assert!(detector.observe("Non-monotonous DTS in output stream"));
     }
 
@@ -640,6 +843,10 @@ mod tests {
     fn parses_opening_path() {
         let path = parse_ffmpeg_opening_path("Opening 'foo/bar.mp4.part' for writing").unwrap();
         assert_eq!(path, PathBuf::from("foo/bar.mp4.part"));
+        let quoted =
+            parse_ffmpeg_opening_path("Opening 'foo/it's live.mp4.part' for writing").unwrap();
+        assert_eq!(quoted, PathBuf::from("foo/it's live.mp4.part"));
+        assert!(parse_ffmpeg_opening_path("Opening 'pipe:1' for writing").is_none());
         assert!(parse_ffmpeg_opening_path("frame=1").is_none());
     }
 
@@ -653,5 +860,46 @@ mod tests {
             strip_part_suffix(Path::new("a/b.mp4")),
             PathBuf::from("a/b.mp4")
         );
+    }
+
+    #[tokio::test]
+    async fn internal_completion_emits_boundaries_before_segment() {
+        let dir = std::env::temp_dir().join(format!(
+            "biliup-ffmpeg-boundary-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let part_path = dir.join("capture.flv.part");
+        std::fs::write(&part_path, b"media").unwrap();
+
+        let mut events = Vec::new();
+        let mut callback = |event| {
+            events.push(match event {
+                SegmentEvent::Start { .. } => "start",
+                SegmentEvent::End { .. } => "end",
+                SegmentEvent::Segment(_) => "segment",
+            });
+        };
+        let mut started = HashSet::new();
+        let mut ended = HashSet::new();
+        let mut finalized = HashSet::new();
+        let mut segment_index = 0;
+
+        complete_internal_segment(
+            &part_path,
+            &mut callback,
+            &mut started,
+            &mut ended,
+            &mut finalized,
+            &mut segment_index,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(events, ["start", "end", "segment"]);
+        assert_eq!(segment_index, 1);
+        assert!(dir.join("capture.flv").exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
