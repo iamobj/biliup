@@ -190,8 +190,9 @@ async fn parse_flv_with_boundaries(
                         && is_timestamp_anomaly(prev_timestamp, tag_header.timestamp)
                     {
                         warn!(
-                            "关键帧刷新前检测到时间戳异常，准备切分文件 previous={prev_timestamp} current={}",
-                            tag_header.timestamp
+                            "关键帧刷新前检测到时间戳异常，准备切分文件 previous={prev_timestamp} current={} delta_ms={}",
+                            tag_header.timestamp,
+                            tag_header.timestamp as i64 - prev_timestamp as i64
                         );
                         create_new = true;
                         discard_rest_of_cache = true;
@@ -201,8 +202,9 @@ async fn parse_flv_with_boundaries(
                         && tag_header.timestamp < prev_timestamp
                     {
                         warn!(
-                            "输出流 DTS 非单调 previous={prev_timestamp} current={}",
-                            tag_header.timestamp
+                            "输出流 DTS 非单调 previous={prev_timestamp} current={} delta_ms={}",
+                            tag_header.timestamp,
+                            tag_header.timestamp as i64 - prev_timestamp as i64
                         );
                     }
 
@@ -235,10 +237,21 @@ async fn parse_flv_with_boundaries(
                     && is_timestamp_anomaly(prev_timestamp, flv_tag.header.timestamp);
                 if keyframe_anomaly {
                     warn!(
-                        "关键帧处检测到时间戳异常，准备切分文件 previous={prev_timestamp} current={}",
-                        flv_tag.header.timestamp
+                        "关键帧处检测到时间戳异常，准备切分文件 previous={prev_timestamp} current={} delta_ms={}",
+                        flv_tag.header.timestamp,
+                        flv_tag.header.timestamp as i64 - prev_timestamp as i64
                     );
                     create_new = true;
+                } else if segment.split_on_timestamp_anomaly()
+                    && prev_timestamp > 0
+                    && flv_tag.header.timestamp < prev_timestamp
+                {
+                    // 小幅回退：保留在当前文件，避免直播抖动导致碎切
+                    warn!(
+                        "关键帧处 DTS 小幅回退，忽略切分 previous={prev_timestamp} current={} delta_ms={}",
+                        flv_tag.header.timestamp,
+                        flv_tag.header.timestamp as i64 - prev_timestamp as i64
+                    );
                 }
 
                 if segment.needed() || create_new {

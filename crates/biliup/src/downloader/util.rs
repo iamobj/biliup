@@ -12,19 +12,25 @@ pub type CallbackFn<'a> = Box<dyn FnMut(&str) + Send + Sync + 'a>;
 /// 仅用于“相邻媒体 tag”的前跳检测。FLV 新段写入的 sequence header
 /// 必须使用 timestamp=0，否则会和后续媒体 tag 形成假跳变。
 pub const TIMESTAMP_JUMP_THRESHOLD_MS: u32 = 2000;
+/// 时间戳回退容差：500 毫秒。
+///
+/// 直播 FLV 音视频交错/编码抖动常出现十几到几百毫秒的小幅 DTS 回退；
+/// 小于该阈值只视为抖动，不触发切段。达到或超过则按真实时间基异常处理。
+pub const TIMESTAMP_REGRESSION_TOLERANCE_MS: u32 = 500;
 /// 时间戳异常切文件冷却：5 秒
 pub const TIMESTAMP_ANOMALY_COOLDOWN: Duration = Duration::from_secs(5);
 
-/// 判断流时间戳是否异常（回退或大幅前跳）
+/// 判断流时间戳是否异常（大幅回退或大幅前跳）
 ///
 /// `prev_ms == 0` 视为新段首个参考点，不触发。
+/// 小幅 DTS 回退（< [`TIMESTAMP_REGRESSION_TOLERANCE_MS`]）不视为需切段的异常。
 pub fn is_timestamp_anomaly(prev_ms: u32, current_ms: u32) -> bool {
     if prev_ms == 0 {
         return false;
     }
-    // DTS 回退：明确异常
+    // DTS 回退：仅超过容差才切段，避免音视频交错抖动导致碎文件
     if current_ms < prev_ms {
-        return true;
+        return prev_ms - current_ms >= TIMESTAMP_REGRESSION_TOLERANCE_MS;
     }
     // 相邻 tag 前跳过大：通常是断流/重推后的时间基变化
     current_ms - prev_ms >= TIMESTAMP_JUMP_THRESHOLD_MS
@@ -453,7 +459,15 @@ mod tests {
     fn is_timestamp_anomaly_detects_regression_and_jump() {
         assert!(!is_timestamp_anomaly(0, 5000));
         assert!(!is_timestamp_anomaly(1000, 1200));
+        // 大幅回退仍切段
         assert!(is_timestamp_anomaly(3000, 1000));
+        // 用户日志中的 ~9s 回退
+        assert!(is_timestamp_anomaly(4_005_589, 3_996_599));
+        // 小幅回退（音视频交错抖动）不切段：17ms / 499ms
+        assert!(!is_timestamp_anomaly(1_490_668, 1_490_651));
+        assert!(!is_timestamp_anomaly(1000, 501));
+        // 恰好达到回退容差视为异常
+        assert!(is_timestamp_anomaly(1000, 500));
         assert!(is_timestamp_anomaly(1000, 4000));
         assert!(!is_timestamp_anomaly(1000, 2999));
         // 恰好 2 秒前跳视为异常
