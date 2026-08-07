@@ -163,9 +163,9 @@ const Global: React.FC = () => {
           field="split_on_timestamp_anomaly"
           extraText={
             <div style={{ fontSize: '14px' }}>
-              检测到直播流时间戳回退/大幅跳变（如主播中途开延迟）时自动切分文件，避免音画不同步写进同一文件。
+              检测到直播流时间戳回退/非单调（高风险，易导致 B 站时间戳异常）时自动切分文件。
               <br />
-              默认开启；适用于 ffmpeg / stream-gears。
+              单调前跳（断流恢复后的时间空洞）默认不切，避免碎文件。默认开启；适用于 ffmpeg / stream-gears。
             </div>
           }
           label="时间戳异常自动切文件（split_on_timestamp_anomaly）"
