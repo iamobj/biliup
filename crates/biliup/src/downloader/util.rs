@@ -7,30 +7,59 @@ use tracing::{error, info};
 
 pub type CallbackFn<'a> = Box<dyn FnMut(&str) + Send + Sync + 'a>;
 
+/// 时间戳前跳压平阈值：1 秒。
+///
+/// B 站会拒文件内明显时间戳跳变（例如 8141s → 8189s），即使音视频同步前跳。
+/// 前跳若直接切段，2 秒阈值容易碎文件、过大又可能漏过拒稿点；因此前跳默认
+/// **压平输出时间轴**（抬高 rebase base 抹掉空洞）而不是切段。
+/// 达到该阈值的 source 前跳会被吸收；FLV 新段 sequence header 仍必须
+/// timestamp=0 且不参与媒体时间轴推进。
+pub const TIMESTAMP_JUMP_THRESHOLD_MS: u32 = 1000;
+/// 压平前跳后保留的微小递增，保证输出 DTS 仍严格单调。
+pub const TIMESTAMP_FORWARD_KEEP_MS: u32 = 1;
 /// 时间戳回退容差：500 毫秒。
 ///
 /// 直播 FLV 音视频交错/编码抖动常出现十几到几百毫秒的小幅 DTS 回退；
 /// 小于该阈值只视为抖动，不触发切段。达到或超过则按真实时间基异常处理。
-///
-/// 注意：单调前跳（哪怕十几秒）默认不切段。前跳仍保持递增，对 B 站投稿
-/// “时间戳异常”风险低；真正高风险的是 DTS 回退/非单调。FLV 新段写入的
-/// sequence header 仍必须使用 timestamp=0，且不参与媒体时间轴推进，
-/// 避免与后续媒体 tag 形成假回退连切。
 pub const TIMESTAMP_REGRESSION_TOLERANCE_MS: u32 = 500;
 /// 时间戳异常切文件冷却：5 秒
 pub const TIMESTAMP_ANOMALY_COOLDOWN: Duration = Duration::from_secs(5);
 
-/// 判断流时间戳是否需要因异常切段（仅大幅 DTS 回退）
+/// 判断流时间戳是否需要因异常**切段**（仅大幅 DTS 回退）
 ///
 /// `prev_ms == 0` 视为新段首个参考点，不触发。
 /// 小幅 DTS 回退（< [`TIMESTAMP_REGRESSION_TOLERANCE_MS`]）不视为需切段的异常。
-/// 单调前跳一律不切，避免断流恢复后的空洞被切成碎文件。
+/// 单调前跳不在此切段，改由 [`absorb_forward_timestamp_jump`] 压平。
 pub fn is_timestamp_anomaly(prev_ms: u32, current_ms: u32) -> bool {
     if prev_ms == 0 || current_ms >= prev_ms {
         return false;
     }
     // DTS 回退：仅超过容差才切段，避免音视频交错抖动导致碎文件
     prev_ms - current_ms >= TIMESTAMP_REGRESSION_TOLERANCE_MS
+}
+
+/// 源时间轴大幅前跳时，抬高输出 rebase base，把空洞从文件时间轴抹掉。
+///
+/// 返回吸收的毫秒数；未达到阈值、尚无 base、或非前跳时返回 `None`。
+pub fn absorb_forward_timestamp_jump(
+    prev_ms: u32,
+    current_ms: u32,
+    output_timestamp_base: &mut Option<u32>,
+) -> Option<u32> {
+    if prev_ms == 0 || current_ms <= prev_ms {
+        return None;
+    }
+    let delta = current_ms - prev_ms;
+    if delta < TIMESTAMP_JUMP_THRESHOLD_MS {
+        return None;
+    }
+    let absorb = delta.saturating_sub(TIMESTAMP_FORWARD_KEEP_MS);
+    if absorb == 0 {
+        return None;
+    }
+    let base = output_timestamp_base.as_mut()?;
+    *base = base.saturating_add(absorb);
+    Some(absorb)
 }
 
 /// 把 FLV tag 的时间戳改写为指定值，用于新段写入 header。
@@ -465,10 +494,36 @@ mod tests {
         assert!(!is_timestamp_anomaly(1000, 501));
         // 恰好达到回退容差视为异常
         assert!(is_timestamp_anomaly(1000, 500));
-        // 单调前跳（含原先 2s 阈值与用户日志中的 12s 空洞）不切段
+        // 前跳不切段（改由 absorb 压平）
         assert!(!is_timestamp_anomaly(1000, 4000));
         assert!(!is_timestamp_anomaly(1000, 2999));
         assert!(!is_timestamp_anomaly(1000, 3000));
         assert!(!is_timestamp_anomaly(3_807_016, 3_819_366));
+        assert!(!is_timestamp_anomaly(8_141_000, 8_189_000));
+    }
+
+    #[test]
+    fn absorb_forward_timestamp_jump_compacts_gap() {
+        let mut base = Some(0u32);
+        // 不足 1s 不压平
+        assert_eq!(absorb_forward_timestamp_jump(1000, 1500, &mut base), None);
+        assert_eq!(base, Some(0));
+
+        // 12.35s 前跳：输出从连续 prev 后只保留 1ms
+        let absorbed = absorb_forward_timestamp_jump(3_807_016, 3_819_366, &mut base).unwrap();
+        assert_eq!(absorbed, 12_349);
+        assert_eq!(base, Some(12_349));
+        assert_eq!(3_819_366 - base.unwrap(), 3_807_017);
+
+        // B 站拒稿案例 8141s → 8189s
+        let mut base = Some(0u32);
+        let absorbed = absorb_forward_timestamp_jump(8_141_000, 8_189_000, &mut base).unwrap();
+        assert_eq!(absorbed, 47_999);
+        assert_eq!(8_189_000 - base.unwrap(), 8_141_001);
+
+        // 尚无 base 时不处理（首帧由 rebase 建基）
+        let mut base = None;
+        assert_eq!(absorb_forward_timestamp_jump(1000, 5000, &mut base), None);
+        assert_eq!(base, None);
     }
 }

@@ -4,7 +4,8 @@ use crate::downloader::flv_parser::{
 };
 use crate::downloader::flv_writer::{FlvFile, FlvTag, TagDataHeader};
 use crate::downloader::util::{
-    LifecycleFile, Segmentable, is_timestamp_anomaly, retimestamp_tag_header,
+    LifecycleFile, Segmentable, absorb_forward_timestamp_jump, is_timestamp_anomaly,
+    retimestamp_tag_header,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use nom::{Err, IResult};
@@ -217,10 +218,11 @@ async fn parse_flv_with_boundaries(
                         segment_started(&out.file.file_name);
                         current_file_started = true;
                     }
-                    let output_header = rebase_media_timestamp(
+                    let output_header = rebase_media_timestamp_for_write(
                         &tag_header,
                         is_media_for_ts,
                         &mut output_timestamp_base,
+                        prev_timestamp,
                     );
                     out.write_tag(&output_header, &flv_tag_data, &previous_tag_size_bytes)?;
                     segment.increase_size((11 + tag_header.data_size + 4) as u64);
@@ -316,21 +318,29 @@ async fn parse_flv_with_boundaries(
                             segment_started(&out.file.file_name);
                             current_file_started = true;
                         }
-                        let output_header = rebase_media_timestamp(
+                        let output_header = rebase_media_timestamp_for_write(
                             &cached_header,
                             is_media,
                             &mut output_timestamp_base,
+                            prev_timestamp,
                         );
                         out.write_tag(&output_header, &cached_data, &cached_previous_size)?;
                         segment.increase_size((11 + cached_header.data_size + 4) as u64);
+                        if is_media {
+                            prev_timestamp = cached_header.timestamp;
+                        }
                     }
 
                     if !current_file_started {
                         segment_started(&out.file.file_name);
                         current_file_started = true;
                     }
-                    let output_header =
-                        rebase_media_timestamp(&tag_header, true, &mut output_timestamp_base);
+                    let output_header = rebase_media_timestamp_for_write(
+                        &tag_header,
+                        true,
+                        &mut output_timestamp_base,
+                        prev_timestamp,
+                    );
                     out.write_tag(&output_header, &bytes, &previous_tag_size)?;
                     segment.increase_size((11 + tag_header.data_size + 4) as u64);
                     prev_timestamp = tag_header.timestamp;
@@ -349,9 +359,16 @@ async fn parse_flv_with_boundaries(
             segment_started(&out.file.file_name);
             current_file_started = true;
         }
-        let output_header =
-            rebase_media_timestamp(&tag_header, is_media, &mut output_timestamp_base);
+        let output_header = rebase_media_timestamp_for_write(
+            &tag_header,
+            is_media,
+            &mut output_timestamp_base,
+            prev_timestamp,
+        );
         out.write_tag(&output_header, &flv_tag_data, &previous_tag_size_bytes)?;
+        if is_media {
+            prev_timestamp = tag_header.timestamp;
+        }
     }
     if current_file_started {
         segment_ended(&out.file.file_name);
@@ -369,6 +386,27 @@ fn rebase_media_timestamp(
     }
     let base = *output_timestamp_base.get_or_insert(header.timestamp);
     retimestamp_tag_header(header, header.timestamp.saturating_sub(base))
+}
+
+/// 写入前：先按 source 前跳压平 base，再 rebase 到段内时间轴。
+fn rebase_media_timestamp_for_write(
+    header: &TagHeader,
+    is_media: bool,
+    output_timestamp_base: &mut Option<u32>,
+    prev_source_ms: u32,
+) -> TagHeader {
+    if is_media {
+        if let Some(absorbed) =
+            absorb_forward_timestamp_jump(prev_source_ms, header.timestamp, output_timestamp_base)
+        {
+            warn!(
+                "检测到时间戳前跳，已压平输出时间轴 previous={prev_source_ms} current={} absorbed_ms={absorbed} delta_ms={}",
+                header.timestamp,
+                header.timestamp as i64 - prev_source_ms as i64
+            );
+        }
+    }
+    rebase_media_timestamp(header, is_media, output_timestamp_base)
 }
 
 fn is_media_timestamp_tag(tag_header: &TagHeader, body: &Bytes) -> bool {
@@ -517,6 +555,29 @@ mod tests {
         let zeroed = retimestamp_tag_header(&header, 0);
         assert_eq!(zeroed.timestamp, 0);
         assert_eq!(zeroed.data_size, 10);
+    }
+
+    #[test]
+    fn forward_jump_is_absorbed_into_output_timeline() {
+        let prev = TagHeader {
+            tag_type: TagType::Video,
+            data_size: 10,
+            timestamp: 8_141_000,
+            stream_id: 0,
+        };
+        let jumped = TagHeader {
+            timestamp: 8_189_000,
+            ..prev
+        };
+        let mut base = Some(0u32);
+        // 先写入 prev 对应的输出点
+        assert_eq!(
+            rebase_media_timestamp_for_write(&prev, true, &mut base, 0).timestamp,
+            8_141_000
+        );
+        let out = rebase_media_timestamp_for_write(&jumped, true, &mut base, prev.timestamp);
+        // 48s 空洞被吸收，仅保留 1ms 递增
+        assert_eq!(out.timestamp, 8_141_001);
     }
 
     #[test]

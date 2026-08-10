@@ -26,9 +26,10 @@
   - 成功处理后的路径会继续交给 `postprocessor`。
 - 时间戳异常时自动切文件（默认开启，`split_on_timestamp_anomaly`）：
   - 适用于 `ffmpeg` / `stream-gears`；streamlink、sync-downloader 不改。
-  - 触发条件：DTS 回退 ≥ 500ms，或 FFmpeg 报
+  - 切段触发条件：DTS 回退 ≥ 500ms，或 FFmpeg 报
     `Non-monotonous DTS` / `non monotonically increasing dts` / `out of order` / `non-monotonic dts`。
-  - 单调前跳（即使十几秒空洞）不切段：时间戳仍递增，对 B 站“时间戳异常”风险低。
+  - 单调前跳 ≥ 1 秒不切段，改为压平输出时间轴（吸收空洞），避免 B 站“时间戳跳变”拒稿，
+    也避免 2 秒阈值切段过于频繁产生碎文件。
   - 小幅 DTS 回退（< 500ms，常见于音视频交错抖动）只告警不切段，避免碎文件。
   - FFmpeg：解析 stderr 命中后优先 SIGINT 优雅退出并落盘，由现有仍在播重试循环立刻开新文件；
     5 秒冷却防抖。强制结束仅在同 pid 超时未退出时触发，避免误杀下一段。

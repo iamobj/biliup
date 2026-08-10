@@ -255,7 +255,7 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
         label="时间戳异常自动切文件（split_on_timestamp_anomaly）"
         extraText={
           <div style={{ fontSize: '14px' }}>
-            检测到直播流时间戳回退/非单调时自动切文件；单调前跳不切。未覆写时继承全局配置（默认开启）。
+            检测到时间戳回退/非单调时自动切文件；前跳 ≥ 1 秒压平时间轴不切段。未覆写时继承全局配置（默认开启）。
           </div>
         }
       />
