@@ -50,6 +50,12 @@
   - stream-gears 同一秒连续切段时，若最终文件或 `.part` 已存在需追加数字序号，
     不得复用路径覆盖上一段。
   - 全局配置与主播 override 均可开关；override 布尔三态 `unset | true | false`。
+- 抖音画质支持 `douyin_prefer_uhd` 优先策略：
+  - 默认关闭；开启后优先使用当前协议下有有效地址的 `uhd`，没有可用 `uhd` 时使用 `origin`。
+  - `uhd` 与 `origin` 都不可用时，沿用原有 `douyin_quality` 邻近画质回退逻辑。
+  - `douyin_true_origin` 优先级更高，满足条件时继续使用 `ao.main.flv` 真原画流。
+  - 支持全局配置和主播稀疏 override；主播 override 的 `true`/`false` 必须正确覆盖全局值。
+  - 判断画质是否存在时必须按当前 `douyin_protocol` 检查对应的非空 FLV/HLS 地址，不能只检查画质 key。
 - `download.log` 按 50 MiB 自动分割，保留当前文件和最新 1 份历史分片。
   - 当前文件名固定为 `download.log`，历史文件为 `download.log.1`。
   - tracing 下载日志和 Hook 的 stdout/stderr 共用进程级写入器，避免并发轮转时
@@ -156,6 +162,10 @@
     `crates/biliup-cli/src/server/core/downloader.rs`、
     `crates/danmaku/src/protocols/douyin.rs`、`pyproject.toml` 和
     `crates/stream-gears/Cargo.toml`。
+- 上游如改动抖音画质配置、直播流选择或抖音配置 UI，需保留
+  `douyin_prefer_uhd` 的兼容行为：开启时按 `uhd -> origin` 优先，均不可用时才执行
+  原有 `douyin_quality` 回退；按当前协议检查有效地址；`douyin_true_origin` 优先；并保留
+  全局配置与主播稀疏 override 的继承及显式 `false` 覆写语义。
 - 上游如改动虎牙取流、WUP/TARS、anticode、mobile API 或相关配置/UI，需优先核对本分支
   是否仍对齐 DanmakuRender 的 WUP 默认路径与 anticode 规则，以及主播覆写布尔值回填。
 - 上游如改动虎牙弹幕协议、TARS codec、通用 heartbeat 调度或 Huya 弹幕示例，需保留上述

@@ -41,6 +41,18 @@ const Douyin: React.FC<Props> = props => {
           <Select.Option value="md">流畅（md）</Select.Option>
         </Form.Select>
         <OverrideSwitch
+          field="douyin_prefer_uhd"
+          label="优先抖音蓝光（douyin_prefer_uhd）"
+          extraText={
+            <div style={{ fontSize: '14px' }}>
+              适合海外 VPS 或其他高码率原画流不稳定的网络环境。开启后优先使用 uhd（蓝光），没有可用
+              uhd 时使用 origin（原画）；两者都不可用时沿用画质等级的原有回退逻辑。
+            </div>
+          }
+          fieldStyle={{alignSelf: 'stretch',
+            padding: 0,}}
+        />
+        <OverrideSwitch
           field="douyin_danmaku"
           label="录制弹幕（douyin_danmaku）"
           extraText="录制抖音弹幕，默认关闭。"

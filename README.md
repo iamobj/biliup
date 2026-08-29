@@ -46,3 +46,9 @@ git commit
 ```bash
 git push origin HEAD
 ```
+
+本地构建docker测试：
+
+```bash
+docker build --tag biliup:test .
+```

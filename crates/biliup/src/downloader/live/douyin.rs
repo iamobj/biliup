@@ -65,6 +65,7 @@ struct DouyinLive<'a> {
     url: String,
     name: String,
     douyin_quality: String,
+    douyin_prefer_uhd: bool,
     douyin_protocol: String,
     douyin_double_screen: bool,
     douyin_true_origin: bool,
@@ -84,6 +85,7 @@ impl<'a> DouyinLive<'a> {
             url: request.url,
             name: request.name,
             douyin_quality: options.quality,
+            douyin_prefer_uhd: options.prefer_uhd,
             douyin_protocol: options.protocol,
             douyin_double_screen: options.double_screen,
             douyin_true_origin: options.true_origin,
@@ -401,55 +403,24 @@ impl<'a> DouyinLive<'a> {
         if self.douyin_true_origin
             && self.douyin_quality == "origin"
             && self.douyin_protocol != "hls"
-            && let Some(url) = stream_data
-                .get("ao")
-                .and_then(|quality| quality.pointer("/main/flv"))
-                .and_then(Value::as_str)
-                .filter(|url| !url.is_empty())
+            && let Some(url) = true_origin_url(stream_data)
         {
-            return Ok(url
-                .replace("&only_audio=1", "")
-                .replace("http://", "https://"));
+            return Ok(url);
         }
-
-        let quality_items = ["origin", "uhd", "hd", "sd", "ld", "md"];
-        let quality = if quality_items.contains(&self.douyin_quality.as_str()) {
-            self.douyin_quality.as_str()
-        } else {
-            "origin"
-        };
-        let quality_index = quality_items
-            .iter()
-            .position(|item| item == &quality)
-            .unwrap_or_default();
-        let selected_quality = if stream_data.contains_key(quality) {
-            quality
-        } else {
-            quality_items[quality_index + 1..]
-                .iter()
-                .copied()
-                .find(|item| stream_data.contains_key(*item))
-                .or_else(|| {
-                    quality_items[..quality_index]
-                        .iter()
-                        .rev()
-                        .copied()
-                        .find(|item| stream_data.contains_key(*item))
-                })
-                .ok_or_else(|| LiveError::custom("抖音没有可用清晰度"))?
-        };
 
         let protocol = if self.douyin_protocol == "hls" {
             "hls"
         } else {
             "flv"
         };
+        let selected_quality = select_quality(
+            stream_data,
+            &self.douyin_quality,
+            protocol,
+            self.douyin_prefer_uhd,
+        )?;
 
-        stream_data
-            .get(selected_quality)
-            .and_then(|quality| quality.pointer(&format!("/main/{protocol}")))
-            .and_then(Value::as_str)
-            .filter(|url| !url.is_empty())
+        stream_url_for_quality(stream_data, &selected_quality, protocol)
             .map(|url| url.replace("http://", "https://"))
             // 回放流 URL 携带 reflow 标记，直播已结束，拒绝作为直播流返回
             .filter(|url| !url.contains("rtm_expr_tag=reflow_room_info"))
@@ -482,6 +453,148 @@ impl<'a> DouyinLive<'a> {
             movie_id: None,
             password: None,
         })
+    }
+}
+
+const DOUYIN_QUALITY_ITEMS: [&str; 6] = ["origin", "uhd", "hd", "sd", "ld", "md"];
+
+fn stream_url_for_quality<'a>(
+    stream_data: &'a serde_json::Map<String, Value>,
+    quality: &str,
+    protocol: &str,
+) -> Option<&'a str> {
+    stream_data
+        .get(quality)
+        .and_then(|quality| quality.pointer(&format!("/main/{protocol}")))
+        .and_then(Value::as_str)
+        .filter(|url| !url.is_empty())
+}
+
+fn true_origin_url(stream_data: &serde_json::Map<String, Value>) -> Option<String> {
+    stream_data
+        .get("ao")
+        .and_then(|quality| quality.pointer("/main/flv"))
+        .and_then(Value::as_str)
+        .filter(|url| !url.is_empty())
+        .map(|url| {
+            url.replace("&only_audio=1", "")
+                .replace("http://", "https://")
+        })
+}
+
+fn select_quality(
+    stream_data: &serde_json::Map<String, Value>,
+    requested_quality: &str,
+    protocol: &str,
+    prefer_uhd: bool,
+) -> LiveResult<String> {
+    if prefer_uhd {
+        if stream_url_for_quality(stream_data, "uhd", protocol).is_some() {
+            return Ok("uhd".to_string());
+        }
+        if stream_url_for_quality(stream_data, "origin", protocol).is_some() {
+            return Ok("origin".to_string());
+        }
+    }
+
+    let quality = if DOUYIN_QUALITY_ITEMS.contains(&requested_quality) {
+        requested_quality
+    } else {
+        "origin"
+    };
+    let quality_index = DOUYIN_QUALITY_ITEMS
+        .iter()
+        .position(|item| item == &quality)
+        .unwrap_or_default();
+    let selected_quality = if stream_data.contains_key(quality) {
+        quality
+    } else {
+        DOUYIN_QUALITY_ITEMS[quality_index + 1..]
+            .iter()
+            .copied()
+            .find(|item| stream_data.contains_key(*item))
+            .or_else(|| {
+                DOUYIN_QUALITY_ITEMS[..quality_index]
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|item| stream_data.contains_key(*item))
+            })
+            .ok_or_else(|| LiveError::custom("抖音没有可用清晰度"))?
+    };
+
+    Ok(selected_quality.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn stream_data(value: Value) -> serde_json::Map<String, Value> {
+        value.as_object().expect("stream data object").clone()
+    }
+
+    #[test]
+    fn prefer_uhd_selects_uhd_before_origin() {
+        let data = stream_data(json!({
+            "origin": {"main": {"flv": "origin"}},
+            "uhd": {"main": {"flv": "uhd"}},
+            "hd": {"main": {"flv": "hd"}}
+        }));
+
+        assert_eq!(select_quality(&data, "hd", "flv", true).unwrap(), "uhd");
+    }
+
+    #[test]
+    fn prefer_uhd_falls_back_to_origin_when_uhd_is_unavailable() {
+        let data = stream_data(json!({
+            "origin": {"main": {"flv": "origin"}},
+            "uhd": {"main": {"flv": ""}},
+            "hd": {"main": {"flv": "hd"}}
+        }));
+
+        assert_eq!(select_quality(&data, "uhd", "flv", true).unwrap(), "origin");
+    }
+
+    #[test]
+    fn prefer_uhd_checks_the_selected_protocol() {
+        let data = stream_data(json!({
+            "origin": {"main": {"hls": "origin-hls"}},
+            "uhd": {"main": {"flv": "uhd-flv"}}
+        }));
+
+        assert_eq!(select_quality(&data, "uhd", "hls", true).unwrap(), "origin");
+        assert_eq!(select_quality(&data, "uhd", "flv", true).unwrap(), "uhd");
+    }
+
+    #[test]
+    fn prefer_uhd_uses_existing_fallback_when_both_preferred_qualities_are_missing() {
+        let data = stream_data(json!({
+            "hd": {"main": {"flv": "hd"}},
+            "sd": {"main": {"flv": "sd"}}
+        }));
+
+        assert_eq!(select_quality(&data, "uhd", "flv", true).unwrap(), "hd");
+    }
+
+    #[test]
+    fn disabled_prefer_uhd_keeps_existing_fallback_order() {
+        let data = stream_data(json!({
+            "origin": {"main": {"flv": "origin"}},
+            "hd": {"main": {"flv": "hd"}}
+        }));
+
+        assert_eq!(select_quality(&data, "uhd", "flv", false).unwrap(), "hd");
+    }
+
+    #[test]
+    fn true_origin_url_keeps_existing_ao_handling() {
+        let data = stream_data(json!({
+            "ao": {"main": {"flv": "http://origin&only_audio=1"}}
+        }));
+
+        assert_eq!(true_origin_url(&data).as_deref(), Some("https://origin"));
     }
 }
 

@@ -71,6 +71,7 @@ fn live_options(config: &Config) -> LiveOptions {
                 .douyin_quality
                 .clone()
                 .unwrap_or_else(|| "origin".to_string()),
+            prefer_uhd: config.douyin_prefer_uhd.unwrap_or(false),
             protocol: config
                 .douyin_protocol
                 .clone()

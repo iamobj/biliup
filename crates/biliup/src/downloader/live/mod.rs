@@ -172,6 +172,7 @@ impl Default for CcOptions {
 #[derive(Debug, Clone)]
 pub struct DouyinOptions {
     pub quality: String,
+    pub prefer_uhd: bool,
     pub protocol: String,
     pub double_screen: bool,
     pub true_origin: bool,
@@ -182,6 +183,7 @@ impl Default for DouyinOptions {
     fn default() -> Self {
         Self {
             quality: "origin".to_string(),
+            prefer_uhd: false,
             protocol: "flv".to_string(),
             double_screen: false,
             true_origin: false,

@@ -143,6 +143,9 @@ pub struct Config {
     /// 抖音画质
     #[serde(default)]
     pub douyin_quality: Option<String>,
+    /// 抖音优先使用蓝光，缺少蓝光时使用原画
+    #[serde(default)]
+    pub douyin_prefer_uhd: Option<bool>,
     /// 抖音直播协议：flv 或 hls
     #[serde(default)]
     pub douyin_protocol: Option<String>,
@@ -693,6 +696,7 @@ mod tests {
         assert_eq!(config.file_size, default_file_size());
         assert_eq!(config.segment_time, None);
         assert_eq!(config.split_on_timestamp_anomaly, Some(true));
+        assert_eq!(config.douyin_prefer_uhd, None);
         assert!(config.validate_segment_limits().is_ok());
     }
 
@@ -701,6 +705,33 @@ mod tests {
         let config: Config =
             serde_json::from_str(r#"{"split_on_timestamp_anomaly": false}"#).unwrap();
         assert_eq!(config.split_on_timestamp_anomaly, Some(false));
+    }
+
+    #[test]
+    fn douyin_prefer_uhd_defaults_to_false_at_runtime() {
+        let config: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(!config.douyin_prefer_uhd.unwrap_or(false));
+
+        let enabled: Config = serde_json::from_str(r#"{"douyin_prefer_uhd": true}"#).unwrap();
+        assert_eq!(enabled.douyin_prefer_uhd, Some(true));
+    }
+
+    #[test]
+    fn sparse_override_supports_douyin_prefer_uhd() {
+        let mut config = Config::default();
+        config.douyin_prefer_uhd = Some(false);
+
+        let enabled =
+            config_patch_from_override_value(&serde_json::json!({"douyin_prefer_uhd": true}))
+                .unwrap();
+        config.apply(enabled);
+        assert_eq!(config.douyin_prefer_uhd, Some(true));
+
+        let disabled =
+            config_patch_from_override_value(&serde_json::json!({"douyin_prefer_uhd": false}))
+                .unwrap();
+        config.apply(disabled);
+        assert_eq!(config.douyin_prefer_uhd, Some(false));
     }
 
     #[test]
