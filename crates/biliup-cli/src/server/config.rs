@@ -50,7 +50,7 @@ pub struct Config {
     #[serde(default)]
     pub submit_api: Option<String>,
 
-    /// 上传线路：AUTO | alia | bda2 | bldsa | qn | tx | txa
+    /// 上传线路：AUTO | alia | bda2 | bldsa | tx | txa | estx | akbd
     #[builder(default = default_lines())]
     #[serde(default = "default_lines")]
     pub lines: String,
@@ -436,8 +436,6 @@ pub struct UserConfig {
     pub afreecatv_password: Option<String>,
 }
 
-
-
 /// 显式 null 有语义的配置项（ConfigPatch 用 deserialize_option_patch 区分 missing/null）。
 const OVERRIDE_NULLABLE_KEYS: &[&str] = &["file_size"];
 
@@ -489,7 +487,8 @@ pub fn compact_override_value(raw: Option<serde_json::Value>) -> Option<serde_js
 /// 将主播稀疏 override JSON 解析为 ConfigPatch。
 /// 仅包含显式出现的 key；null 表示对该可空配置的显式清空（如 file_size）。
 pub fn config_patch_from_override_value(raw: &serde_json::Value) -> AppResult<ConfigPatch> {
-    let compact = compact_override_value(Some(raw.clone())).unwrap_or_else(|| serde_json::json!({}));
+    let compact =
+        compact_override_value(Some(raw.clone())).unwrap_or_else(|| serde_json::json!({}));
     serde_json::from_value(compact)
         .change_context(AppError::Unknown)
         .attach("parse streamer override config")
@@ -946,8 +945,7 @@ mod tests {
     #[test]
     fn config_patch_serialize_is_dense_with_nulls() {
         // document why we store Map instead of ConfigPatch in DB/API
-        let patch: ConfigPatch =
-            serde_json::from_str(r#"{"huya_cdn":"AL"}"#).unwrap();
+        let patch: ConfigPatch = serde_json::from_str(r#"{"huya_cdn":"AL"}"#).unwrap();
         let value = serde_json::to_value(&patch).unwrap();
         let obj = value.as_object().unwrap();
         assert!(obj.contains_key("huya_cdn"));

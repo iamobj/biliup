@@ -279,8 +279,7 @@ impl HookStep {
                 .write_all(&buf[..n])
                 .await
                 .change_context(AppError::Unknown)?;
-            std::io::Write::write_all(&mut log, &buf[..n])
-                .change_context(AppError::Unknown)?;
+            std::io::Write::write_all(&mut log, &buf[..n]).change_context(AppError::Unknown)?;
         }
         terminal.flush().await.change_context(AppError::Unknown)?;
         std::io::Write::flush(&mut log).change_context(AppError::Unknown)?;

@@ -58,8 +58,8 @@ impl FfmpegDownloader {
         args.extend(["-reset_timestamps".to_string(), "1".to_string()]);
         args.extend(["-strftime".to_string(), "1".to_string()]);
 
-        if let Some(segment_time) = &download_config.segment_time {
-            let seconds = downloader::parse_duration(segment_time);
+        if let Some(segment_time) = download_config.segment_duration() {
+            let seconds = downloader::parse_duration(&segment_time);
             args.extend(["-segment_time".to_string(), seconds.to_string()]);
         }
 
@@ -73,6 +73,11 @@ impl FfmpegDownloader {
             } else {
                 args.extend(["-movflags".to_string(), "+faststart".to_string()]);
             }
+        }
+        // -t: 录制总时长上限。内部分段由 segment muxer 自己切片、进程不会自行退出，
+        // 所以要用总时长把录制截停在录制时间范围的结束时刻。
+        if let Some(remaining) = download_config.time_range_remaining() {
+            args.extend(["-t".to_string(), remaining]);
         }
 
         self.append_common_output_args(
@@ -104,8 +109,10 @@ impl FfmpegDownloader {
 
         self.append_common_input_args(&mut args, download_config);
 
-        if let Some(segment_time) = &download_config.segment_time {
-            args.extend(["-to".to_string(), segment_time.clone()]);
+        // 外部分段特定的输出参数
+        // -to: 限制录制时长，快到录制时间范围结束时会被裁短，使录制停在窗口边界
+        if let Some(segment_time) = download_config.segment_duration() {
+            args.extend(["-to".to_string(), segment_time]);
         }
 
         if let Some(file_size) = download_config.file_size {
@@ -804,6 +811,7 @@ fn interrupt_ffmpeg_child(child: &tokio::process::Child) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
     use std::time::Duration;
 
     #[test]
@@ -901,5 +909,104 @@ mod tests {
         assert_eq!(segment_index, 1);
         assert!(dir.join("capture.flv").exists());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 以「当前时刻」为基准造一个录制时间范围，形态与前端 `Date.toISOString()` 写出的一致。
+    /// 相对当前时刻取值，因此走的是真实时钟，也顺带覆盖了窗口跨过零点的情形。
+    fn window(starts_in: i64, ends_in: i64) -> String {
+        let now = Utc::now();
+        let iso = |offset: i64| {
+            (now + ChronoDuration::seconds(offset)).to_rfc3339_opts(SecondsFormat::Millis, true)
+        };
+        format!(r#"["{}","{}"]"#, iso(starts_in), iso(ends_in))
+    }
+
+    fn config(segment_time: Option<&str>, time_range: Option<String>) -> DownloadConfig {
+        DownloadConfig {
+            segment_time: segment_time.map(str::to_owned),
+            time_range,
+            suffix: "flv".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn value_of(args: &[String], flag: &str) -> Option<String> {
+        let index = args.iter().position(|arg| arg == flag)?;
+        args.get(index + 1).cloned()
+    }
+
+    fn seconds_of(args: &[String], flag: &str) -> u32 {
+        let raw = value_of(args, flag).unwrap_or_else(|| panic!("命令行里应有 {flag}"));
+        let parts: Vec<u32> = raw
+            .split(':')
+            .map(|p| p.parse().expect("时长应为 HH:MM:SS"))
+            .collect();
+        parts[0] * 3600 + parts[1] * 60 + parts[2]
+    }
+
+    fn external() -> FfmpegDownloader {
+        FfmpegDownloader::new(Vec::new(), DownloaderType::FfmpegExternal)
+    }
+
+    fn internal() -> FfmpegDownloader {
+        FfmpegDownloader::new(Vec::new(), DownloaderType::FfmpegInternal)
+    }
+
+    #[test]
+    fn without_a_time_range_the_segment_time_reaches_ffmpeg_unchanged() {
+        let args = external().build_ffmpeg_args_external_segment(&config(Some("01:00:00"), None));
+        assert_eq!(value_of(&args, "-to"), Some("01:00:00".to_string()));
+    }
+
+    #[test]
+    fn without_a_segment_time_or_window_ffmpeg_gets_no_duration_limit() {
+        let args = external().build_ffmpeg_args_external_segment(&config(None, None));
+        assert_eq!(value_of(&args, "-to"), None);
+    }
+
+    #[test]
+    fn a_far_away_window_end_leaves_the_segment_time_alone() {
+        // 窗口还剩 2 小时，1 小时的分段时长不该被动
+        let args = external()
+            .build_ffmpeg_args_external_segment(&config(Some("01:00:00"), Some(window(-60, 7200))));
+        assert_eq!(value_of(&args, "-to"), Some("01:00:00".to_string()));
+    }
+
+    #[test]
+    fn a_near_window_end_shortens_the_segment_so_recording_stops_on_the_boundary() {
+        // 窗口只剩 10 分钟，1 小时的分段必须被裁到 10 分钟，否则会冲出窗口 50 分钟
+        let args = external()
+            .build_ffmpeg_args_external_segment(&config(Some("01:00:00"), Some(window(-60, 600))));
+        let to = seconds_of(&args, "-to");
+        assert!((595..=600).contains(&to), "-to 应约为 600 秒，实际 {to}");
+    }
+
+    #[test]
+    fn a_window_bounds_recording_even_when_no_segment_time_is_configured() {
+        // Python 版这种情况根本不下发 -to，会一直录到直播结束
+        let args =
+            external().build_ffmpeg_args_external_segment(&config(None, Some(window(-60, 600))));
+        let to = seconds_of(&args, "-to");
+        assert!((595..=600).contains(&to), "-to 应约为 600 秒，实际 {to}");
+    }
+
+    #[test]
+    fn internal_segmentation_caps_total_duration_at_the_window_end() {
+        // 内部分段的 -segment_time 只是切片间隔，进程不会自己退出，必须靠 -t 截停
+        let args = internal()
+            .build_ffmpeg_args_internal_segment(&config(Some("01:00:00"), Some(window(-60, 600))));
+        assert_eq!(value_of(&args, "-segment_time"), Some("3600".to_string()));
+        let total = seconds_of(&args, "-t");
+        assert!(
+            (595..=600).contains(&total),
+            "-t 应约为 600 秒，实际 {total}"
+        );
+    }
+
+    #[test]
+    fn internal_segmentation_has_no_total_cap_without_a_window() {
+        let args = internal().build_ffmpeg_args_internal_segment(&config(Some("01:00:00"), None));
+        assert_eq!(value_of(&args, "-segment_time"), Some("3600".to_string()));
+        assert_eq!(value_of(&args, "-t"), None);
     }
 }

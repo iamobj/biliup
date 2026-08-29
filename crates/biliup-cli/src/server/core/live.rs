@@ -1,13 +1,13 @@
 use crate::server::common::util::danmaku_filename_template;
 use crate::server::config::Config;
+#[cfg(feature = "python-bridge")]
+use crate::server::core::downloader::PythonDanmakuClient;
 use crate::server::core::downloader::streamlink::{Platform, Streamlink, StreamlinkDownloader};
 use crate::server::core::downloader::ytdlp::{
     Backend as RuntimeYtDlpBackend, DownloadConfig as YtDlpConfig,
     YouTubeDownloader as YtDlpDownloader,
 };
 use crate::server::core::downloader::{DownloaderRuntime, DownloaderType, RustDanmakuClient};
-#[cfg(feature = "python-bridge")]
-use crate::server::core::downloader::PythonDanmakuClient;
 use crate::server::infrastructure::context::Worker;
 use crate::server::infrastructure::models::StreamerInfo;
 use biliup::downloader::live::{
@@ -319,13 +319,10 @@ pub fn danmaku_client(
     context.movie_id = source.movie_id.clone();
     context.password = source.password.clone();
 
-    let config = RecorderConfig::new(
-        source.url.clone(),
-        output_file,
-    )
-    .with_context(context)
-    .with_raw(source.raw)
-    .with_detail(source.detail);
+    let config = RecorderConfig::new(source.url.clone(), output_file)
+        .with_context(context)
+        .with_raw(source.raw)
+        .with_detail(source.detail);
 
     Some(Arc::new(RustDanmakuClient::new(config)))
 }

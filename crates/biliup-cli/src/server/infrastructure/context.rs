@@ -1,6 +1,7 @@
 use crate::server::common::download::DownloadTask;
+use crate::server::common::recording_policy::Rejection;
 use crate::server::common::util::Recorder;
-use crate::server::config::{config_patch_from_override_value, merge_user_config, Config};
+use crate::server::config::{Config, config_patch_from_override_value, merge_user_config};
 use crate::server::core::downloader::DownloadConfig;
 use crate::server::core::live::streamer_info;
 use crate::server::infrastructure::connection_pool::ConnectionPool;
@@ -121,6 +122,7 @@ impl Context {
             // 流URL
             url: stream.raw_stream_url.to_string(),
             segment_time: config.segment_time,
+            time_range: self.live_streamer().time_range.clone(),
             file_size: config.file_size,
             split_on_timestamp_anomaly: config.split_on_timestamp_anomaly.unwrap_or(true),
             headers: stream.stream_headers.clone(),
@@ -147,6 +149,11 @@ pub struct Worker {
     config: Arc<RwLock<Config>>,
     /// HTTP客户端
     pub client: StatelessClient,
+    /// 最近一次开播探测被录制策略挡下的原因，仅用于向界面解释「为什么没在录」。
+    ///
+    /// 不参与任何控制流。只存需要流信息才能判定的结论（如标题命中排除关键词）；
+    /// 探测前就能判定的条件（如录制时间范围）由接口侧按当前时钟实时算，不会过期。
+    last_rejection: RwLock<Option<Rejection>>,
 }
 
 impl Worker {
@@ -175,11 +182,22 @@ impl Worker {
             upload_streamer,
             config,
             client,
+            last_rejection: RwLock::new(None),
         }
     }
 
     pub fn id(&self) -> i64 {
         self.live_streamer.id
+    }
+
+    /// 记录本轮开播探测的策略判定结果（`None` 表示未被挡下）。
+    pub fn set_rejection(&self, rejection: Option<Rejection>) {
+        *self.last_rejection.write().unwrap() = rejection;
+    }
+
+    /// 最近一次探测被挡下的原因。
+    pub fn rejection(&self) -> Option<Rejection> {
+        self.last_rejection.read().unwrap().clone()
     }
 
     /// 获取主播信息

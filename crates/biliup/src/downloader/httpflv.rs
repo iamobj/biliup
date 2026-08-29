@@ -274,6 +274,10 @@ async fn parse_flv_with_boundaries(
                     output_timestamp_base = None;
                     current_file_started = false;
 
+                    // 开启新分段时补齐已捕获的头部标签。这些头部并非所有直播流都具备
+                    // （例如纯视频流没有 AAC 序列头，部分流缺少 onMetaData 脚本标签），
+                    // 缺失时跳过并告警，而不是像原先那样直接 expect/panic 中断录制。
+                    // onMetaData
                     if let Some((meta_header, meta_bytes, previous_meta_tag_size)) =
                         on_meta_data.as_ref()
                     {
@@ -652,6 +656,65 @@ mod tests {
     fn it_works() -> Result<(), Box<dyn std::error::Error>> {
         // download(
         //     "test.flv")?;
+        Ok(())
+    }
+
+    /// 回归测试：纯视频流（没有任何音频标签）在首次分段时不应 panic。
+    ///
+    /// 该流只包含一个 onMetaData 脚本标签和一个 H264 序列头关键帧，`aac_sequence_header`
+    /// 全程为 `None`。修复前，分段重建逻辑会对 `aac_sequence_header` 执行
+    /// `expect("aac_sequence_header does not exist")` 而 panic，导致纯视频直播录制中断。
+    #[tokio::test]
+    async fn pure_video_stream_segments_without_panic() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::downloader::util::{LifecycleFile, Segmentable};
+
+        let mut data: Vec<u8> = Vec::new();
+        // parse_flv_with_boundaries 起始会先读取 4 字节（上一个 tag 的大小），这里给占位。
+        data.extend_from_slice(&[0, 0, 0, 0]);
+
+        // Script 标签（onMetaData），其值为 Null（0x05）。
+        // 结构：0x02(字符串) + u16 长度(10) + "onMetaData" + 0x05(Null)
+        let script_body: [u8; 14] = [
+            0x02, 0x00, 0x0A, b'o', b'n', b'M', b'e', b't', b'a', b'D', b'a', b't', b'a', 0x05,
+        ];
+        // tag_header: type=18(script), data_size=14, timestamp=0, stream_id=0
+        data.extend_from_slice(&[
+            0x12, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        data.extend_from_slice(&script_body);
+        data.extend_from_slice(&[0, 0, 0, 0]); // previous_tag_size
+
+        // Video 标签：关键帧 + H264 序列头（无音频）。
+        // body[0]=0x17 → frame_type=Key(1), codec_id=H264(7)
+        // 其后 4 字节：avc packet_type=0(SequenceHeader) + composition_time(i24)=0
+        let video_body: [u8; 5] = [0x17, 0x00, 0x00, 0x00, 0x00];
+        // tag_header: type=9(video), data_size=5, timestamp=0, stream_id=0
+        data.extend_from_slice(&[
+            0x09, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        data.extend_from_slice(&video_body);
+        data.extend_from_slice(&[0, 0, 0, 0]); // previous_tag_size
+
+        let http_resp = http::Response::builder().status(200).body(data)?;
+        let resp = reqwest::Response::from(http_resp);
+        let connection = super::Connection::new(resp);
+
+        let dir = tempfile::tempdir()?;
+        let file_stem = dir.path().join("pure_video_seg");
+        let file = LifecycleFile::new(file_stem.to_str().unwrap(), "flv");
+
+        // expected_size 设得极小，确保首个关键帧即触发分段，进入头部重建路径。
+        let segment = Segmentable::new(None, Some(1));
+
+        // 修复前：此调用会 panic（aac_sequence_header does not exist）。
+        super::parse_flv_with_boundaries(
+            connection,
+            file,
+            segment,
+            Box::new(|_| {}),
+            Box::new(|_| {}),
+        )
+        .await?;
         Ok(())
     }
 }

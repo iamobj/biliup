@@ -76,12 +76,7 @@ struct RotatingFile {
 }
 
 impl RotatingFile {
-    fn new(
-        path: PathBuf,
-        max_bytes: u64,
-        backup_count: usize,
-        generation: Arc<AtomicU64>,
-    ) -> Self {
+    fn new(path: PathBuf, max_bytes: u64, backup_count: usize, generation: Arc<AtomicU64>) -> Self {
         Self {
             path,
             max_bytes,

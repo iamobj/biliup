@@ -159,7 +159,7 @@ pub enum Commands {
     /// 启动web服务，默认端口19159
     Server {
         /// Specify bind address
-        #[arg(short, long, default_value = "0.0.0.0")]
+        #[arg(short, long, default_value = "127.0.0.1")]
         bind: String,
 
         /// Port to use
@@ -169,6 +169,11 @@ pub enum Commands {
         /// 开启登录密码认证
         #[arg(long, default_value = "false")]
         auth: bool,
+
+        /// 为会话 Cookie 附加 Secure 属性。仅当通过 HTTPS 反向代理访问 Web UI 时开启；
+        /// 直接通过 HTTP 远程访问时开启会导致浏览器丢弃登录态
+        #[arg(long, default_value = "false")]
+        secure_session_cookie: bool,
 
         /// 使用 biliup 1.0.7 风格配置文件启动录制
         #[arg(short, long, value_name = "FILE")]
@@ -213,4 +218,40 @@ fn parse_u8(string: &[u8]) -> Result<f64, String> {
     string
         .parse()
         .map_err(|e| format!("{string} is not ascii digit. {:?}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands};
+    use clap::Parser;
+    use std::path::Path;
+
+    #[test]
+    fn server_defaults_to_loopback_and_default_cookie_file() {
+        let cli = Cli::try_parse_from(["biliup", "server"]).unwrap();
+
+        assert_eq!(cli.user_cookie, Path::new("cookies.json"));
+        assert!(matches!(
+            cli.command,
+            Commands::Server {
+                ref bind,
+                auth: false,
+                secure_session_cookie: false,
+                ..
+            } if bind == "127.0.0.1"
+        ));
+    }
+
+    #[test]
+    fn server_preserves_an_explicit_cookie_file() {
+        let cli = Cli::try_parse_from([
+            "biliup",
+            "--user-cookie",
+            "/tmp/private-account.json",
+            "server",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.user_cookie, Path::new("/tmp/private-account.json"));
+    }
 }

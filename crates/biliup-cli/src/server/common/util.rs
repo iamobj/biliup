@@ -244,11 +244,7 @@ impl FileValidator {
     }
 
     /// 验证文件有效性，并在过滤删除时同步删除关联文件
-    pub fn validate_with_related_paths<'a, I>(
-        &self,
-        path: &Path,
-        related_paths: I,
-    ) -> AppResult<()>
+    pub fn validate_with_related_paths<'a, I>(&self, path: &Path, related_paths: I) -> AppResult<()>
     where
         I: IntoIterator<Item = &'a Path>,
     {
