@@ -364,9 +364,13 @@ impl HookStep {
         // 逐个删除视频文件
         for video_path in video_paths {
             info!("删除 - Removing: {}", video_path.display());
-            fs::remove_file(video_path)
-                .await
-                .change_context(AppError::Unknown)?;
+            match fs::remove_file(video_path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    info!("删除目标已不存在，跳过: {}", video_path.display());
+                }
+                Err(error) => return Err(error).change_context(AppError::Unknown),
+            }
         }
         Ok(())
     }
@@ -491,6 +495,30 @@ mod tests {
 
         assert!(!video.exists());
         assert!(!danmaku.exists());
+    }
+
+    #[tokio::test]
+    async fn remove_skips_missing_path_and_continues_remaining_postprocessors() {
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("segment.mp4");
+        let danmaku = dir.path().join("segment.xml");
+        let marker = dir.path().join("postprocessor-ran");
+        std::fs::write(&danmaku, b"danmaku").unwrap();
+        let paths = vec![video.as_path(), danmaku.as_path()];
+        let processors = vec![
+            HookStep::Remove("rm".into()),
+            HookStep::Run {
+                run: format!("echo postprocessor-ran > \"{}\"", marker.display()),
+            },
+        ];
+
+        process_video(&paths, &processors).await.unwrap();
+
+        assert!(
+            !danmaku.exists(),
+            "rm should continue to remove the XML file"
+        );
+        assert!(marker.exists(), "postprocessors after rm should still run");
     }
 
     /// 复现 pipeline_upload_videos 的 fault-tolerance 触发条件：

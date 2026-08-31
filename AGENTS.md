@@ -24,6 +24,9 @@
   - `uploader=Noop` 与无投稿模板一致：跳过实际上传，但仍执行 `segment_processor`。
   - 单个分段处理失败时只跳过该分段，不中断后续分段处理。
   - 成功处理后的路径会继续交给 `postprocessor`。
+- `postprocessor` 的内置 `"rm"` 为幂等删除：路径已不存在时只记录跳过并继续删除其余路径，
+  不得中断该分段后续后处理步骤；权限、I/O 等非 `NotFound` 错误仍应返回失败。
+  这保证自定义 Hook 提前删除视频后，关联弹幕 XML 仍可清理。
 - 时间戳异常时自动切文件（默认开启，`split_on_timestamp_anomaly`）：
   - 适用于 `ffmpeg` / `stream-gears`；streamlink、sync-downloader 不改。
   - 切段触发条件：DTS 回退 ≥ 500ms，或 FFmpeg 报
