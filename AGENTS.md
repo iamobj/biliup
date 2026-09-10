@@ -29,19 +29,20 @@
   这保证自定义 Hook 提前删除视频后，关联弹幕 XML 仍可清理。
 - 时间戳异常时自动切文件（默认开启，`split_on_timestamp_anomaly`）：
   - 适用于 `ffmpeg` / `stream-gears`；streamlink、sync-downloader 不改。
-  - 切段触发条件：DTS 回退 ≥ 500ms，或 FFmpeg 报
-    `Non-monotonous DTS` / `non monotonically increasing dts` / `out of order` / `non-monotonic dts`。
-  - 单调前跳 ≥ 1 秒不切段，改为压平输出时间轴（吸收空洞），避免 B 站“时间戳跳变”拒稿，
-    也避免 2 秒阈值切段过于频繁产生碎文件。
-  - 小幅 DTS 回退（< 500ms，常见于音视频交错抖动）只告警不切段，避免碎文件。
+  - 切段触发条件：同轨 DTS 回退 ≥ 500ms（排除 H.264 Sequence Header 等流配置包），或 FFmpeg 报
+    `Non-monotonous DTS` / `non monotonically increasing dts` / `non-monotonic dts`。
+  - 单调前跳 ≥ 1 秒不切段，改为按流最大时间戳协同压平输出时间轴（吸收空洞），避免两轨先后吸收破坏音画同步，
+    避免 B 站“时间戳跳变”拒稿，也避免 2 秒阈值切段过于频繁产生碎文件。
+  - 小幅 DTS 回退（< 500ms，常见于音视频交错抖动）与轨道间交织到达只告警不切段，避免碎文件与丢帧。
   - FFmpeg：解析 stderr 命中后优先 SIGINT 优雅退出并落盘，由现有仍在播重试循环立刻开新文件；
     5 秒冷却防抖。强制结束仅在同 pid 超时未退出时触发，避免误杀下一段。
   - FFmpeg 输出 mp4 使用 `frag_keyframe+empty_moov+default_base_moof`，打断时仍尽量可播；
     空 `.part` 不晋升为最终文件。
-  - stream-gears FLV：关键帧边界检测异常后 `create_new`，新段始终写入 H264/AAC sequence header
+  - stream-gears FLV：音视频分轨独立跟踪上一帧时间戳；H.264 Sequence Header 不参与关键帧回退判定；
+    关键帧边界检测异常后 `create_new`，新段始终写入 H264/AAC sequence header
     （header 时间戳改写为 0，且不参与媒体时间轴推进，避免假跳变连切）；
     异常后的残帧不写入旧文件，切段前 flush 缓冲。HLS 保留 discontinuity，
-    并在 media sequence 明显回退时切段。
+    并在 media sequence 明显回退（容差 5 个切片，防 CDN 抖动）时切段。
   - 视频与弹幕使用明确的 Start/End 边界同步：Start 只在新段首批媒体实际到达时触发，
     End 后到下一次 Start 前的弹幕直接丢弃，新 XML 的相对时间从 Start 重新计时。
   - FFmpeg 内部分段同时读取 Opening 日志和 segment list，并按路径去重边界事件；

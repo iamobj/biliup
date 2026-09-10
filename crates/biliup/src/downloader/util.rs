@@ -62,6 +62,46 @@ pub fn absorb_forward_timestamp_jump(
     Some(absorb)
 }
 
+/// 源时间轴大幅前跳时，以流迄今见过的最大媒体时间戳为基准检测空洞，
+/// 抬高输出 rebase base，把空洞从文件时间轴抹掉。
+///
+/// 使用 `stream_max_ms` 能够避免音视频两轨交错时误判前跳，
+/// 并且当两轨先后到达同一空洞后区间时，只吸收一次，确保音视频始终对齐。
+pub fn absorb_forward_timestamp_jump_with_max(
+    current_ms: u32,
+    stream_max_ms: &mut Option<u32>,
+    output_timestamp_base: &mut Option<u32>,
+) -> Option<u32> {
+    let prev_max = match *stream_max_ms {
+        Some(max) => max,
+        None => {
+            *stream_max_ms = Some(current_ms);
+            return None;
+        }
+    };
+
+    if current_ms <= prev_max {
+        return None;
+    }
+
+    let delta = current_ms - prev_max;
+    if delta < TIMESTAMP_JUMP_THRESHOLD_MS {
+        *stream_max_ms = Some(current_ms);
+        return None;
+    }
+
+    let absorb = delta.saturating_sub(TIMESTAMP_FORWARD_KEEP_MS);
+    if absorb == 0 {
+        *stream_max_ms = Some(current_ms);
+        return None;
+    }
+
+    let base = output_timestamp_base.as_mut()?;
+    *base = base.saturating_add(absorb);
+    *stream_max_ms = Some(current_ms);
+    Some(absorb)
+}
+
 /// 把 FLV tag 的时间戳改写为指定值，用于新段写入 header。
 pub fn retimestamp_tag_header(
     header: &crate::downloader::flv_parser::TagHeader,
@@ -525,5 +565,56 @@ mod tests {
         let mut base = None;
         assert_eq!(absorb_forward_timestamp_jump(1000, 5000, &mut base), None);
         assert_eq!(base, None);
+    }
+
+    #[test]
+    fn absorb_forward_timestamp_jump_with_max_coordinates_av_tracks() {
+        let mut base = Some(0u32);
+        let mut stream_max = None;
+
+        // 1. 首个视频帧 (1000ms)，初始化 stream_max
+        assert_eq!(
+            absorb_forward_timestamp_jump_with_max(1000, &mut stream_max, &mut base),
+            None
+        );
+        assert_eq!(stream_max, Some(1000));
+        assert_eq!(base, Some(0));
+
+        // 2. 音视频正常交织：音频 (1020ms) 稍快，视频 (1033ms) 紧随
+        assert_eq!(
+            absorb_forward_timestamp_jump_with_max(1020, &mut stream_max, &mut base),
+            None
+        );
+        assert_eq!(stream_max, Some(1020));
+        assert_eq!(
+            absorb_forward_timestamp_jump_with_max(1033, &mut stream_max, &mut base),
+            None
+        );
+        assert_eq!(stream_max, Some(1033));
+        assert_eq!(base, Some(0));
+
+        // 3. 伴随到达的音频帧 (1010ms)，不应误判前跳
+        assert_eq!(
+            absorb_forward_timestamp_jump_with_max(1010, &mut stream_max, &mut base),
+            None
+        );
+        assert_eq!(stream_max, Some(1033));
+
+        // 4. 流中断 5 秒后恢复：视频先到达 6033ms
+        // 空洞: 6033 - 1033 = 5000ms，吸收 4999ms
+        let absorbed =
+            absorb_forward_timestamp_jump_with_max(6033, &mut stream_max, &mut base).unwrap();
+        assert_eq!(absorbed, 4999);
+        assert_eq!(base, Some(4999));
+        assert_eq!(stream_max, Some(6033));
+
+        // 5. 紧随其后的恢复音频帧到达 6020ms
+        // 因为 6020 <= 6033，不应发生二次吸收，避免把 base 再次抬高
+        assert_eq!(
+            absorb_forward_timestamp_jump_with_max(6020, &mut stream_max, &mut base),
+            None
+        );
+        assert_eq!(base, Some(4999));
+        assert_eq!(stream_max, Some(6033));
     }
 }

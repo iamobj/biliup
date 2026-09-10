@@ -58,8 +58,8 @@ impl FfmpegDownloader {
         args.extend(["-reset_timestamps".to_string(), "1".to_string()]);
         args.extend(["-strftime".to_string(), "1".to_string()]);
 
-        if let Some(segment_time) = download_config.segment_duration() {
-            let seconds = downloader::parse_duration(&segment_time);
+        if let Some(segment_time) = &download_config.segment_time {
+            let seconds = downloader::parse_duration(segment_time);
             args.extend(["-segment_time".to_string(), seconds.to_string()]);
         }
 
@@ -599,7 +599,6 @@ fn is_ffmpeg_timestamp_anomaly_line(line: &str) -> bool {
     lower.contains("non-monotonic dts")
         || lower.contains("non-monotonous dts")
         || lower.contains("non monotonically increasing dts")
-        || lower.contains("out of order")
 }
 
 fn parse_ffmpeg_opening_path(line: &str) -> Option<PathBuf> {
@@ -825,7 +824,8 @@ mod tests {
         assert!(is_ffmpeg_timestamp_anomaly_line(
             "[vost#0:0/copy @ 0x] Non-monotonic DTS; previous: 27189520, current: 27074992; changing to 27189521."
         ));
-        assert!(is_ffmpeg_timestamp_anomaly_line(
+        // 过于宽泛的普通乱序（如网络或解码乱序）不作为 DTS 异常切段依据
+        assert!(!is_ffmpeg_timestamp_anomaly_line(
             "Packet is out of order, dropping"
         ));
         assert!(!is_ffmpeg_timestamp_anomaly_line("frame= 123 fps=30"));

@@ -207,8 +207,10 @@ fn playlist_last_sequence(playlist: &m3u8_rs::MediaPlaylist) -> Option<u64> {
     })
 }
 
+const HLS_SEQUENCE_REGRESSION_TOLERANCE: u64 = 5;
+
 fn is_sequence_regression(previous: Option<u64>, current: Option<u64>) -> bool {
-    matches!((previous, current), (Some(previous), Some(current)) if current.saturating_add(1) < previous)
+    matches!((previous, current), (Some(previous), Some(current)) if current.saturating_add(HLS_SEQUENCE_REGRESSION_TOLERANCE) < previous)
 }
 
 fn should_download_sequence(previous: Option<u64>, current: u64) -> bool {
@@ -341,6 +343,7 @@ mod tests {
     fn detects_large_regression_and_forward_gap() {
         assert!(is_sequence_regression(Some(102), Some(2)));
         assert!(!is_sequence_regression(Some(102), Some(101)));
+        assert!(!is_sequence_regression(Some(102), Some(98)));
         assert!(has_sequence_gap(Some(102), 104));
         assert!(!has_sequence_gap(Some(102), 103));
     }
