@@ -1,5 +1,5 @@
 use crate::downloader::flv_parser::{
-    AACPacketType, AVCPacketType, CodecId, FrameType, SoundFormat, TagData, TagHeader,
+    AACPacketType, AVCPacketType, CodecId, FrameType, SoundFormat, TagData, TagHeader, TagType,
     aac_audio_packet_header, avc_video_packet_header, script_data, tag_data, tag_header,
 };
 use crate::downloader::flv_writer::{FlvFile, FlvTag, TagDataHeader};
@@ -13,7 +13,7 @@ use reqwest::Response;
 
 use std::time::Duration;
 use tokio::time::timeout;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub async fn download(connection: Connection, file: LifecycleFile<'_>, segment: Segmentable) {
     download_with_boundaries(
@@ -69,7 +69,8 @@ async fn parse_flv_with_boundaries(
     let mut stream_max_ms: Option<u32> = None;
     let mut output_timestamp_base = None::<u32>;
     let mut regression_offset: u32 = 0;
-    let mut last_output_ms = None::<u32>;
+    let mut last_video_output_ms = None::<u32>;
+    let mut last_audio_output_ms = None::<u32>;
     let mut current_file_started = false;
     let mut create_new = false;
     loop {
@@ -246,7 +247,8 @@ async fn parse_flv_with_boundaries(
                         &mut output_timestamp_base,
                         &mut stream_max_ms,
                         &mut regression_offset,
-                        &mut last_output_ms,
+                        &mut last_video_output_ms,
+                        &mut last_audio_output_ms,
                     );
                     out.write_tag(&output_header, &flv_tag_data, &previous_tag_size_bytes)?;
                     segment.increase_size((11 + tag_header.data_size + 4) as u64);
@@ -308,7 +310,8 @@ async fn parse_flv_with_boundaries(
                     stream_max_ms = None;
                     output_timestamp_base = None;
                     regression_offset = 0;
-                    last_output_ms = None;
+                    last_video_output_ms = None;
+                    last_audio_output_ms = None;
                     current_file_started = false;
 
                     // 开启新分段时补齐已捕获的头部标签。这些头部并非所有直播流都具备
@@ -365,7 +368,8 @@ async fn parse_flv_with_boundaries(
                             &mut output_timestamp_base,
                             &mut stream_max_ms,
                             &mut regression_offset,
-                            &mut last_output_ms,
+                            &mut last_video_output_ms,
+                            &mut last_audio_output_ms,
                         );
                         out.write_tag(&output_header, &cached_data, &cached_previous_size)?;
                         segment.increase_size((11 + cached_header.data_size + 4) as u64);
@@ -384,7 +388,8 @@ async fn parse_flv_with_boundaries(
                         &mut output_timestamp_base,
                         &mut stream_max_ms,
                         &mut regression_offset,
-                        &mut last_output_ms,
+                        &mut last_video_output_ms,
+                        &mut last_audio_output_ms,
                     );
                     out.write_tag(&output_header, &bytes, &previous_tag_size)?;
                     segment.increase_size((11 + tag_header.data_size + 4) as u64);
@@ -410,7 +415,8 @@ async fn parse_flv_with_boundaries(
             &mut output_timestamp_base,
             &mut stream_max_ms,
             &mut regression_offset,
-            &mut last_output_ms,
+            &mut last_video_output_ms,
+            &mut last_audio_output_ms,
         );
         out.write_tag(&output_header, &flv_tag_data, &previous_tag_size_bytes)?;
     }
@@ -432,14 +438,15 @@ fn rebase_media_timestamp(
     retimestamp_tag_header(header, header.timestamp.saturating_sub(base))
 }
 
-/// 写入前：先按 source 前跳压平 base，再 rebase 到段内时间轴，并对容差内回退做单调钳位平滑。
+/// 写入前：先按 source 前跳压平 base，再 rebase 到段内时间轴，并对容差内回退做分轨单调钳位平滑。
 fn rebase_media_timestamp_for_write(
     header: &TagHeader,
     is_media: bool,
     output_timestamp_base: &mut Option<u32>,
     stream_max_ms: &mut Option<u32>,
     regression_offset: &mut u32,
-    last_output_ms: &mut Option<u32>,
+    last_video_output_ms: &mut Option<u32>,
+    last_audio_output_ms: &mut Option<u32>,
 ) -> TagHeader {
     if is_media {
         if let Some(absorbed) = absorb_forward_timestamp_jump_with_max(
@@ -456,20 +463,36 @@ fn rebase_media_timestamp_for_write(
     let mut out_header = rebase_media_timestamp(header, is_media, output_timestamp_base);
     if is_media {
         let prev_offset = *regression_offset;
+        let last_track_output = match header.tag_type {
+            TagType::Video => last_video_output_ms,
+            TagType::Audio => last_audio_output_ms,
+            _ => return out_header,
+        };
         out_header.timestamp = clamp_regression_monotonic(
             out_header.timestamp,
             regression_offset,
-            last_output_ms,
+            last_track_output,
         );
         if *regression_offset > prev_offset {
             let gap = *regression_offset - prev_offset;
-            warn!(
-                "输出时间戳已单调钳位平滑 tag_type={:?} raw_timestamp={} output_timestamp={} clamped_gap_ms={gap} total_offset_ms={}",
-                header.tag_type,
-                header.timestamp,
-                out_header.timestamp,
-                *regression_offset,
-            );
+            // 优化日志级别：微小容差平滑（< 100ms）使用 debug 避免刷屏，显著回退（>= 100ms）才使用 warn 提醒
+            if gap >= 100 {
+                warn!(
+                    "输出时间戳已单调钳位平滑 tag_type={:?} raw_timestamp={} output_timestamp={} clamped_gap_ms={gap} total_offset_ms={}",
+                    header.tag_type,
+                    header.timestamp,
+                    out_header.timestamp,
+                    *regression_offset,
+                );
+            } else {
+                debug!(
+                    "输出时间戳已单调钳位平滑 tag_type={:?} raw_timestamp={} output_timestamp={} clamped_gap_ms={gap} total_offset_ms={}",
+                    header.tag_type,
+                    header.timestamp,
+                    out_header.timestamp,
+                    *regression_offset,
+                );
+            }
         }
     }
     out_header
@@ -638,7 +661,8 @@ mod tests {
         let mut base = Some(0u32);
         let mut stream_max_ms = None;
         let mut regression_offset = 0u32;
-        let mut last_output_ms = None;
+        let mut last_video_output_ms = None;
+        let mut last_audio_output_ms = None;
         // 先写入 prev 对应的输出点
         assert_eq!(
             rebase_media_timestamp_for_write(
@@ -647,7 +671,8 @@ mod tests {
                 &mut base,
                 &mut stream_max_ms,
                 &mut regression_offset,
-                &mut last_output_ms,
+                &mut last_video_output_ms,
+                &mut last_audio_output_ms,
             )
             .timestamp,
             8_141_000
@@ -658,7 +683,8 @@ mod tests {
             &mut base,
             &mut stream_max_ms,
             &mut regression_offset,
-            &mut last_output_ms,
+            &mut last_video_output_ms,
+            &mut last_audio_output_ms,
         );
         // 48s 空洞被吸收，仅保留 1ms 递增
         assert_eq!(out.timestamp, 8_141_001);
@@ -676,7 +702,8 @@ mod tests {
             &mut base,
             &mut stream_max_ms,
             &mut regression_offset,
-            &mut last_output_ms,
+            &mut last_video_output_ms,
+            &mut last_audio_output_ms,
         );
         assert_eq!(audio_out.timestamp, 8_141_021);
 
@@ -693,9 +720,127 @@ mod tests {
             &mut base,
             &mut stream_max_ms,
             &mut regression_offset,
-            &mut last_output_ms,
+            &mut last_video_output_ms,
+            &mut last_audio_output_ms,
         );
         assert!(audio_clamped.timestamp > audio_out.timestamp);
+    }
+
+    #[test]
+    fn av_interleaving_same_timestamp_does_not_trigger_clamp_offset() {
+        let v1 = TagHeader {
+            tag_type: TagType::Video,
+            data_size: 10,
+            timestamp: 1000,
+            stream_id: 0,
+        };
+        let a1 = TagHeader {
+            tag_type: TagType::Audio,
+            data_size: 10,
+            timestamp: 1000,
+            stream_id: 0,
+        };
+        let v2 = TagHeader {
+            tag_type: TagType::Video,
+            data_size: 10,
+            timestamp: 1033,
+            stream_id: 0,
+        };
+        let a2 = TagHeader {
+            tag_type: TagType::Audio,
+            data_size: 10,
+            timestamp: 1021, // 相比 v2(1033) 稍小，但相比自身 a1(1000) 单调递增
+            stream_id: 0,
+        };
+
+        let mut base = Some(1000u32);
+        let mut stream_max_ms = None;
+        let mut regression_offset = 0u32;
+        let mut last_video_output_ms = None;
+        let mut last_audio_output_ms = None;
+
+        let out_v1 = rebase_media_timestamp_for_write(
+            &v1,
+            true,
+            &mut base,
+            &mut stream_max_ms,
+            &mut regression_offset,
+            &mut last_video_output_ms,
+            &mut last_audio_output_ms,
+        );
+        let out_a1 = rebase_media_timestamp_for_write(
+            &a1,
+            true,
+            &mut base,
+            &mut stream_max_ms,
+            &mut regression_offset,
+            &mut last_video_output_ms,
+            &mut last_audio_output_ms,
+        );
+        let out_v2 = rebase_media_timestamp_for_write(
+            &v2,
+            true,
+            &mut base,
+            &mut stream_max_ms,
+            &mut regression_offset,
+            &mut last_video_output_ms,
+            &mut last_audio_output_ms,
+        );
+        let out_a2 = rebase_media_timestamp_for_write(
+            &a2,
+            true,
+            &mut base,
+            &mut stream_max_ms,
+            &mut regression_offset,
+            &mut last_video_output_ms,
+            &mut last_audio_output_ms,
+        );
+
+        assert_eq!(out_v1.timestamp, 0);
+        assert_eq!(out_a1.timestamp, 0);
+        assert_eq!(out_v2.timestamp, 33);
+        assert_eq!(out_a2.timestamp, 21);
+        // 音视频交织/同时间戳不应触发任何虚假 offset 垫高
+        assert_eq!(regression_offset, 0);
+
+        // 模拟后续真实回退：视频帧回退 200ms
+        let v3_regressed = TagHeader {
+            tag_type: TagType::Video,
+            data_size: 10,
+            timestamp: 833, // 从 1033 回退到 833 (rebase 后是 0 saturating, candidate 0 <= prev 33)
+            stream_id: 0,
+        };
+        let out_v3 = rebase_media_timestamp_for_write(
+            &v3_regressed,
+            true,
+            &mut base,
+            &mut stream_max_ms,
+            &mut regression_offset,
+            &mut last_video_output_ms,
+            &mut last_audio_output_ms,
+        );
+        // 视频回退被垫高推进到 34 (33 + 1)
+        assert_eq!(out_v3.timestamp, 34);
+        assert_eq!(regression_offset, 34);
+
+        // 伴随的音频也回退到了 825，但享受相同的 regression_offset 协同垫高
+        let a3_regressed = TagHeader {
+            tag_type: TagType::Audio,
+            data_size: 10,
+            timestamp: 825,
+            stream_id: 0,
+        };
+        let out_a3 = rebase_media_timestamp_for_write(
+            &a3_regressed,
+            true,
+            &mut base,
+            &mut stream_max_ms,
+            &mut regression_offset,
+            &mut last_video_output_ms,
+            &mut last_audio_output_ms,
+        );
+        // a3 协同垫高后，时间戳单调且相对音画差保持一致
+        assert!(out_a3.timestamp > out_a2.timestamp);
     }
 
     #[test]

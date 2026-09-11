@@ -33,9 +33,10 @@
     `Non-monotonous DTS` / `non monotonically increasing dts` / `non-monotonic dts`（当阈值 > 0 时启用）。
   - 单调前跳 ≥ 1 秒不切段，改为按流最大时间戳协同压平输出时间轴（吸收空洞），避免两轨先后吸收破坏音画同步，
     避免 B 站“时间戳跳变”拒稿，也避免频繁产生碎文件。
-  - 容差内 DTS 回退（< `timestamp_anomaly_threshold_ms`）：不触发切段。在 stream-gears FLV 写入时通过
-    `clamp_regression_monotonic` 协同垫高统一 `regression_offset`，确保输出时间戳严格单调递增，
-    既彻底消除 DTS 回退导致的 B 站拒稿，又完整保持音画相对时差，避免碎文件。
+  - 容差内 DTS 回退（< `timestamp_anomaly_threshold_ms`）：不触发切段。在 stream-gears FLV 写入时音视频分轨跟踪
+    上一帧输出时间戳，通过 `clamp_regression_monotonic` 协同垫高统一 `regression_offset`，确保输出时间戳严格单调递增，
+    避免跨轨交错误触垫高，既彻底消除 DTS 回退导致的 B 站拒稿，又完整保持音画相对时差，避免碎文件；
+    微小容差平滑（< 100ms）降为 debug 日志避免刷屏。
   - FFmpeg：解析 stderr 命中后优先 SIGINT 优雅退出并落盘，由现有仍在播重试循环立刻开新文件；
     5 秒冷却防抖。强制结束仅在同 pid 超时未退出时触发，避免误杀下一段。
   - FFmpeg 输出 mp4 使用 `frag_keyframe+empty_moov+default_base_moof`，打断时仍尽量可播；
