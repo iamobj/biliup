@@ -114,7 +114,7 @@ pub async fn download_with_boundaries(
                 }
                 debug!("Yield segment");
                 let anomaly_boundary =
-                    splitting.split_on_timestamp_anomaly() && sequence_gap;
+                    splitting.timestamp_anomaly_threshold_ms() > 0 && sequence_gap;
                 if anomaly_boundary || segment.discontinuity {
                     if current_file_started {
                         segment_ended(&ts_file.file.file_name);
@@ -167,7 +167,7 @@ pub async fn download_with_boundaries(
         let resp = client.retryable(media_url.as_str()).await?;
         let bs = resp.bytes().await?;
         let playlist = parse_media_playlist(&bs)?;
-        if splitting.split_on_timestamp_anomaly()
+        if splitting.timestamp_anomaly_threshold_ms() > 0
             && is_sequence_regression(last_sequence, playlist_last_sequence(&playlist))
         {
             warn!(

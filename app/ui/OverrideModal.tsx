@@ -250,14 +250,22 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
         stopValidateWithError={true}
       />
 
-      <OverrideSwitch
-        field="split_on_timestamp_anomaly"
-        label="时间戳异常自动切文件（split_on_timestamp_anomaly）"
+      <Form.InputNumber
+        field="timestamp_anomaly_threshold_ms"
+        label="时间戳异常切文件阈值（timestamp_anomaly_threshold_ms）"
         extraText={
           <div style={{ fontSize: '14px' }}>
-            检测到时间戳回退/非单调时自动切文件；前跳 ≥ 1 秒压平时间轴不切段。未覆写时继承全局配置（默认开启）。
+            检测到时间戳回退达到或超过该阈值时自动切文件，单位毫秒。设为 0 时禁用切分；阈值内小回退自动单调钳位平滑。未覆写时继承全局配置（默认 5000 ms）。
           </div>
         }
+        suffix={'ms'}
+        min={0}
+        style={{ width: '100%' }}
+        fieldStyle={{
+          alignSelf: 'stretch',
+          padding: 0,
+        }}
+        showClear={true}
       />
 
       <Form.InputNumber

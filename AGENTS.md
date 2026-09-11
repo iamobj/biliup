@@ -27,13 +27,15 @@
 - `postprocessor` 的内置 `"rm"` 为幂等删除：路径已不存在时只记录跳过并继续删除其余路径，
   不得中断该分段后续后处理步骤；权限、I/O 等非 `NotFound` 错误仍应返回失败。
   这保证自定义 Hook 提前删除视频后，关联弹幕 XML 仍可清理。
-- 时间戳异常时自动切文件（默认开启，`split_on_timestamp_anomaly`）：
+- 时间戳异常时自动切文件（数值毫秒，默认 5000ms，`timestamp_anomaly_threshold_ms`；设为 0 时关闭）：
   - 适用于 `ffmpeg` / `stream-gears`；streamlink、sync-downloader 不改。
-  - 切段触发条件：同轨 DTS 回退 ≥ 500ms（排除 H.264 Sequence Header 等流配置包），或 FFmpeg 报
-    `Non-monotonous DTS` / `non monotonically increasing dts` / `non-monotonic dts`。
+  - 切段触发条件：同轨 DTS 回退 ≥ `timestamp_anomaly_threshold_ms`（排除 H.264 Sequence Header 等流配置包），或 FFmpeg 报
+    `Non-monotonous DTS` / `non monotonically increasing dts` / `non-monotonic dts`（当阈值 > 0 时启用）。
   - 单调前跳 ≥ 1 秒不切段，改为按流最大时间戳协同压平输出时间轴（吸收空洞），避免两轨先后吸收破坏音画同步，
-    避免 B 站“时间戳跳变”拒稿，也避免 2 秒阈值切段过于频繁产生碎文件。
-  - 小幅 DTS 回退（< 500ms，常见于音视频交错抖动）与轨道间交织到达只告警不切段，避免碎文件与丢帧。
+    避免 B 站“时间戳跳变”拒稿，也避免频繁产生碎文件。
+  - 容差内 DTS 回退（< `timestamp_anomaly_threshold_ms`）：不触发切段。在 stream-gears FLV 写入时通过
+    `clamp_regression_monotonic` 协同垫高统一 `regression_offset`，确保输出时间戳严格单调递增，
+    既彻底消除 DTS 回退导致的 B 站拒稿，又完整保持音画相对时差，避免碎文件。
   - FFmpeg：解析 stderr 命中后优先 SIGINT 优雅退出并落盘，由现有仍在播重试循环立刻开新文件；
     5 秒冷却防抖。强制结束仅在同 pid 超时未退出时触发，避免误杀下一段。
   - FFmpeg 输出 mp4 使用 `frag_keyframe+empty_moov+default_base_moof`，打断时仍尽量可播；
@@ -53,7 +55,10 @@
     EOF 必须刷出最后一个 GOP，缺少 metadata/AAC/H264 header 时不得 panic。
   - stream-gears 同一秒连续切段时，若最终文件或 `.part` 已存在需追加数字序号，
     不得复用路径覆盖上一段。
-  - 全局配置与主播 override 均可开关；override 布尔三态 `unset | true | false`。
+  - 全局配置与主播 override 均可配置数值；override 支持清除继承全局（设为 0 时关闭异常切段）。
+  - 历史配置迁移：通过 `migrations/5_migrate_timestamp_anomaly.sql` 由 `sqlx::migrate!()` 自动迁移 SQLite 数据库（`configuration` 与 `livestreamers.override`），
+    将旧布尔字段 `split_on_timestamp_anomaly` 转换为 `timestamp_anomaly_threshold_ms`（true/null -> 5000, false -> 0）
+    并删除旧字段；同时提供 `scripts/migrate_timestamp_anomaly.py` 独立脚本用于手动或离线迁移。
 - 抖音画质支持 `douyin_prefer_uhd` 优先策略：
   - 默认关闭；开启后优先使用当前协议下有有效地址的 `uhd`，没有可用 `uhd` 时使用 `origin`。
   - `uhd` 与 `origin` 都不可用时，沿用原有 `douyin_quality` 邻近画质回退逻辑。
@@ -106,9 +111,9 @@
     `user` 做字段级合并，避免只覆写一个 cookie 时整对象替换清掉其它全局 cookie。
   - `kuaishou_cookie` 是顶层配置字段，不要写成 `user.kuaishou_cookie`。
 - 全局“默认开启”布尔配置需保持 UI 与运行时一致（读时补全，不主动写回历史库）：
-  - 字段：`split_on_timestamp_anomaly`、`huya_use_wup`、`huya_imgplus`、
+  - 字段：`huya_use_wup`、`huya_imgplus`、
     `twitch_disable_ads`、`youtube_enable_download_live`、
-    `youtube_enable_download_playback`。
+    `youtube_enable_download_playback`。（注：`timestamp_anomaly_threshold_ms` 为数值配置，默认 5000ms，缺失/null 读时归一为 `Some(5000)`）。
   - `Config` 使用 `serde(default = ...)` 填缺失；`normalize_default_true_options`
     （经 `normalize_segment_limits` 调用）把旧库显式 `null` 也归一为 `Some(true)`。
   - 读/写回读路径（`get_config`、`put_configuration` 等）都会 normalize，

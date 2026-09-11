@@ -65,7 +65,7 @@ impl FfmpegDownloader {
 
         // segment muxer 不会走上面的 "mp4" 分支；mp4 分段需单独附加 movflags。
         if download_config.suffix.eq_ignore_ascii_case("mp4") {
-            if download_config.split_on_timestamp_anomaly {
+            if download_config.timestamp_anomaly_threshold_ms > 0 {
                 args.extend([
                     "-movflags".to_string(),
                     "+frag_keyframe+empty_moov+default_base_moof".to_string(),
@@ -83,7 +83,7 @@ impl FfmpegDownloader {
         self.append_common_output_args(
             &mut args,
             "segment",
-            download_config.split_on_timestamp_anomaly,
+            download_config.timestamp_anomaly_threshold_ms,
         );
         args
     }
@@ -93,7 +93,7 @@ impl FfmpegDownloader {
         let mut args = Vec::new();
 
         // 开启异常切分时保留 warning，便于检测 DTS 告警
-        let loglevel = if download_config.split_on_timestamp_anomaly {
+        let loglevel = if download_config.timestamp_anomaly_threshold_ms > 0 {
             "warning"
         } else {
             "quiet"
@@ -122,7 +122,7 @@ impl FfmpegDownloader {
         self.append_common_output_args(
             &mut args,
             &download_config.suffix,
-            download_config.split_on_timestamp_anomaly,
+            download_config.timestamp_anomaly_threshold_ms,
         );
         args
     }
@@ -152,7 +152,7 @@ impl FfmpegDownloader {
         &self,
         args: &mut Vec<String>,
         format: &str,
-        split_on_timestamp_anomaly: bool,
+        timestamp_anomaly_threshold_ms: u32,
     ) {
         args.extend(["-c".to_string(), "copy".to_string()]);
 
@@ -161,7 +161,7 @@ impl FfmpegDownloader {
                 args.extend(["-bsf:a".to_string(), "aac_adtstoasc".to_string()]);
                 // 开启时间戳异常切段时用 fMP4：打断后即使 trailer 未写完通常仍可打开。
                 // 未开启时保持 faststart 常规 mp4，兼容投稿/常规播放器。
-                if split_on_timestamp_anomaly {
+                if timestamp_anomaly_threshold_ms > 0 {
                     args.extend([
                         "-movflags".to_string(),
                         "+frag_keyframe+empty_moov+default_base_moof".to_string(),
@@ -209,7 +209,7 @@ impl FfmpegDownloader {
         let (status, anomaly) = spawn_log(
             child,
             Arc::clone(&self.process_handle),
-            download_config.split_on_timestamp_anomaly,
+            download_config.timestamp_anomaly_threshold_ms,
             |event| match event {
                 FfmpegProcessEvent::Started => {
                     if !segment_started {
@@ -324,7 +324,7 @@ impl FfmpegDownloader {
         }
 
         let mut detector =
-            TimestampAnomalyDetector::new(download_config.split_on_timestamp_anomaly);
+            TimestampAnomalyDetector::new(download_config.timestamp_anomaly_threshold_ms);
         let mut stdout_lines = BufReader::new(stdout).lines();
         let mut stderr_lines = BufReader::new(stderr).lines();
         let mut stdout_open = true;
@@ -571,9 +571,9 @@ struct TimestampAnomalyDetector {
 }
 
 impl TimestampAnomalyDetector {
-    fn new(enabled: bool) -> Self {
+    fn new(threshold_ms: u32) -> Self {
         Self {
-            enabled,
+            enabled: threshold_ms > 0,
             last_trigger: None,
         }
     }
@@ -667,7 +667,7 @@ enum FfmpegProcessEvent {
 async fn spawn_log<F>(
     mut child: tokio::process::Child,
     process_handle: Arc<RwLock<Option<tokio::process::Child>>>,
-    split_on_timestamp_anomaly: bool,
+    timestamp_anomaly_threshold_ms: u32,
     mut event_hook: F,
 ) -> AppResult<(ExitStatus, bool)>
 where
@@ -685,7 +685,7 @@ where
         *handle = Some(child);
     }
 
-    let mut detector = TimestampAnomalyDetector::new(split_on_timestamp_anomaly);
+    let mut detector = TimestampAnomalyDetector::new(timestamp_anomaly_threshold_ms);
     let mut anomaly = false;
     let mut progress_started = false;
     let mut stdout_open = true;
@@ -833,7 +833,7 @@ mod tests {
 
     #[test]
     fn detector_respects_cooldown() {
-        let mut detector = TimestampAnomalyDetector::new(true);
+        let mut detector = TimestampAnomalyDetector::new(5000);
         assert!(detector.observe("Non-monotonous DTS in output stream"));
         assert!(!detector.observe("Non-monotonous DTS in output stream"));
         detector.last_trigger =
@@ -843,7 +843,7 @@ mod tests {
 
     #[test]
     fn detector_can_be_disabled() {
-        let mut detector = TimestampAnomalyDetector::new(false);
+        let mut detector = TimestampAnomalyDetector::new(0);
         assert!(!detector.observe("Non-monotonous DTS in output stream"));
     }
 

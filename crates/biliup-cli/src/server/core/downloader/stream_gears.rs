@@ -56,7 +56,7 @@ impl StreamGears {
                 .map(parse_time),
             download_config.file_size,
         );
-        segment.set_split_on_timestamp_anomaly(download_config.split_on_timestamp_anomaly);
+        segment.set_timestamp_anomaly_threshold_ms(download_config.timestamp_anomaly_threshold_ms);
 
         // 创建HTTP客户端
         let client = StatelessClient::new(headers_in, proxy.as_deref());

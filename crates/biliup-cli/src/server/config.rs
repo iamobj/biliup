@@ -25,9 +25,9 @@ pub struct Config {
     #[serde(default)]
     pub segment_time: Option<String>,
 
-    /// 时间戳异常时自动切文件（开延迟/DTS 回退等）
-    #[serde(default = "default_split_on_timestamp_anomaly")]
-    pub split_on_timestamp_anomaly: Option<bool>,
+    /// 时间戳异常切文件阈值（毫秒），0 为禁用，默认 5000
+    #[serde(default = "default_timestamp_anomaly_threshold_ms")]
+    pub timestamp_anomaly_threshold_ms: Option<u32>,
 
     /// 过滤阈值（MB）
     #[builder(default = default_filtering_threshold())]
@@ -561,9 +561,9 @@ pub fn default_segment_time() -> Option<String> {
     None
 }
 
-/// 默认开启时间戳异常自动切文件
-fn default_split_on_timestamp_anomaly() -> Option<bool> {
-    Some(true)
+/// 默认时间戳异常切文件阈值：5000 毫秒（5 秒）
+fn default_timestamp_anomaly_threshold_ms() -> Option<u32> {
+    Some(5000)
 }
 
 /// 运行时与 UI 共用的“默认开启”布尔配置
@@ -633,11 +633,11 @@ impl Config {
         self.normalize_default_true_options();
     }
 
-    /// 将缺失/null 的“默认开启”开关归一为 Some(true)，避免 UI 显示关而运行时仍开启。
-    /// 显式 false 保持不变；稀疏 override/ConfigPatch 不走此路径。
+    /// 将缺失/null 的默认配置归一为默认值，避免 UI 显示未配置而运行时未应用。
+    /// 显式设置保持不变；稀疏 override/ConfigPatch 不走此路径。
     pub fn normalize_default_true_options(&mut self) {
-        if self.split_on_timestamp_anomaly.is_none() {
-            self.split_on_timestamp_anomaly = Some(true);
+        if self.timestamp_anomaly_threshold_ms.is_none() {
+            self.timestamp_anomaly_threshold_ms = Some(5000);
         }
         if self.huya_imgplus.is_none() {
             self.huya_imgplus = Some(true);
@@ -695,16 +695,16 @@ mod tests {
 
         assert_eq!(config.file_size, default_file_size());
         assert_eq!(config.segment_time, None);
-        assert_eq!(config.split_on_timestamp_anomaly, Some(true));
+        assert_eq!(config.timestamp_anomaly_threshold_ms, Some(5000));
         assert_eq!(config.douyin_prefer_uhd, None);
         assert!(config.validate_segment_limits().is_ok());
     }
 
     #[test]
-    fn split_on_timestamp_anomaly_can_be_disabled() {
+    fn timestamp_anomaly_threshold_ms_can_be_disabled() {
         let config: Config =
-            serde_json::from_str(r#"{"split_on_timestamp_anomaly": false}"#).unwrap();
-        assert_eq!(config.split_on_timestamp_anomaly, Some(false));
+            serde_json::from_str(r#"{"timestamp_anomaly_threshold_ms": 0}"#).unwrap();
+        assert_eq!(config.timestamp_anomaly_threshold_ms, Some(0));
     }
 
     #[test]
@@ -805,7 +805,7 @@ mod tests {
         assert_eq!(config.twitch_disable_ads, Some(true));
         assert_eq!(config.youtube_enable_download_live, Some(true));
         assert_eq!(config.youtube_enable_download_playback, Some(true));
-        assert_eq!(config.split_on_timestamp_anomaly, Some(true));
+        assert_eq!(config.timestamp_anomaly_threshold_ms, Some(5000));
         // 默认 false 的开关仍保持 None，避免被误写成 true
         assert_eq!(config.huya_mobile_api, None);
 
@@ -823,12 +823,12 @@ mod tests {
                 "twitch_disable_ads": null,
                 "youtube_enable_download_live": null,
                 "youtube_enable_download_playback": null,
-                "split_on_timestamp_anomaly": null
+                "timestamp_anomaly_threshold_ms": null
             }"#,
         )
         .unwrap();
         assert_eq!(config.huya_use_wup, None);
-        assert_eq!(config.split_on_timestamp_anomaly, None);
+        assert_eq!(config.timestamp_anomaly_threshold_ms, None);
 
         config.normalize_segment_limits();
 
@@ -837,11 +837,11 @@ mod tests {
         assert_eq!(config.twitch_disable_ads, Some(true));
         assert_eq!(config.youtube_enable_download_live, Some(true));
         assert_eq!(config.youtube_enable_download_playback, Some(true));
-        assert_eq!(config.split_on_timestamp_anomaly, Some(true));
+        assert_eq!(config.timestamp_anomaly_threshold_ms, Some(5000));
     }
 
     #[test]
-    fn default_true_options_preserve_explicit_false() {
+    fn default_true_options_preserve_explicit_disabled() {
         let mut config: Config = serde_json::from_str(
             r#"{
                 "huya_use_wup": false,
@@ -849,7 +849,7 @@ mod tests {
                 "twitch_disable_ads": false,
                 "youtube_enable_download_live": false,
                 "youtube_enable_download_playback": false,
-                "split_on_timestamp_anomaly": false
+                "timestamp_anomaly_threshold_ms": 0
             }"#,
         )
         .unwrap();
@@ -859,12 +859,12 @@ mod tests {
         assert_eq!(config.twitch_disable_ads, Some(false));
         assert_eq!(config.youtube_enable_download_live, Some(false));
         assert_eq!(config.youtube_enable_download_playback, Some(false));
-        assert_eq!(config.split_on_timestamp_anomaly, Some(false));
+        assert_eq!(config.timestamp_anomaly_threshold_ms, Some(0));
 
         let encoded = serde_json::to_string(&config).unwrap();
         let again: Config = serde_json::from_str(&encoded).unwrap();
         assert_eq!(again.huya_use_wup, Some(false));
-        assert_eq!(again.split_on_timestamp_anomaly, Some(false));
+        assert_eq!(again.timestamp_anomaly_threshold_ms, Some(0));
     }
 
     #[test]

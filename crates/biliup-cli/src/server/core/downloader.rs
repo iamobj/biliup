@@ -42,9 +42,9 @@ pub struct DownloadConfig {
     /// 分段文件大小限制 (字节)
     pub file_size: Option<u64>,
 
-    /// 时间戳异常时自动切文件
-    #[serde(default = "default_split_on_timestamp_anomaly_enabled")]
-    pub split_on_timestamp_anomaly: bool,
+    /// 时间戳异常切文件阈值（毫秒），0 为禁用，默认 5000
+    #[serde(default = "default_timestamp_anomaly_threshold_ms")]
+    pub timestamp_anomaly_threshold_ms: u32,
 
     /// HTTP请求头
     pub headers: HashMap<String, String>,
@@ -58,8 +58,8 @@ pub struct DownloadConfig {
     pub suffix: String,
 }
 
-fn default_split_on_timestamp_anomaly_enabled() -> bool {
-    true
+fn default_timestamp_anomaly_threshold_ms() -> u32 {
+    5000
 }
 
 impl Default for DownloadConfig {
@@ -69,7 +69,7 @@ impl Default for DownloadConfig {
             segment_time: None,
             time_range: None,
             file_size: None,
-            split_on_timestamp_anomaly: true,
+            timestamp_anomaly_threshold_ms: 5000,
             headers: HashMap::new(),
             recorder: Default::default(),
             output_dir: PathBuf::new(),

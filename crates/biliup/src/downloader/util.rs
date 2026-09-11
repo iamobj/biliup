@@ -7,35 +7,47 @@ use tracing::{error, info};
 
 pub type CallbackFn<'a> = Box<dyn FnMut(&str) + Send + Sync + 'a>;
 
-/// 时间戳前跳压平阈值：1 秒。
-///
-/// B 站会拒文件内明显时间戳跳变（例如 8141s → 8189s），即使音视频同步前跳。
-/// 前跳若直接切段，2 秒阈值容易碎文件、过大又可能漏过拒稿点；因此前跳默认
-/// **压平输出时间轴**（抬高 rebase base 抹掉空洞）而不是切段。
-/// 达到该阈值的 source 前跳会被吸收；FLV 新段 sequence header 仍必须
-/// timestamp=0 且不参与媒体时间轴推进。
 pub const TIMESTAMP_JUMP_THRESHOLD_MS: u32 = 1000;
 /// 压平前跳后保留的微小递增，保证输出 DTS 仍严格单调。
 pub const TIMESTAMP_FORWARD_KEEP_MS: u32 = 1;
-/// 时间戳回退容差：500 毫秒。
-///
-/// 直播 FLV 音视频交错/编码抖动常出现十几到几百毫秒的小幅 DTS 回退；
-/// 小于该阈值只视为抖动，不触发切段。达到或超过则按真实时间基异常处理。
-pub const TIMESTAMP_REGRESSION_TOLERANCE_MS: u32 = 500;
+/// 默认时间戳异常切文件阈值：5000 毫秒（5 秒）。设为 0 时禁用切分。
+pub const DEFAULT_TIMESTAMP_ANOMALY_THRESHOLD_MS: u32 = 5000;
 /// 时间戳异常切文件冷却：5 秒
 pub const TIMESTAMP_ANOMALY_COOLDOWN: Duration = Duration::from_secs(5);
 
 /// 判断流时间戳是否需要因异常**切段**（仅大幅 DTS 回退）
 ///
+/// `threshold_ms == 0` 视为禁用异常切分。
 /// `prev_ms == 0` 视为新段首个参考点，不触发。
-/// 小幅 DTS 回退（< [`TIMESTAMP_REGRESSION_TOLERANCE_MS`]）不视为需切段的异常。
-/// 单调前跳不在此切段，改由 [`absorb_forward_timestamp_jump`] 压平。
-pub fn is_timestamp_anomaly(prev_ms: u32, current_ms: u32) -> bool {
-    if prev_ms == 0 || current_ms >= prev_ms {
+/// 小幅 DTS 回退（< `threshold_ms`）不视为需切段的异常，改由 [`clamp_regression_monotonic`] 压平。
+/// 单调前跳不在此切段，改由 [`absorb_forward_timestamp_jump_with_max`] 压平。
+pub fn is_timestamp_anomaly(prev_ms: u32, current_ms: u32, threshold_ms: u32) -> bool {
+    if threshold_ms == 0 || prev_ms == 0 || current_ms >= prev_ms {
         return false;
     }
-    // DTS 回退：仅超过容差才切段，避免音视频交错抖动导致碎文件
-    prev_ms - current_ms >= TIMESTAMP_REGRESSION_TOLERANCE_MS
+    // DTS 回退：达到或超过阈值才切段，避免推流微卡顿/连麦导致碎文件
+    prev_ms - current_ms >= threshold_ms
+}
+
+/// 在输出写入时平滑容差内的 DTS 回退，确保输出 DTS 严格单调递增。
+///
+/// 当输入时间戳经过 base 重基后小于或等于上一个输出时间戳时，说明发生了回退。
+/// 通过累加 `regression_offset`，既将当前帧单调推进，又能保持后续帧及伴随音视频轨道的相对时间差。
+pub fn clamp_regression_monotonic(
+    raw_rebased_ms: u32,
+    regression_offset: &mut u32,
+    last_output_ms: &mut Option<u32>,
+) -> u32 {
+    let mut candidate = raw_rebased_ms.saturating_add(*regression_offset);
+    if let Some(prev) = *last_output_ms {
+        if candidate <= prev {
+            let gap = prev.saturating_sub(candidate).saturating_add(1);
+            *regression_offset = regression_offset.saturating_add(gap);
+            candidate = candidate.saturating_add(gap);
+        }
+    }
+    *last_output_ms = Some(candidate);
+    candidate
 }
 
 /// 源时间轴大幅前跳时，抬高输出 rebase base，把空洞从文件时间轴抹掉。
@@ -123,8 +135,8 @@ pub enum Segment {
 pub struct Segmentable {
     time: Time,
     size: Size,
-    /// 时间戳异常时是否自动切文件
-    split_on_timestamp_anomaly: bool,
+    /// 时间戳异常切文件阈值（毫秒），0 为禁用，默认 5000
+    timestamp_anomaly_threshold_ms: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -152,16 +164,16 @@ impl Segmentable {
                 expected: expected_size,
                 current: 0,
             },
-            split_on_timestamp_anomaly: true,
+            timestamp_anomaly_threshold_ms: DEFAULT_TIMESTAMP_ANOMALY_THRESHOLD_MS,
         }
     }
 
-    pub fn set_split_on_timestamp_anomaly(&mut self, enabled: bool) {
-        self.split_on_timestamp_anomaly = enabled;
+    pub fn set_timestamp_anomaly_threshold_ms(&mut self, threshold_ms: u32) {
+        self.timestamp_anomaly_threshold_ms = threshold_ms;
     }
 
-    pub fn split_on_timestamp_anomaly(&self) -> bool {
-        self.split_on_timestamp_anomaly
+    pub fn timestamp_anomaly_threshold_ms(&self) -> u32 {
+        self.timestamp_anomaly_threshold_ms
     }
 
     /// 检查是否需要分割 - 只要时间或大小任一条件满足就返回 true
@@ -338,7 +350,7 @@ impl Default for Segmentable {
                 expected: None,
                 current: 0,
             },
-            split_on_timestamp_anomaly: true,
+            timestamp_anomaly_threshold_ms: DEFAULT_TIMESTAMP_ANOMALY_THRESHOLD_MS,
         }
     }
 }
@@ -522,24 +534,70 @@ mod tests {
     }
 
     #[test]
-    fn is_timestamp_anomaly_detects_regression_only() {
-        assert!(!is_timestamp_anomaly(0, 5000));
-        assert!(!is_timestamp_anomaly(1000, 1200));
-        // 大幅回退仍切段
-        assert!(is_timestamp_anomaly(3000, 1000));
-        // 用户日志中的 ~9s 回退
-        assert!(is_timestamp_anomaly(4_005_589, 3_996_599));
-        // 小幅回退（音视频交错抖动）不切段：17ms / 499ms
-        assert!(!is_timestamp_anomaly(1_490_668, 1_490_651));
-        assert!(!is_timestamp_anomaly(1000, 501));
-        // 恰好达到回退容差视为异常
-        assert!(is_timestamp_anomaly(1000, 500));
-        // 前跳不切段（改由 absorb 压平）
-        assert!(!is_timestamp_anomaly(1000, 4000));
-        assert!(!is_timestamp_anomaly(1000, 2999));
-        assert!(!is_timestamp_anomaly(1000, 3000));
-        assert!(!is_timestamp_anomaly(3_807_016, 3_819_366));
-        assert!(!is_timestamp_anomaly(8_141_000, 8_189_000));
+    fn is_timestamp_anomaly_detects_regression_with_threshold() {
+        let default_threshold = DEFAULT_TIMESTAMP_ANOMALY_THRESHOLD_MS;
+        assert!(!is_timestamp_anomaly(0, 5000, default_threshold));
+        assert!(!is_timestamp_anomaly(1000, 1200, default_threshold));
+        // 阈值为 0 时禁用切分
+        assert!(!is_timestamp_anomaly(10000, 1000, 0));
+        assert!(!is_timestamp_anomaly(4_005_589, 3_996_599, 0));
+
+        // 默认 5000ms：未达 5000ms 的回退不切段（改由 clamp 压平）
+        assert!(!is_timestamp_anomaly(10_000, 9000, default_threshold)); // 回退 1s
+        assert!(!is_timestamp_anomaly(10_000, 5001, default_threshold)); // 回退 4999ms
+        assert!(is_timestamp_anomaly(10_000, 5000, default_threshold)); // 恰好回退 5000ms
+        assert!(is_timestamp_anomaly(10_000, 1000, default_threshold)); // 回退 9s
+        assert!(is_timestamp_anomaly(4_005_589, 3_996_599, default_threshold)); // 用户日志中的 ~9s 回退
+
+        // 自定义阈值（如 500ms）
+        assert!(!is_timestamp_anomaly(1000, 501, 500));
+        assert!(is_timestamp_anomaly(1000, 500, 500));
+
+        // 前跳不在此判定为回退异常
+        assert!(!is_timestamp_anomaly(1000, 4000, default_threshold));
+        assert!(!is_timestamp_anomaly(3_807_016, 3_819_366, default_threshold));
+    }
+
+    #[test]
+    fn clamp_regression_monotonic_preserves_order_and_relative_av_diff() {
+        let mut regression_offset = 0u32;
+        let mut last_output = None;
+
+        // 1. 视频帧 1 (1000ms)
+        let v1 = clamp_regression_monotonic(1000, &mut regression_offset, &mut last_output);
+        assert_eq!(v1, 1000);
+        assert_eq!(last_output, Some(1000));
+        assert_eq!(regression_offset, 0);
+
+        // 2. 音频帧 1 (1020ms, 比视频快 20ms)
+        let a1 = clamp_regression_monotonic(1020, &mut regression_offset, &mut last_output);
+        assert_eq!(a1, 1020);
+        assert_eq!(last_output, Some(1020));
+        assert_eq!(regression_offset, 0);
+
+        // 3. 网络抖动/重连，时间戳回退到 800ms！
+        // 视频帧 2 (800ms，回退了 200ms)
+        let v2 = clamp_regression_monotonic(800, &mut regression_offset, &mut last_output);
+        // 必须严格单调递增：上一个输出是 1020，v2 钳位推进到 1021
+        assert_eq!(v2, 1021);
+        assert_eq!(last_output, Some(1021));
+        // offset 增加了 (1020 - 800) + 1 = 221
+        assert_eq!(regression_offset, 221);
+
+        // 4. 音频帧 2 (820ms，原本音频仍然比视频快 20ms)
+        let a2 = clamp_regression_monotonic(820, &mut regression_offset, &mut last_output);
+        // 820 + 221 = 1041
+        assert_eq!(a2, 1041);
+        assert_eq!(last_output, Some(1041));
+        // 检查音视频相对差：1041 - 1021 = 20ms！完美的相对音画同步对齐！
+        assert_eq!(a2 - v2, 20);
+
+        // 5. 随后的普通前进帧 (850ms)
+        let v3 = clamp_regression_monotonic(850, &mut regression_offset, &mut last_output);
+        // 850 + 221 = 1071
+        assert_eq!(v3, 1071);
+        assert_eq!(last_output, Some(1071));
+        assert!(v3 > a2);
     }
 
     #[test]

@@ -108,4 +108,49 @@ mod tests {
             "migration must not pick an administrator implicitly"
         );
     }
+
+    #[tokio::test]
+    async fn migrates_legacy_split_on_timestamp_anomaly_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("data.sqlite3");
+        let pool = ConnectionManager::new_pool(db.to_str().unwrap())
+            .await
+            .unwrap();
+
+        // 插入旧格式配置
+        sqlx::query("INSERT INTO configuration (key, value) VALUES ('config', '{\"split_on_timestamp_anomaly\": true, \"filtering_threshold\": 30}')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO livestreamers (url, remark, override) VALUES ('https://live.douyin.com/123', 'test', '{\"split_on_timestamp_anomaly\": false}')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // 模拟升级场景：回退并重新运行 migration 5
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 5")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        // 验证 configuration
+        let cfg_val: String = sqlx::query_scalar("SELECT value FROM configuration WHERE key = 'config'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let cfg_json: serde_json::Value = serde_json::from_str(&cfg_val).unwrap();
+        assert!(cfg_json.get("split_on_timestamp_anomaly").is_none());
+        assert_eq!(cfg_json.get("timestamp_anomaly_threshold_ms").unwrap(), 5000);
+        assert_eq!(cfg_json.get("filtering_threshold").unwrap(), 30);
+
+        // 验证 livestreamers override
+        let ov_val: String = sqlx::query_scalar("SELECT override FROM livestreamers WHERE url = 'https://live.douyin.com/123'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let ov_json: serde_json::Value = serde_json::from_str(&ov_val).unwrap();
+        assert!(ov_json.get("split_on_timestamp_anomaly").is_none());
+        assert_eq!(ov_json.get("timestamp_anomaly_threshold_ms").unwrap(), 0);
+    }
 }

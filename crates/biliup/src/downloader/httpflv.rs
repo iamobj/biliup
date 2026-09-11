@@ -4,8 +4,8 @@ use crate::downloader::flv_parser::{
 };
 use crate::downloader::flv_writer::{FlvFile, FlvTag, TagDataHeader};
 use crate::downloader::util::{
-    LifecycleFile, Segmentable, absorb_forward_timestamp_jump_with_max, is_timestamp_anomaly,
-    retimestamp_tag_header,
+    LifecycleFile, Segmentable, absorb_forward_timestamp_jump_with_max, clamp_regression_monotonic,
+    is_timestamp_anomaly, retimestamp_tag_header,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use nom::{Err, IResult};
@@ -68,6 +68,8 @@ async fn parse_flv_with_boundaries(
     let mut prev_audio_timestamp: Option<u32> = None;
     let mut stream_max_ms: Option<u32> = None;
     let mut output_timestamp_base = None::<u32>;
+    let mut regression_offset: u32 = 0;
+    let mut last_output_ms = None::<u32>;
     let mut current_file_started = false;
     let mut create_new = false;
     loop {
@@ -197,18 +199,16 @@ async fn parse_flv_with_boundaries(
                         None
                     };
 
+                    let threshold_ms = segment.timestamp_anomaly_threshold_ms();
                     let is_anomaly = if is_media_for_ts {
                         track_prev
-                            .map(|prev| is_timestamp_anomaly(prev, tag_header.timestamp))
+                            .map(|prev| is_timestamp_anomaly(prev, tag_header.timestamp, threshold_ms))
                             .unwrap_or(false)
                     } else {
                         false
                     };
 
-                    if !discard_rest_of_cache
-                        && is_anomaly
-                        && segment.split_on_timestamp_anomaly()
-                    {
+                    if !discard_rest_of_cache && is_anomaly {
                         warn!(
                             "关键帧刷新前检测到{:?}时间戳异常，准备切分文件 previous={:?} current={} delta_ms={}",
                             tag_header.tag_type,
@@ -223,7 +223,7 @@ async fn parse_flv_with_boundaries(
                         && track_prev.is_some_and(|prev| tag_header.timestamp < prev)
                     {
                         warn!(
-                            "输出流 {:?} DTS 非单调 previous={:?} current={} delta_ms={}",
+                            "输出流 {:?} DTS 非单调（将自动钳位平滑写入） previous={:?} current={} delta_ms={}",
                             tag_header.tag_type,
                             track_prev,
                             tag_header.timestamp,
@@ -245,6 +245,8 @@ async fn parse_flv_with_boundaries(
                         is_media_for_ts,
                         &mut output_timestamp_base,
                         &mut stream_max_ms,
+                        &mut regression_offset,
+                        &mut last_output_ms,
                     );
                     out.write_tag(&output_header, &flv_tag_data, &previous_tag_size_bytes)?;
                     segment.increase_size((11 + tag_header.data_size + 4) as u64);
@@ -265,10 +267,10 @@ async fn parse_flv_with_boundaries(
                 }
 
                 // 当前关键帧本身也参与检测；它一定是媒体帧。
-                let keyframe_anomaly = segment.split_on_timestamp_anomaly()
-                    && prev_video_timestamp
-                        .map(|prev| is_timestamp_anomaly(prev, flv_tag.header.timestamp))
-                        .unwrap_or(false);
+                let threshold_ms = segment.timestamp_anomaly_threshold_ms();
+                let keyframe_anomaly = prev_video_timestamp
+                    .map(|prev| is_timestamp_anomaly(prev, flv_tag.header.timestamp, threshold_ms))
+                    .unwrap_or(false);
                 if keyframe_anomaly {
                     warn!(
                         "关键帧处检测到时间戳异常，准备切分文件 previous={:?} current={} delta_ms={}",
@@ -277,10 +279,8 @@ async fn parse_flv_with_boundaries(
                         flv_tag.header.timestamp as i64 - prev_video_timestamp.unwrap_or(0) as i64
                     );
                     create_new = true;
-                } else if segment.split_on_timestamp_anomaly()
-                    && prev_video_timestamp.is_some_and(|prev| flv_tag.header.timestamp < prev)
-                {
-                    // 小幅回退：保留在当前文件，避免直播抖动导致碎切
+                } else if prev_video_timestamp.is_some_and(|prev| flv_tag.header.timestamp < prev) {
+                    // 小幅回退：保留在当前文件，避免直播抖动导致碎切（由单调钳位平滑写入）
                     warn!(
                         "关键帧处 DTS 小幅回退，忽略切分 previous={:?} current={} delta_ms={}",
                         prev_video_timestamp,
@@ -307,6 +307,8 @@ async fn parse_flv_with_boundaries(
                     prev_audio_timestamp = None;
                     stream_max_ms = None;
                     output_timestamp_base = None;
+                    regression_offset = 0;
+                    last_output_ms = None;
                     current_file_started = false;
 
                     // 开启新分段时补齐已捕获的头部标签。这些头部并非所有直播流都具备
@@ -362,6 +364,8 @@ async fn parse_flv_with_boundaries(
                             is_media,
                             &mut output_timestamp_base,
                             &mut stream_max_ms,
+                            &mut regression_offset,
+                            &mut last_output_ms,
                         );
                         out.write_tag(&output_header, &cached_data, &cached_previous_size)?;
                         segment.increase_size((11 + cached_header.data_size + 4) as u64);
@@ -379,6 +383,8 @@ async fn parse_flv_with_boundaries(
                         true,
                         &mut output_timestamp_base,
                         &mut stream_max_ms,
+                        &mut regression_offset,
+                        &mut last_output_ms,
                     );
                     out.write_tag(&output_header, &bytes, &previous_tag_size)?;
                     segment.increase_size((11 + tag_header.data_size + 4) as u64);
@@ -403,6 +409,8 @@ async fn parse_flv_with_boundaries(
             is_media,
             &mut output_timestamp_base,
             &mut stream_max_ms,
+            &mut regression_offset,
+            &mut last_output_ms,
         );
         out.write_tag(&output_header, &flv_tag_data, &previous_tag_size_bytes)?;
     }
@@ -424,12 +432,14 @@ fn rebase_media_timestamp(
     retimestamp_tag_header(header, header.timestamp.saturating_sub(base))
 }
 
-/// 写入前：先按 source 前跳压平 base，再 rebase 到段内时间轴。
+/// 写入前：先按 source 前跳压平 base，再 rebase 到段内时间轴，并对容差内回退做单调钳位平滑。
 fn rebase_media_timestamp_for_write(
     header: &TagHeader,
     is_media: bool,
     output_timestamp_base: &mut Option<u32>,
     stream_max_ms: &mut Option<u32>,
+    regression_offset: &mut u32,
+    last_output_ms: &mut Option<u32>,
 ) -> TagHeader {
     if is_media {
         if let Some(absorbed) = absorb_forward_timestamp_jump_with_max(
@@ -443,7 +453,26 @@ fn rebase_media_timestamp_for_write(
             );
         }
     }
-    rebase_media_timestamp(header, is_media, output_timestamp_base)
+    let mut out_header = rebase_media_timestamp(header, is_media, output_timestamp_base);
+    if is_media {
+        let prev_offset = *regression_offset;
+        out_header.timestamp = clamp_regression_monotonic(
+            out_header.timestamp,
+            regression_offset,
+            last_output_ms,
+        );
+        if *regression_offset > prev_offset {
+            let gap = *regression_offset - prev_offset;
+            warn!(
+                "输出时间戳已单调钳位平滑 tag_type={:?} raw_timestamp={} output_timestamp={} clamped_gap_ms={gap} total_offset_ms={}",
+                header.tag_type,
+                header.timestamp,
+                out_header.timestamp,
+                *regression_offset,
+            );
+        }
+    }
+    out_header
 }
 
 fn is_media_timestamp_tag(tag_header: &TagHeader, body: &Bytes) -> bool {
@@ -608,12 +637,29 @@ mod tests {
         };
         let mut base = Some(0u32);
         let mut stream_max_ms = None;
+        let mut regression_offset = 0u32;
+        let mut last_output_ms = None;
         // 先写入 prev 对应的输出点
         assert_eq!(
-            rebase_media_timestamp_for_write(&prev, true, &mut base, &mut stream_max_ms).timestamp,
+            rebase_media_timestamp_for_write(
+                &prev,
+                true,
+                &mut base,
+                &mut stream_max_ms,
+                &mut regression_offset,
+                &mut last_output_ms,
+            )
+            .timestamp,
             8_141_000
         );
-        let out = rebase_media_timestamp_for_write(&jumped, true, &mut base, &mut stream_max_ms);
+        let out = rebase_media_timestamp_for_write(
+            &jumped,
+            true,
+            &mut base,
+            &mut stream_max_ms,
+            &mut regression_offset,
+            &mut last_output_ms,
+        );
         // 48s 空洞被吸收，仅保留 1ms 递增
         assert_eq!(out.timestamp, 8_141_001);
 
@@ -624,8 +670,32 @@ mod tests {
             timestamp: 8_189_020,
             stream_id: 0,
         };
-        let audio_out = rebase_media_timestamp_for_write(&audio_jumped, true, &mut base, &mut stream_max_ms);
+        let audio_out = rebase_media_timestamp_for_write(
+            &audio_jumped,
+            true,
+            &mut base,
+            &mut stream_max_ms,
+            &mut regression_offset,
+            &mut last_output_ms,
+        );
         assert_eq!(audio_out.timestamp, 8_141_021);
+
+        // 随后发生小幅回退（例如回退到 8_188_500ms），输出依然必须严格单调递增
+        let audio_regressed = TagHeader {
+            tag_type: TagType::Audio,
+            data_size: 10,
+            timestamp: 8_188_500,
+            stream_id: 0,
+        };
+        let audio_clamped = rebase_media_timestamp_for_write(
+            &audio_regressed,
+            true,
+            &mut base,
+            &mut stream_max_ms,
+            &mut regression_offset,
+            &mut last_output_ms,
+        );
+        assert!(audio_clamped.timestamp > audio_out.timestamp);
     }
 
     #[test]

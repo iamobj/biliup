@@ -159,16 +159,19 @@ const Global: React.FC = () => {
           stopValidateWithError={true}
         />
 
-        <Form.Switch
-          field="split_on_timestamp_anomaly"
+        <Form.InputNumber
+          field="timestamp_anomaly_threshold_ms"
+          initValue={5000}
+          min={0}
+          suffix="ms"
           extraText={
             <div style={{ fontSize: '14px' }}>
-              检测到直播流时间戳回退/非单调时自动切分文件；前跳 ≥ 1 秒会压平时间轴（不切段），避免 B 站“时间戳跳变”拒稿。
+              检测到直播流同轨时间戳回退达到或超过该阈值时自动切分文件，单位毫秒。设为 0 时禁用切分；阈值内小回退自动单调钳位平滑，前跳自动压平时间轴，避免 B 站“时间戳跳变”拒稿。
               <br />
-              默认开启；适用于 ffmpeg / stream-gears。
+              默认 5000 ms；适用于 stream-gears / ffmpeg。
             </div>
           }
-          label="时间戳异常自动切文件（split_on_timestamp_anomaly）"
+          label="时间戳异常切文件阈值（timestamp_anomaly_threshold_ms）"
           fieldStyle={{
             alignSelf: 'stretch',
             padding: 0,

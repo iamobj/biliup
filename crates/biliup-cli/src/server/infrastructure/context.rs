@@ -124,7 +124,7 @@ impl Context {
             segment_time: config.segment_time,
             time_range: self.live_streamer().time_range.clone(),
             file_size: config.file_size,
-            split_on_timestamp_anomaly: config.split_on_timestamp_anomaly.unwrap_or(true),
+            timestamp_anomaly_threshold_ms: config.timestamp_anomaly_threshold_ms.unwrap_or(5000),
             headers: stream.stream_headers.clone(),
             recorder: self.recorder(stream_info),
             // output_dir: PathBuf::from("./downloads")
