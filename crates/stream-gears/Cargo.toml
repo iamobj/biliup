@@ -25,7 +25,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tracing-appender = { workspace = true }
 biliup = { path = "../biliup"}
-biliup-cli = { path = "../biliup-cli", features = ["python-bridge"] }
+biliup-cli = { path = "../biliup-cli" }
 time = { workspace = true }
 bon = { workspace = true }
 error-stack = { workspace = true }

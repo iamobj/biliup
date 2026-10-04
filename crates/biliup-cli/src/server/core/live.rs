@@ -1,7 +1,5 @@
 use crate::server::common::util::danmaku_filename_template;
 use crate::server::config::Config;
-#[cfg(feature = "python-bridge")]
-use crate::server::core::downloader::PythonDanmakuClient;
 use crate::server::core::downloader::streamlink::{Platform, Streamlink, StreamlinkDownloader};
 use crate::server::core::downloader::ytdlp::{
     Backend as RuntimeYtDlpBackend, DownloadConfig as YtDlpConfig,
@@ -309,16 +307,6 @@ pub fn danmaku_client(
     let source = source?;
     let output_file = PathBuf::from(danmaku_filename_template(filename_prefix, name));
 
-    #[cfg(feature = "python-bridge")]
-    if source.platform == "douyin" {
-        return Some(Arc::new(PythonDanmakuClient::new(
-            source.url.clone(),
-            output_file,
-            source.room_id.clone(),
-            source.cookie.clone(),
-            source.extra.clone(),
-        )));
-    }
 
     let mut context = PlatformContext::new();
     if let Some(room_id) = &source.room_id {

@@ -85,7 +85,6 @@ sysinfo = { version = "0.39", default-features = false, features = ["network", "
 struct-patch = "0.10.4"
 shellexpand = "3.1"
 dirs = "6.0"
-pyo3 = { version = "0.27.1", features = ["abi3-py38"], optional = true }
 
 # Fleet：节点与控制面之间的 iroh QUIC 连接、join 票据与控制面内嵌的 relay，见 server/fleet/。
 # 关掉默认 feature 以去掉 UPnP / NAT-PMP 端口映射与 metrics；TLS 用 biliup 已有的 ring
@@ -102,6 +101,3 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 [dev-dependencies]
 m3u8-rs = "6"
 
-[features]
-default = ["python-bridge"]
-python-bridge = ["dep:pyo3"]

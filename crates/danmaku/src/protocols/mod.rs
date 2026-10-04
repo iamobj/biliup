@@ -292,7 +292,7 @@ pub fn create_platform(url: &str) -> Result<Box<dyn Platform>> {
         return Ok(Box::new(huya::Huya::new()));
     }
 
-    if url.contains("live.douyin.com") {
+    if url.contains("douyin.com") {
         return Ok(Box::new(douyin::Douyin::new()));
     }
 
@@ -301,4 +301,25 @@ pub fn create_platform(url: &str) -> Result<Box<dyn Platform>> {
     }
 
     Err(DanmakuError::UnsupportedPlatform(url.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_platform_douyin() {
+        assert_eq!(
+            create_platform("https://live.douyin.com/123456")
+                .unwrap()
+                .name(),
+            "Douyin"
+        );
+        assert_eq!(
+            create_platform("https://v.douyin.com/iLrqwer/")
+                .unwrap()
+                .name(),
+            "Douyin"
+        );
+    }
 }

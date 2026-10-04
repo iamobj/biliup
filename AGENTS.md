@@ -121,15 +121,11 @@
     因此 `/v1/configuration` 返回值与空间配置 Switch 显示为开。
   - 显式 `false` 始终保留；稀疏主播 override / `ConfigPatch` 不走此归一，
     未覆写仍继承全局。
-- 抖音弹幕默认使用基于 `v1.0.7` 恢复的 Python 链路，而不是
-  `crates/danmaku/src/protocols/douyin.rs` 中的 Rust 协议实现。
-  - Rust 下载流程通过 `python-bridge` 和 PyO3 创建
-    `biliup.Danmaku.DanmakuClient`，其他平台仍使用 Rust 弹幕客户端。
-  - Python 链路保留 `aiohttp`、完整 protobuf 描述和 `webmssdk.js` 签名。
-  - 当前直播插件负责解析单场 `room_id`、获取 Cookie/`ttwid` 并传递统一的
-    User-Agent；Python 客户端负责 WebSocket、ACK、解码和 XML 写入。
-  - Python writer 已适配本分支的 rolling 返回值、目标 XML 不覆盖和下播尾部
-    XML 丢弃语义，不要直接用上游旧文件覆盖这些适配。
+- 抖音弹幕采用上游 v1.2.11 的纯 Rust 协议实现（`crates/danmaku/src/protocols/douyin.rs`）：
+  - 不保留任何 Python 弹幕逻辑，`biliup-cli` 恢复为纯 Rust 构建，无需 Python 运行时及相关依赖。
+  - 抖音弹幕统一走 `RustDanmakuClient`，与其它平台共用本分支的 Start/End 边界同步（`start_segment` / `end_segment`），
+    确保分段与弹幕 XML 严格对齐、丢弃空洞。
+  - `crates/danmaku` 平台识别优化为匹配 `douyin.com`，兼容短链接。
 
 这些调整主要面向只录制、不投稿，或需要用 Hook 接管分段后处理的场景。
 
@@ -160,18 +156,8 @@
   - `crates/biliup-cli/src/server/infrastructure/context.rs`
   - `crates/biliup-cli/src/server/config.rs`
   - `crates/biliup-cli/src/server/api/endpoints.rs`
-- 上游如改动任何抖音弹幕相关逻辑，包括 Rust/Python 协议、签名算法、WebSocket
-  参数或节点、Cookie/UA/room_id 传递、protobuf/ACK、重连、XML rolling、依赖或
-  打包配置，不得直接采用上游版本，也不得静默保留本分支版本。
-  - 先对比上游实现与本分支 Python 链路的完整差异和行为影响。
-  - 明确列出“保留 Python 实现”“采用上游实现”“选择性合并”三个方向及风险。
-  - 在解决冲突或修改实现前询问用户，由用户决定采用哪个方向。
-  - 重点检查：
-    `biliup/Danmaku/`、`crates/biliup/src/downloader/live/douyin.rs`、
-    `crates/biliup-cli/src/server/core/live.rs`、
-    `crates/biliup-cli/src/server/core/downloader.rs`、
-    `crates/danmaku/src/protocols/douyin.rs`、`pyproject.toml` 和
-    `crates/stream-gears/Cargo.toml`。
+- 上游如改动抖音弹幕相关逻辑（`crates/danmaku/src/protocols/douyin.rs` 等）：
+  - 本分支已完全切换为上游纯 Rust 弹幕实现，同步时仅需核对是否与本分支 Start/End 边界生命周期对齐，以及保持 `douyin.com` 域名匹配兼容性。
 - 上游如改动抖音画质配置、直播流选择或抖音配置 UI，需保留
   `douyin_prefer_uhd` 的兼容行为：开启时按 `uhd -> origin` 优先，均不可用时才执行
   原有 `douyin_quality` 回退；按当前协议检查有效地址；`douyin_true_origin` 优先；并保留

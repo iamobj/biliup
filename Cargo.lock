@@ -634,7 +634,6 @@ dependencies = [
  "ormlite",
  "password-auth",
  "pipeline-common",
- "pyo3",
  "qrcode",
  "quick-xml 0.37.5",
  "rand 0.8.6",
