@@ -24,6 +24,7 @@ import {
   type OverrideRecord,
 } from '@/app/lib/override-config'
 import OverrideSwitch, { IsOverrideFormContext } from '@/app/ui/components/OverrideSwitch'
+import { FileSizeField } from './FileSizeInput'
 
 type PluginProps = {
   entity?: LiveStreamerEntity
@@ -40,8 +41,14 @@ type TemplateModalProps = {
 
 type LastEdited = 'form' | 'json'
 
+type PlatformPattern = keyof typeof SupportedPlatforms
+
+/** 按直播间地址找到对应平台插件在 SupportedPlatforms 里的键;没匹配到返回 undefined */
+const matchPlatformPattern = (url?: string): PlatformPattern | undefined =>
+  (Object.keys(SupportedPlatforms) as PlatformPattern[]).find(pattern => url?.match(new RegExp(pattern)))
+
 const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk }) => {
-  const api = useRef<FormApi>()
+  const api = useRef<FormApi>(undefined)
   const lastEditedRef = useRef<LastEdited>('form')
   const overrideRef = useRef<OverrideRecord>({})
   const syncingRef = useRef(false)
@@ -69,13 +76,8 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
   )
 
   const platformPlugin = useMemo(() => {
-    if (!entity?.url) return null
-    for (const [pattern, Plugin] of Object.entries(SupportedPlatforms)) {
-      if (entity.url.match(new RegExp(pattern))) {
-        return Plugin as React.ComponentType<PluginProps>
-      }
-    }
-    return null
+    const pattern = matchPlatformPattern(entity?.url)
+    return pattern ? (SupportedPlatforms[pattern] as React.ComponentType<PluginProps>) : null
   }, [entity?.url])
 
   const showDialog = () => {
@@ -174,7 +176,7 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
   }
 
   const childrenWithProps = React.Children.map(children, child => {
-    if (React.isValidElement<any>(child)) {
+    if (React.isValidElement<{ onClick?: () => void }>(child)) {
       return React.cloneElement(child, {
         onClick: () => {
           showDialog()
@@ -196,7 +198,7 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
       <Form.Select
         label="下载插件（downloader）"
         field="downloader"
-        placeholder="stream-gears（默认）"
+        placeholder="mesio（默认）"
         style={{ width: '100%' }}
         fieldStyle={{
           alignSelf: 'stretch',
@@ -206,21 +208,19 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
       >
         <Select.Option value="streamlink">streamlink（hls多线程下载）</Select.Option>
         <Select.Option value="ffmpeg">ffmpeg</Select.Option>
-        <Select.Option value="stream-gears">stream-gears（默认）</Select.Option>
+        <Select.Option value="stream-gears">stream-gears</Select.Option>
         <Select.Option value="sync-downloader">sync-downloader（边录边传）</Select.Option>
+        <Select.Option value="mesio">mesio（默认）</Select.Option>
       </Form.Select>
 
-      <Form.InputNumber
+      <FileSizeField
         label="视频分段大小（file_size）"
         field="file_size"
-        placeholder=""
-        suffix={'Byte'}
-        style={{ width: '100%' }}
+        extraText="按 1024 进制：1 GB = 1024 MB。没填过的留空即跟随全局设置；把已有的值清空，则这个主播不按大小分段（边录边传仍约 2 GB 一段）。"
         fieldStyle={{
           alignSelf: 'stretch',
           padding: 0,
         }}
-        showClear={true}
       />
 
       <Form.Input

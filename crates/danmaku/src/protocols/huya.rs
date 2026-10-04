@@ -294,6 +294,8 @@ impl Platform for Huya {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::tars::{TarsInputStream, TarsOutputStream};
+    use crate::message::DanmakuEvent;
 
     const PYTHON_WS_USER_INFO: &str = "0130391c260036004c5c6130397003";
     const PYTHON_REGISTER_PACKET: &str = "00011d00000f0130391c260036004c5c6130397003";

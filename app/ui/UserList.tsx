@@ -22,7 +22,8 @@ import { FormApi } from '@douyinfe/semi-ui/lib/es/form'
 import useSWRMutation from 'swr/mutation'
 import { useBiliUsers } from '../lib/use-streamers'
 import QRcode from '@/app/ui/QRcode'
-import { useWindowSize } from 'react-use';
+import { useWindowWidth } from '../lib/useIsMobile';
+import PairAccountsHint from './PairAccountsHint'
 
 type UserListProps = {
   onCancel?: (e: React.MouseEvent<Element, MouseEvent> | React.KeyboardEvent<Element>) => void
@@ -35,7 +36,7 @@ const UserList: React.FC<UserListProps> = ({ onCancel, visible }) => {
   const { biliUsers: list } = useBiliUsers()
   const [modalVisible, setVisible] = useState(false)
   const [confirmLoading, setConfirmLoading] = useState(false)
-  const { width } = useWindowSize()
+  const width = useWindowWidth()
   const showDialog = () => {
     setVisible(true)
   }
@@ -74,10 +75,9 @@ const UserList: React.FC<UserListProps> = ({ onCancel, visible }) => {
   }
   const handleCancel = () => {
     setVisible(false)
-    console.log('Cancel button clicked')
   }
   const handleAfterClose = () => {
-    console.log('After Close callback executed')
+    // noop
   }
   const updateList = async (id: number) => {
     try {
@@ -93,7 +93,7 @@ const UserList: React.FC<UserListProps> = ({ onCancel, visible }) => {
       })
     }
   }
-  const api = useRef<FormApi>()
+  const api = useRef<FormApi>(undefined)
   const [value, setValue] = useState()
   const [panel, setPanel] = useState(<></>)
   const onChange = (e: any) => {
@@ -117,7 +117,7 @@ const UserList: React.FC<UserListProps> = ({ onCancel, visible }) => {
   }
   return (
     <SideSheet
-      title={<Typography.Title heading={4}>用户管理</Typography.Title>}
+      title={<Typography.Title heading={4}>B 站账号</Typography.Title>}
       visible={visible}
       width={Math.min(448, width ?? Number.MIN_VALUE)}
       footer={
@@ -125,7 +125,7 @@ const UserList: React.FC<UserListProps> = ({ onCancel, visible }) => {
           <Button
             onClick={showDialog}
             icon={<IconPlusCircle size="large" />}
-            style={{ marginRight: 4, backgroundColor: 'rgba(var(--semi-indigo-0), 1)' }}
+            style={{ marginRight: 4 }}
           >
             新增
           </Button>
@@ -135,6 +135,7 @@ const UserList: React.FC<UserListProps> = ({ onCancel, visible }) => {
       bodyStyle={{ borderBottom: '1px solid var(--semi-color-border)' }}
       onCancel={onCancel}
     >
+      <PairAccountsHint visible={visible} />
       <List
         className="component-list-demo-booklist"
         dataSource={list}

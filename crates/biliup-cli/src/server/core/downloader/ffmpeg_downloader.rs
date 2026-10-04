@@ -1,9 +1,12 @@
+use crate::server::common::throughput::SubprocessProgress;
+use crate::server::common::util::redact_process_debug;
 use crate::server::core::downloader;
 use crate::server::core::downloader::{
     DownloadConfig, DownloadStatus, DownloaderType, SegmentEvent, SegmentInfo,
 };
 use crate::server::errors::{AppError, AppResult};
-use biliup::downloader::util::TIMESTAMP_ANOMALY_COOLDOWN;
+use crate::tools;
+use biliup::downloader::util::{ByteCounter, TIMESTAMP_ANOMALY_COOLDOWN};
 use error_stack::{ResultExt, bail};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -11,9 +14,8 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// FFmpeg下载器实现
 /// 使用FFmpeg进行直播流下载，支持内部和外部分段
@@ -99,13 +101,6 @@ impl FfmpegDownloader {
             "quiet"
         };
         args.extend(["-loglevel".to_string(), loglevel.to_string()]);
-        args.extend([
-            "-progress".to_string(),
-            "pipe:1".to_string(),
-            "-stats_period".to_string(),
-            "0.25".to_string(),
-            "-nostats".to_string(),
-        ]);
 
         self.append_common_input_args(&mut args, download_config);
 
@@ -130,6 +125,20 @@ impl FfmpegDownloader {
     fn append_common_input_args(&self, args: &mut Vec<String>, download_config: &DownloadConfig) {
         args.push("-y".to_string());
 
+        // -progress pipe:2: 把 key=value 形式的进度（含累计写出字节 total_size）打到 stderr，
+        // 由 spawn_log 解析出写盘速率；不受 -loglevel 影响。
+        // -nostats: 关掉同样写 stderr、以 \r 刷新的单行统计，避免与进度行混在一起
+        args.extend([
+            "-progress".to_string(),
+            "pipe:2".to_string(),
+            "-stats_period".to_string(),
+            "0.25".to_string(),
+            "-nostats".to_string(),
+        ]);
+
+        // HTTP headers
+        // -headers: 设置HTTP请求头，格式为"Key: Value\r\n"
+        // 用于传递User-Agent、Cookie等信息
         if !download_config.headers.is_empty() {
             let headers_str = download_config
                 .headers
@@ -194,8 +203,7 @@ impl FfmpegDownloader {
         let args = self.build_ffmpeg_args_external_segment(&download_config);
         let output_file = download_config.generate_output_filename(&download_config.suffix);
         let part_file = format!("{}.part", output_file.display());
-
-        let mut cmd = Command::new("ffmpeg");
+        let mut cmd = tools::ffmpeg_command();
         cmd.args(&args)
             .arg(&part_file)
             .stdin(Stdio::null())
@@ -210,6 +218,7 @@ impl FfmpegDownloader {
             child,
             Arc::clone(&self.process_handle),
             download_config.timestamp_anomaly_threshold_ms,
+            download_config.bytes_written.clone(),
             |event| match event {
                 FfmpegProcessEvent::Started => {
                     if !segment_started {
@@ -272,6 +281,8 @@ impl FfmpegDownloader {
                     danmaku_file_path: None,
                     segment_index: 0,
                     next_file_path: None,
+                    duration_secs: None,
+                    size_bytes: None,
                 }));
             }
         }
@@ -279,7 +290,6 @@ impl FfmpegDownloader {
         if anomaly {
             return Ok(DownloadStatus::SegmentCompleted);
         }
-
         match status.code() {
             Some(0) => Ok(DownloadStatus::SegmentCompleted),
             Some(255) => Ok(DownloadStatus::StreamEnded),
@@ -299,7 +309,7 @@ impl FfmpegDownloader {
             download_config.suffix
         );
 
-        let mut cmd = Command::new("ffmpeg");
+        let mut cmd = tools::ffmpeg_command();
         cmd.args(&args)
             .arg(&output_pattern)
             .stdin(Stdio::null())
@@ -307,7 +317,7 @@ impl FfmpegDownloader {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        info!("FFmpeg cmd: {:?}", cmd);
+        info!("FFmpeg cmd: {}", redact_process_debug(&cmd));
         let mut child = cmd.spawn().change_context(AppError::Unknown)?;
 
         let stdout = child
@@ -337,6 +347,7 @@ impl FfmpegDownloader {
         let mut ended_paths = HashSet::<PathBuf>::new();
         let mut segment_index = 0;
         let mut finalized = HashSet::<PathBuf>::new();
+        let mut progress = SubprocessProgress::default();
 
         while stdout_open || stderr_open {
             tokio::select! {
@@ -376,6 +387,10 @@ impl FfmpegDownloader {
                 line = stderr_lines.next_line(), if stderr_open => {
                     match line.change_context(AppError::Unknown)? {
                         Some(line) => {
+                            if progress.observe_ffmpeg(&line, &download_config.bytes_written) {
+                                debug!("[ffmpeg] {line}");
+                                continue;
+                            }
                             info!("[ffmpeg] {line}");
                             if let Some(part_path) = parse_ffmpeg_opening_path(&line) {
                                 let final_path = strip_part_suffix(&part_path);
@@ -529,6 +544,8 @@ where
             danmaku_file_path: None,
             next_file_path: None,
             segment_index: *segment_index,
+            duration_secs: None,
+            size_bytes: None,
         }));
         *segment_index += 1;
     }
@@ -668,6 +685,7 @@ async fn spawn_log<F>(
     mut child: tokio::process::Child,
     process_handle: Arc<RwLock<Option<tokio::process::Child>>>,
     timestamp_anomaly_threshold_ms: u32,
+    bytes_written: ByteCounter,
     mut event_hook: F,
 ) -> AppResult<(ExitStatus, bool)>
 where
@@ -692,6 +710,7 @@ where
     let mut stderr_open = true;
     let mut stdout_lines = BufReader::new(stdout).lines();
     let mut stderr_lines = BufReader::new(stderr).lines();
+    let mut progress = SubprocessProgress::default();
     while stdout_open || stderr_open {
         tokio::select! {
             line = stdout_lines.next_line(), if stdout_open => {
@@ -708,6 +727,14 @@ where
             line = stderr_lines.next_line(), if stderr_open => {
                 match line {
                     Ok(Some(line)) => {
+                        if !progress_started && line.starts_with("progress=") {
+                            progress_started = true;
+                            event_hook(FfmpegProcessEvent::Started);
+                        }
+                        if progress.observe_ffmpeg(&line, &bytes_written) {
+                            debug!("[ffmpeg] {line}");
+                            continue;
+                        }
                         info!("[ffmpeg] {line}");
                         if detector.observe(&line) {
                             warn!("检测到 FFmpeg 时间戳异常，正在优雅结束当前文件以便收尾落盘");
@@ -950,6 +977,21 @@ mod tests {
 
     fn internal() -> FfmpegDownloader {
         FfmpegDownloader::new(Vec::new(), DownloaderType::FfmpegInternal)
+    }
+
+    #[test]
+    fn both_modes_ask_ffmpeg_for_machine_readable_progress_on_stderr() {
+        for args in [
+            external().build_ffmpeg_args_external_segment(&config(None, None)),
+            internal().build_ffmpeg_args_internal_segment(&config(None, None)),
+        ] {
+            assert_eq!(value_of(&args, "-progress"), Some("pipe:2".to_string()));
+            assert!(args.contains(&"-nostats".to_string()));
+            // 全局选项必须在 -i 之前
+            let progress_at = args.iter().position(|a| a == "-progress").unwrap();
+            let input_at = args.iter().position(|a| a == "-i").unwrap();
+            assert!(progress_at < input_at);
+        }
     }
 
     #[test]

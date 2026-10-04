@@ -423,7 +423,10 @@ impl<'a> TarsInputStream<'a> {
                         None
                     }
                 }
-                _ => None,
+                other => {
+                    self.skip_field(other);
+                    None
+                }
             }
         } else {
             None
@@ -472,7 +475,10 @@ impl<'a> TarsInputStream<'a> {
                     }
                     None
                 }
-                _ => None,
+                other => {
+                    self.skip_field(other);
+                    None
+                }
             }
         } else {
             None
@@ -506,6 +512,7 @@ impl<'a> TarsInputStream<'a> {
         }
         if let Some((_, tars_type)) = self.read_head() {
             if tars_type != TarsType::Bytes {
+                self.skip_field(tars_type);
                 return None;
             }
             // Read inner type head (should be int8)

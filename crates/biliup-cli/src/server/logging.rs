@@ -256,8 +256,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("download.log");
         fs::write(&path, b"full!").unwrap();
-        fs::create_dir(path.with_extension("log.2")).unwrap();
-        let mut writer = DownloadLogWriter::new(&path, 5, 2);
+        fs::create_dir(path.with_extension("log.1")).unwrap();
+        let mut writer = DownloadLogWriter::new(&path, 5, 1);
 
         assert!(writer.write_all(b"new").is_err());
         assert_eq!(writer.generation(), 0);

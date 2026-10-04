@@ -1,10 +1,14 @@
 pub mod api;
 pub mod app;
+pub mod auto_clip;
 pub mod common;
 pub mod config;
 pub mod core;
 pub mod errors;
+pub mod fleet;
 pub mod infrastructure;
 pub mod logging;
 mod router;
+pub mod services;
+pub mod workbench;
 // use tokio::sync::mpsc::Receiver;

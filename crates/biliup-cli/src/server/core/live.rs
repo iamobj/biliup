@@ -87,6 +87,8 @@ fn live_options(config: &Config) -> LiveOptions {
                 .unwrap_or_else(|| "hw-h5".to_string()),
             force_hs: config.douyu_force_hs.unwrap_or(false),
             rate: config.douyu_rate.unwrap_or(0),
+            device_id: config.douyu_device_id.clone().unwrap_or_default(),
+            codec: config.douyu_codec.clone().unwrap_or_default(),
             disable_interactive_game: config.douyu_disable_interactive_game.unwrap_or(false),
             danmaku: config.douyu_danmaku.unwrap_or(false),
         },
@@ -177,7 +179,9 @@ pub fn downloader_runtime(
     stream: &LiveStream,
 ) -> DownloaderRuntime {
     let downloader_type = config_type.unwrap_or_else(|| match stream.downloader_hint {
-        DownloaderHint::StreamGears => DownloaderType::StreamGears,
+        // 未配置下载器时用 mesio：写出的 FLV 带 onMetaData.keyframes、每段时间戳从 0 开始，
+        // 能录 HEVC / Enhanced-FLV 与 HLS fMP4。显式配置 stream-gears 的不受影响
+        DownloaderHint::StreamGears => DownloaderType::Mesio,
         DownloaderHint::Ffmpeg => DownloaderType::Ffmpeg,
         DownloaderHint::Streamlink => DownloaderType::Streamlink,
         DownloaderHint::YtDlp => DownloaderType::YtDlp,
@@ -205,20 +209,24 @@ pub fn downloader_runtime(
 }
 
 fn streamlink_runtime(stream: &LiveStream) -> DownloaderRuntime {
-    let (url, platform) = match stream.runtime_options.as_ref() {
+    let (url, platform, from_stream_url) = match stream.runtime_options.as_ref() {
         Some(RuntimeOptions::Streamlink(StreamlinkOptions { url, platform })) => (
             url.clone().unwrap_or_else(|| stream.raw_stream_url.clone()),
             streamlink_platform(platform),
+            false,
         ),
         // yt-dlp 型来源（如 YouTube）交给 streamlink 时，传入网页地址让其自行提取，
         // 而非已解析的 manifest 直链（对齐 youtube.py:96-101）
         Some(RuntimeOptions::YtDlp(options)) if !options.webpage_url.is_empty() => {
-            (options.webpage_url.clone(), Platform::Generic)
+            (options.webpage_url.clone(), Platform::Generic, false)
         }
-        _ => (stream.raw_stream_url.clone(), Platform::Generic),
+        _ => (stream.raw_stream_url.clone(), Platform::Generic, true),
     };
-    let downloader =
+    let mut downloader =
         StreamlinkDownloader::new(url, platform).with_headers(stream.stream_headers.clone());
+    if from_stream_url {
+        downloader = downloader.following_stream_url();
+    }
     DownloaderRuntime::StreamLink(Streamlink::new(downloader))
 }
 
@@ -290,10 +298,13 @@ fn ytdlp_backend(
     }
 }
 
+/// 构造弹幕客户端。`live_tx` 为直播预览的实时弹幕广播：客户端每解出一条就 `send` 一份
+/// （不等待、无订阅者时丢弃），XML 录制不受影响。
 pub fn danmaku_client(
     source: Option<&DanmakuSource>,
     filename_prefix: Option<&str>,
     name: &str,
+    live_tx: Option<tokio::sync::broadcast::Sender<danmaku_client::DanmakuEvent>>,
 ) -> Option<Arc<dyn crate::server::core::downloader::DanmakuClient + Send + Sync>> {
     let source = source?;
     let output_file = PathBuf::from(danmaku_filename_template(filename_prefix, name));
@@ -320,10 +331,60 @@ pub fn danmaku_client(
     context.movie_id = source.movie_id.clone();
     context.password = source.password.clone();
 
-    let config = RecorderConfig::new(source.url.clone(), output_file)
+    let mut config = RecorderConfig::new(source.url.clone(), output_file)
         .with_context(context)
         .with_raw(source.raw)
         .with_detail(source.detail);
+    if let Some(tx) = live_tx {
+        config = config.with_live_tx(tx);
+    }
 
     Some(Arc::new(RustDanmakuClient::new(config)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn stream(hint: DownloaderHint) -> LiveStream {
+        LiveStream {
+            name: "room".into(),
+            url: "https://live.bilibili.com/1".into(),
+            title: "t".into(),
+            date: chrono::Utc::now(),
+            live_cover_url: String::new(),
+            avatar_url: None,
+            raw_stream_url: "https://cdn.example/live.flv".into(),
+            platform: "bilibili".into(),
+            stream_headers: HashMap::new(),
+            suffix: "flv".into(),
+            danmaku: None,
+            downloader_hint: hint,
+            runtime_options: None,
+        }
+    }
+
+    #[test]
+    fn unconfigured_rooms_default_to_mesio() {
+        let runtime = downloader_runtime(None, &stream(DownloaderHint::StreamGears));
+        assert!(matches!(runtime, DownloaderRuntime::Mesio(_)));
+    }
+
+    #[test]
+    fn an_explicit_stream_gears_choice_is_kept() {
+        let runtime = downloader_runtime(
+            Some(DownloaderType::StreamGears),
+            &stream(DownloaderHint::StreamGears),
+        );
+        assert!(matches!(runtime, DownloaderRuntime::StreamGears(_)));
+    }
+
+    #[test]
+    fn plugin_hints_for_external_tools_are_unchanged() {
+        let runtime = downloader_runtime(None, &stream(DownloaderHint::Streamlink));
+        assert!(matches!(runtime, DownloaderRuntime::StreamLink(_)));
+        let runtime = downloader_runtime(None, &stream(DownloaderHint::Ffmpeg));
+        assert!(matches!(runtime, DownloaderRuntime::Ffmpeg(_)));
+    }
 }
