@@ -18,6 +18,7 @@ import useSWR from 'swr'
 import useSWRMutation from 'swr/mutation'
 import { useMe } from '../lib/use-me'
 import { useAutoClip } from '../lib/auto-clip'
+import { hookStepListToForm } from '../lib/postprocessor'
 import AfterLiveSwitch from './auto-clip/AfterLiveSwitch'
 
 type TemplateModalEntity = Omit<LiveStreamerEntity, 'id'> & { id?: number }
@@ -119,6 +120,9 @@ const TemplateModal: React.FC<TemplateModalProps> = ({
     } catch (e) {
       console.error(e)
     }
+    if (values.postprocessor) {
+      values.postprocessor = hookStepListToForm(values.postprocessor as any) as any
+    }
     return values
   }, [entity, formKey])
 
@@ -135,7 +139,13 @@ const TemplateModal: React.FC<TemplateModalProps> = ({
       remark: values?.remark?.trim(),
       url: values?.url?.trim(),
       format: values?.format?.trim(),
-      time_range: JSON.stringify(values?.time_range?.map((date: Date) => date.toISOString())),
+      time_range: values?.time_range?.length
+        ? JSON.stringify(
+            values.time_range.map((date: Date | string) =>
+              date instanceof Date ? date.toISOString() : new Date(date).toISOString()
+            )
+          )
+        : undefined,
     }
     // Form 可能不登记 override 字段；复制新建时从 entity 补上
     if (values?.override === undefined && entity?.override !== undefined) {

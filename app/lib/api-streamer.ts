@@ -217,6 +217,13 @@ export function cloneStreamerForCreate(
 		statusTag: _statusTag,
 		upload_status: _uploadStatus,
 		paused: _paused,
+		live_bytes_per_sec: _bytes,
+		live_cover_url: _cover,
+		live_avatar_url: _avatar,
+		preview: _preview,
+		session_id: _session,
+		marker_count: _markers,
+		auto_clip_after_live: _autoClip,
 		...rest
 	} = source;
 	return JSON.parse(JSON.stringify(rest));

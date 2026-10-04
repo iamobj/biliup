@@ -289,7 +289,7 @@ export default function StreamersPage() {
         </TemplateModal>
       ),
       canEdit && (
-        <TemplateModal key="copy" title="复制录播" onOk={handleOk} entity={cloneStreamerForCreate(item)}>
+        <TemplateModal key="copy" title="复制录播" onOk={handleOk} entity={handleEntityPostprocessor(cloneStreamerForCreate(item))}>
           <Button theme="borderless" icon={<IconCopyStroked />} aria-label="复制新建" {...lock} />
         </TemplateModal>
       ),
