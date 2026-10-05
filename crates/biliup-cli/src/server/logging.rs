@@ -5,26 +5,40 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
-const DOWNLOAD_LOG_PATH: &str = "download.log";
-const DOWNLOAD_LOG_MAX_BYTES: u64 = 50 * 1024 * 1024;
-const DOWNLOAD_LOG_BACKUPS: usize = 1;
+pub const DOWNLOAD_LOG_PATH: &str = "download.log";
+pub const SERVER_LOG_PATH: &str = "ds_update.log";
+pub const DEFAULT_LOG_MAX_BYTES: u64 = 50 * 1024 * 1024;
+pub const DEFAULT_LOG_BACKUPS: usize = 1;
+pub const DOWNLOAD_LOG_MAX_BYTES: u64 = DEFAULT_LOG_MAX_BYTES;
+pub const DOWNLOAD_LOG_BACKUPS: usize = DEFAULT_LOG_BACKUPS;
 
-static DOWNLOAD_LOG_WRITER: LazyLock<DownloadLogWriter> = LazyLock::new(|| {
-    DownloadLogWriter::new(
+static DOWNLOAD_LOG_WRITER: LazyLock<RotatingLogWriter> = LazyLock::new(|| {
+    RotatingLogWriter::new(
         DOWNLOAD_LOG_PATH,
-        DOWNLOAD_LOG_MAX_BYTES,
-        DOWNLOAD_LOG_BACKUPS,
+        DEFAULT_LOG_MAX_BYTES,
+        DEFAULT_LOG_BACKUPS,
+    )
+});
+
+static SERVER_LOG_WRITER: LazyLock<RotatingLogWriter> = LazyLock::new(|| {
+    RotatingLogWriter::new(
+        SERVER_LOG_PATH,
+        DEFAULT_LOG_MAX_BYTES,
+        DEFAULT_LOG_BACKUPS,
     )
 });
 
 #[derive(Clone)]
-pub struct DownloadLogWriter {
+pub struct RotatingLogWriter {
     inner: Arc<Mutex<RotatingFile>>,
     generation: Arc<AtomicU64>,
 }
 
-impl DownloadLogWriter {
-    fn new(path: impl Into<PathBuf>, max_bytes: u64, backup_count: usize) -> Self {
+pub type DownloadLogWriter = RotatingLogWriter;
+pub type ServerLogWriter = RotatingLogWriter;
+
+impl RotatingLogWriter {
+    pub fn new(path: impl Into<PathBuf>, max_bytes: u64, backup_count: usize) -> Self {
         let generation = Arc::new(AtomicU64::new(0));
         Self {
             inner: Arc::new(Mutex::new(RotatingFile::new(
@@ -37,23 +51,23 @@ impl DownloadLogWriter {
         }
     }
 
-    fn generation(&self) -> u64 {
+    pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
 }
 
-impl Write for DownloadLogWriter {
+impl Write for RotatingLogWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.inner
             .lock()
-            .map_err(|_| io::Error::other("download log writer lock poisoned"))?
+            .map_err(|_| io::Error::other("rotating log writer lock poisoned"))?
             .write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
         self.inner
             .lock()
-            .map_err(|_| io::Error::other("download log writer lock poisoned"))?
+            .map_err(|_| io::Error::other("rotating log writer lock poisoned"))?
             .flush()
     }
 }
@@ -64,6 +78,22 @@ pub fn download_log_writer() -> DownloadLogWriter {
 
 pub fn download_log_generation() -> u64 {
     DOWNLOAD_LOG_WRITER.generation()
+}
+
+pub fn server_log_writer() -> ServerLogWriter {
+    SERVER_LOG_WRITER.clone()
+}
+
+pub fn server_log_generation() -> u64 {
+    SERVER_LOG_WRITER.generation()
+}
+
+pub fn log_generation_for(file_name: &str) -> Option<u64> {
+    match file_name {
+        DOWNLOAD_LOG_PATH => Some(download_log_generation()),
+        SERVER_LOG_PATH => Some(server_log_generation()),
+        _ => None,
+    }
 }
 
 struct RotatingFile {
@@ -296,5 +326,28 @@ mod tests {
         assert_eq!(total_len, 1600);
         assert_eq!(writer.generation(), 1);
         assert!(!path.with_extension("log.2").exists());
+    }
+
+    #[test]
+    fn server_log_keeps_only_latest_backup() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ds_update.log");
+        fs::write(path.with_extension("log.2"), b"stale").unwrap();
+        let mut writer = RotatingLogWriter::new(&path, 5, DEFAULT_LOG_BACKUPS);
+
+        writer.write_all(b"aaaaa").unwrap();
+        writer.write_all(b"b").unwrap();
+
+        assert_eq!(read(&path), b"b");
+        assert_eq!(read(&path.with_extension("log.1")), b"aaaaa");
+        assert!(!path.with_extension("log.2").exists());
+    }
+
+    #[test]
+    fn log_generation_for_matches_expected_files() {
+        assert_eq!(log_generation_for("download.log"), Some(download_log_generation()));
+        assert_eq!(log_generation_for("ds_update.log"), Some(server_log_generation()));
+        assert_eq!(log_generation_for("upload.log"), None);
+        assert_eq!(log_generation_for("unknown.log"), None);
     }
 }

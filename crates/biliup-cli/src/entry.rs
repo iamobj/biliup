@@ -106,8 +106,8 @@ pub fn init_tracing_with(filter: &str, log_file: bool) -> Logging {
     let (filter_layer, handle) = reload::Layer::new(EnvFilter::new(filter));
 
     let (file_layer, file_guard) = if log_file {
-        let file_appender = tracing_appender::rolling::never(".", LOG_FILE);
-        let (file_writer, file_guard) = tracing_appender::non_blocking(file_appender);
+        let (file_writer, file_guard) =
+            tracing_appender::non_blocking(crate::server::logging::server_log_writer());
         let file_layer = tracing_subscriber::fmt::layer()
             .with_timer(timer.clone())
             .with_writer(file_writer)

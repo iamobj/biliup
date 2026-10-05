@@ -1,16 +1,15 @@
-use crate::server::logging::download_log_generation;
+use crate::server::logging::log_generation_for;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket};
 use axum::extract::{Query, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
-use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, error, info};
@@ -101,8 +100,7 @@ async fn websocket_logs(mut ws: WebSocket, query: LogsQuery) {
     }
 
     let log_file = PathBuf::from(&file_param);
-    let watches_download_log = file_param == "download.log";
-    let mut log_generation = download_log_generation();
+    let mut log_generation = log_generation_for(&file_param);
 
     // 发送初始内容（最后50行）并获取当前大小
     let mut file_size = match send_last_lines(&mut ws, &log_file, 50).await {
@@ -160,29 +158,31 @@ async fn websocket_logs(mut ws: WebSocket, query: LogsQuery) {
             }
 
             _ = tick.tick() => {
-                let current_generation = download_log_generation();
-                if watches_download_log && current_generation != log_generation {
-                    let _ = ws
-                        .send(Message::Text(Utf8Bytes::from(
-                            "日志文件已分割，重新加载...".to_string(),
-                        )))
-                        .await;
-                    match send_last_lines(&mut ws, &log_file, 50).await {
-                        Ok(size) => {
-                            file_size = size;
-                            log_generation = current_generation;
+                let current_generation = log_generation_for(&file_param);
+                if let (Some(cur_gen), Some(last_gen)) = (current_generation, log_generation) {
+                    if cur_gen != last_gen {
+                        let _ = ws
+                            .send(Message::Text(Utf8Bytes::from(
+                                "日志文件已分割，重新加载...".to_string(),
+                            )))
+                            .await;
+                        match send_last_lines(&mut ws, &log_file, 50).await {
+                            Ok(size) => {
+                                file_size = size;
+                                log_generation = Some(cur_gen);
+                            }
+                            Err(e) => {
+                                let _ = ws
+                                    .send(Message::Text(
+                                        format!("读取日志文件错误: {}", e).into(),
+                                    ))
+                                    .await;
+                                error!("读取日志文件错误: {}", e);
+                                break;
+                            }
                         }
-                        Err(e) => {
-                            let _ = ws
-                                .send(Message::Text(
-                                    format!("读取日志文件错误: {}", e).into(),
-                                ))
-                                .await;
-                            error!("读取日志文件错误: {}", e);
-                            break;
-                        }
+                        continue;
                     }
-                    continue;
                 }
 
                 // 文件是否存在
@@ -208,7 +208,10 @@ async fn websocket_logs(mut ws: WebSocket, query: LogsQuery) {
                 if current_size < file_size {
                     let _ = ws.send(Message::Text(Utf8Bytes::from("日志文件被截断，重新加载...".to_string()))).await;
                     match send_last_lines(&mut ws, &log_file, 50).await {
-                        Ok(size) => file_size = size,
+                        Ok(size) => {
+                            file_size = size;
+                            log_generation = log_generation_for(&file_param);
+                        }
                         Err(e) => {
                             let _ = ws.send(Message::Text(format!("读取日志文件错误: {}", e).into())).await;
                             error!("读取日志文件错误: {}", e);
@@ -235,27 +238,55 @@ async fn websocket_logs(mut ws: WebSocket, query: LogsQuery) {
     debug!("WebSocket日志会话结束: {}", file_param);
 }
 
+// 读取文件最后 n 行，并返回 (行列表, 文件当前大小)
+pub(crate) async fn read_last_lines(
+    path: &std::path::Path,
+    n: usize,
+) -> std::io::Result<(Vec<String>, u64)> {
+    let mut file = fs::File::open(path).await?;
+    let file_size = file.metadata().await?.len();
+    if file_size == 0 || n == 0 {
+        return Ok((Vec::new(), file_size));
+    }
+
+    const CHUNK_SIZE: usize = 64 * 1024;
+    const MAX_TAIL_BYTES: u64 = 5 * 1024 * 1024;
+    let mut pos = file_size;
+    let mut chunks = Vec::new();
+    let mut newlines_found = 0;
+
+    while pos > 0 && newlines_found <= n && (file_size - pos) < MAX_TAIL_BYTES {
+        let read_size = (pos.min(CHUNK_SIZE as u64)) as usize;
+        pos -= read_size as u64;
+        file.seek(std::io::SeekFrom::Start(pos)).await?;
+        let mut chunk = vec![0u8; read_size];
+        file.read_exact(&mut chunk).await?;
+        newlines_found += chunk.iter().filter(|&&b| b == b'\n').count();
+        chunks.push(chunk);
+    }
+
+    chunks.reverse();
+    let total_bytes: Vec<u8> = chunks.into_iter().flatten().collect();
+    let text = String::from_utf8_lossy(&total_bytes);
+    let mut all_lines: Vec<String> = text.lines().map(String::from).collect();
+
+    let lines = if all_lines.len() > n {
+        all_lines.split_off(all_lines.len() - n)
+    } else {
+        all_lines
+    };
+
+    Ok((lines, file_size))
+}
+
 // 发送最后 n 行，并返回当前文件大小
 async fn send_last_lines(
     ws: &mut WebSocket,
     path: &std::path::Path,
     n: usize,
 ) -> std::io::Result<u64> {
-    let meta = fs::metadata(path).await?;
-    let file_size = meta.len();
-
-    let file = fs::File::open(path).await?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
-
-    let mut buf: VecDeque<String> = VecDeque::with_capacity(n);
-    while let Some(line) = lines.next_line().await? {
-        if buf.len() == n {
-            buf.pop_front();
-        }
-        buf.push_back(line);
-    }
-    for line in buf {
+    let (lines, file_size) = read_last_lines(path, n).await?;
+    for line in lines {
         ws.send(Message::Text(Utf8Bytes::from(line)))
             .await
             .map_err(|e| {
@@ -354,5 +385,51 @@ mod tests {
         assert!(acquire_log_permit(limiter.clone()).is_none());
         drop(permits);
         assert!(acquire_log_permit(limiter).is_some());
+    }
+
+    #[tokio::test]
+    async fn read_last_lines_reads_tail_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.log");
+
+        // 1. 空文件
+        tokio::fs::write(&path, b"").await.unwrap();
+        let (lines, size) = super::read_last_lines(&path, 50).await.unwrap();
+        assert!(lines.is_empty());
+        assert_eq!(size, 0);
+
+        // 2. 少于 50 行
+        let content = (1..=10).map(|i| format!("line {i}\n")).collect::<String>();
+        tokio::fs::write(&path, content.as_bytes()).await.unwrap();
+        let (lines, size) = super::read_last_lines(&path, 50).await.unwrap();
+        assert_eq!(lines.len(), 10);
+        assert_eq!(lines[0], "line 1");
+        assert_eq!(lines[9], "line 10");
+        assert_eq!(size, content.len() as u64);
+
+        // 3. 多于 50 行（跨 chunk 测试）
+        let content = (1..=2000).map(|i| format!("log entry number {i:04}\n")).collect::<String>();
+        tokio::fs::write(&path, content.as_bytes()).await.unwrap();
+        let (lines, size) = super::read_last_lines(&path, 50).await.unwrap();
+        assert_eq!(lines.len(), 50);
+        assert_eq!(lines[0], "log entry number 1951");
+        assert_eq!(lines[49], "log entry number 2000");
+        assert_eq!(size, content.len() as u64);
+
+        // 4. 末尾无换行符
+        tokio::fs::write(&path, b"line a\nline b").await.unwrap();
+        let (lines, _) = super::read_last_lines(&path, 2).await.unwrap();
+        assert_eq!(lines, vec!["line a", "line b"]);
+
+        // 5. 非 UTF-8 数据正常降级处理
+        let mut raw = b"line 1\n".to_vec();
+        raw.extend_from_slice(&[0xff, 0xfe, 0xfd]);
+        raw.extend_from_slice(b"\nline 3\n");
+        tokio::fs::write(&path, &raw).await.unwrap();
+        let (lines, _) = super::read_last_lines(&path, 50).await.unwrap();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "line 1");
+        assert!(lines[1].contains('\u{FFFD}'));
+        assert_eq!(lines[2], "line 3");
     }
 }

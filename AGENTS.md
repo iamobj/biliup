@@ -66,11 +66,11 @@
   - `douyin_true_origin` 优先级更高，满足条件时继续使用 `ao.main.flv` 真原画流。
   - 支持全局配置和主播稀疏 override；主播 override 的 `true`/`false` 必须正确覆盖全局值。
   - 判断画质是否存在时必须按当前 `douyin_protocol` 检查对应的非空 FLV/HLS 地址，不能只检查画质 key。
-- `download.log` 按 50 MiB 自动分割，保留当前文件和最新 1 份历史分片。
-  - 当前文件名固定为 `download.log`，历史文件为 `download.log.1`。
-  - tracing 下载日志和 Hook 的 stdout/stderr 共用进程级写入器，避免并发轮转时
+- `download.log` 与 `ds_update.log` 按 50 MiB 自动分割，保留当前文件和最新 1 份历史分片。
+  - 当前文件名固定为 `download.log` / `ds_update.log`，历史文件为 `download.log.1` / `ds_update.log.1`。
+  - tracing 下载日志和 Hook 的 stdout/stderr 共用进程级写入器，服务端 tracing 输出共用 server 写入器，避免并发轮转时
     覆盖归档或丢失输出。
-  - Web 日志查看器仍只展示当前文件，并在轮转后重新加载最后 50 行。
+  - Web 日志查看器仍只展示当前文件，并在轮转后重新加载最后 50 行；加载历史行采用尾部 seek 倒读优化，消除全量读 I/O。
 - 修复录播分段时弹幕 XML 偶发丢失的问题。
   - 弹幕 rolling 会先把当前 XML 落到分段目标路径，再创建下一段 writer，避免新 writer 与分段目标同名时被误删。
   - 分段目标 XML 已存在时不会覆盖或删除已有文件，会保留当前文件并跳过该次分段弹幕输出。
