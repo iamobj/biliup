@@ -156,6 +156,10 @@
   - `crates/biliup-cli/src/server/infrastructure/context.rs`
   - `crates/biliup-cli/src/server/config.rs`
   - `crates/biliup-cli/src/server/api/endpoints.rs`
+  - `.github/workflows/docker-publish.yml`
+- 上游如改动 Docker 发布工作流（`.github/workflows/docker-publish.yml`）：
+  - 镜像名称需保持 `IMAGE_NAME: ghcr.io/${{ github.repository }}`，确保 push 权限归属于当前 fork 仓库而非上游组织，避免 403 权限拒绝。
+  - 保持关闭 `pull_request` 触发与冗余 `test` 任务，构建与合并任务使用细粒度 `permissions: packages: write`，push master / tag 时直接并行构建发布多架构镜像，避免重复构建浪费 CI 时长。
 - 上游如改动抖音弹幕相关逻辑（`crates/danmaku/src/protocols/douyin.rs` 等）：
   - 本分支已完全切换为上游纯 Rust 弹幕实现，同步时仅需核对是否与本分支 Start/End 边界生命周期对齐，以及保持 `douyin.com` 域名匹配兼容性。
 - 上游如改动抖音画质配置、直播流选择或抖音配置 UI，需保留
