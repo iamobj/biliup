@@ -88,6 +88,10 @@
   - `use_wup=true` 且走 WUP 时，`LiveStream.stream_headers` 会带 WUP UA。
   - 保留上游 room_id 缓存、CDN 健康检查回退、回放标题过滤，以及本仓 `huya_cdn`、
     `huya_max_ratio`、`huya_imgplus` 与 `HY/HUYA/HYZJ` 过滤。
+  - 虎牙开播检测（`check_stream`）通用执行流地址可用性健康探测（5 秒超时）：无论是否开启 `huya_cdn_fallback`，
+    均先验证选定 CDN 的流连通性。若返回 404 / 不可用，开启 fallback 时尝试备选 CDN，全线不可用（或未开启 fallback）
+    时直接判定为 `LiveStatus::Offline`，彻底消除主播刚下播或转入平台重播/轮播时因网页缓存延迟导致的 404 误判开播与
+    反复触发 `preprocessor` 死循环；探测通过后重新获取房间 profile 生成未被连接消耗的全新流直链。
   - 主播配置覆写里的布尔开关（如 `huya_use_wup=false`）必须从 `entity.override` 回填，不能只读顶层字段后回退默认值。
 - 虎牙弹幕 Rust 链路以迁移前最后一版 Python `biliup/Danmaku/huya.py` 为协议基线：
   - 获取房间 UID 的页面请求超时为 5 秒；进程级随机 Chrome 100–120 UA 必须同时用于
@@ -167,7 +171,8 @@
   原有 `douyin_quality` 回退；按当前协议检查有效地址；`douyin_true_origin` 优先；并保留
   全局配置与主播稀疏 override 的继承及显式 `false` 覆写语义。
 - 上游如改动虎牙取流、WUP/TARS、anticode、mobile API 或相关配置/UI，需优先核对本分支
-  是否仍对齐 DanmakuRender 的 WUP 默认路径与 anticode 规则，以及主播覆写布尔值回填。
+  是否仍对齐 DanmakuRender 的 WUP 默认路径与 anticode 规则，主播覆写布尔值回填，以及
+  **通用流可用性健康探测（选定流或备选流 404 均判定下播，探测通过后刷新取流地址）**，防止下播/重播缓存期 404 死循环。
 - 上游如改动虎牙弹幕协议、TARS codec、通用 heartbeat 调度或 Huya 弹幕示例，需保留上述
   Python 基线：嵌套 `User`/`DColor` 解码、注册包黄金字节、共享随机 UA，以及 60 秒首跳延迟。
 - 上游如改动主播配置覆写、`LiveStreamer.override`、`ConfigPatch` apply、配置导入或

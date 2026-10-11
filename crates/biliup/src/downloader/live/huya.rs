@@ -14,7 +14,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 const HUYA_WEB_BASE_URL: &str = "https://www.huya.com";
 const HUYA_MP_BASE_URL: &str = "https://mp.huya.com";
@@ -105,15 +105,17 @@ impl<'a> HuyaLive<'a> {
         }
 
         let stream_urls = self.build_stream_urls(&profile.stream_info).await?;
-        let (mut selected_cdn, mut raw_stream_url) =
+        let (mut selected_cdn, raw_stream_url) =
             self.select_stream_url(&stream_urls, &profile)?;
 
-        // HTTPS 的直播流只允许连接一次：健康检查会消耗掉这次连接，
-        // 因此 cdn_fallback 无论是否回退，最后都要重新取一次流地址
-        if self.huya_cdn_fallback {
-            if !self.check_url_healthy(&raw_stream_url).await {
-                let cdn_list: Vec<&str> = stream_urls.iter().map(|(cdn, _)| cdn.as_str()).collect();
-                info!(name = %self.name, "cdn_fallback 顺序尝试 {cdn_list:?}");
+        // 流地址可用性健康检查：防止主播下播/重播时网页残留推流信息导致 404 误判开播。
+        // HTTPS 直播流连接后会被服务端计数或消耗，因此检查通过后必须重新获取流地址。
+        let is_healthy = self.check_url_healthy(&raw_stream_url).await;
+        if !is_healthy {
+            if self.huya_cdn_fallback {
+                let cdn_list: Vec<&str> =
+                    stream_urls.iter().map(|(cdn, _)| cdn.as_str()).collect();
+                info!(name = %self.name, "当前 CDN 不可用，cdn_fallback 顺序尝试 {cdn_list:?}");
                 let mut fallback = None;
                 for (cdn, url) in &stream_urls {
                     if cdn == &selected_cdn {
@@ -126,26 +128,29 @@ impl<'a> HuyaLive<'a> {
                     }
                 }
                 let Some(fallback) = fallback else {
-                    error!(name = %self.name, "cdn_fallback 所有链接无法使用");
+                    info!(name = %self.name, "虎牙所有 CDN 流地址均不可用 (404/未推流)，判定为未开播");
                     return Ok(LiveStatus::Offline);
                 };
                 info!(name = %self.name, "cdn_fallback 回退到 {fallback}");
                 selected_cdn = fallback;
-            }
-
-            let Some(next_profile) = self.get_room_profile(&room_id).await? else {
+            } else {
+                info!(name = %self.name, "虎牙选定 CDN 流地址不可用 (404/未推流)，判定为未开播");
                 return Ok(LiveStatus::Offline);
-            };
-            profile = next_profile;
-            let stream_urls = self.build_stream_urls(&profile.stream_info).await?;
-            let url = stream_urls
-                .iter()
-                .find(|(cdn, _)| cdn == &selected_cdn)
-                .or_else(|| stream_urls.first())
-                .map(|(_, url)| url)
-                .ok_or_else(|| LiveError::custom("虎牙可用 CDN 为空"))?;
-            raw_stream_url = self.add_ratio(url, &profile.bitrate_info, profile.max_bitrate);
+            }
         }
+
+        let Some(next_profile) = self.get_room_profile(&room_id).await? else {
+            return Ok(LiveStatus::Offline);
+        };
+        profile = next_profile;
+        let stream_urls = self.build_stream_urls(&profile.stream_info).await?;
+        let url = stream_urls
+            .iter()
+            .find(|(cdn, _)| cdn == &selected_cdn)
+            .or_else(|| stream_urls.first())
+            .map(|(_, url)| url)
+            .ok_or_else(|| LiveError::custom("虎牙可用 CDN 为空"))?;
+        let raw_stream_url = self.add_ratio(url, &profile.bitrate_info, profile.max_bitrate);
 
         let stream_headers = if self.should_use_wup() {
             HashMap::from([("User-Agent".to_string(), huya_wup::WUP_UA.to_string())])
@@ -471,6 +476,7 @@ impl<'a> HuyaLive<'a> {
         let response = match self
             .client
             .get(url)
+            .timeout(std::time::Duration::from_secs(5))
             .header("referer", HUYA_WEB_BASE_URL)
             .header("user-agent", HUYA_USER_AGENT)
             .send()
@@ -497,6 +503,7 @@ impl<'a> HuyaLive<'a> {
         matches!(
             self.client
                 .get(variant_url)
+                .timeout(std::time::Duration::from_secs(5))
                 .header("referer", HUYA_WEB_BASE_URL)
                 .header("user-agent", HUYA_USER_AGENT)
                 .send()
