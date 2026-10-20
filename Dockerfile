@@ -8,7 +8,7 @@ ARG branch_name=master
 COPY . /biliup
 RUN set -eux; \
 	\
-	if [ ! -f /biliup/crates/stream-gears/pyproject.toml ]; then \
+	if [ ! -f /biliup/crates/biliup-cli/Cargo.toml ]; then \
 	rm -rf /biliup; \
 	git clone --depth 1 --branch "$branch_name" "$repo_url" /biliup; \
 	fi;
@@ -29,43 +29,29 @@ RUN set -eux; \
 	npm run build;
 
 
-# Build biliup's python wheel
-FROM rust:latest AS wheel-builder
-
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-	--mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
-	set -eux; \
-	apt-get update; \
-	apt-get install -y --no-install-recommends python3-pip g++ patchelf; \
-	pip3 install maturin --break-system-packages;
-
+# The service runs the native CLI; the Python distribution only provides APIs.
+FROM rust:latest AS binary-builder
+COPY --from=webui-builder /biliup /biliup
 WORKDIR /biliup
-
-COPY --from=source /biliup ./
-COPY --from=webui-builder /biliup/out /biliup/out
-
+# 随包字体不进仓库：镜像里按固定 SHA-256 取回，来源与 CI、发布包一致
+RUN set -eux; dir=crates/biliup-cli/assets/render-tools/fonts; mkdir -p "$dir"; curl -fsSL --retry 3 -o "$dir/NotoSansSC-Regular.otf" 'https://raw.githubusercontent.com/notofonts/noto-cjk/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf'; echo "2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b  $dir/NotoSansSC-Regular.otf" | sha256sum -c -; curl -fsSL --retry 3 -o "$dir/NotoEmoji.ttf" 'https://raw.githubusercontent.com/google/fonts/47d54ca1ebb14fd864695f1d39dc734f39017c33/ofl/notoemoji/NotoEmoji%5Bwght%5D.ttf'; echo "de6c18832938afc99caf132b39d6a30a19bac7f2e812e28db2535b4608d27551  $dir/NotoEmoji.ttf" | sha256sum -c -
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
 	--mount=type=cache,target=/usr/local/cargo/git \
 	--mount=type=cache,target=/biliup/target \
 	set -eux; \
-	maturin build --release -m crates/stream-gears/Cargo.toml --out /tmp/wheels;
+	cargo build --locked --release -p biliup-cli --bin biliup; \
+	cp /biliup/target/release/biliup /tmp/biliup
 
-
-# Deploy Biliup
-FROM python:3.13-slim AS biliup
-
-ENV TZ="Asia/Shanghai"
-ENV LANG="C.UTF-8"
-ENV LANGUAGE="C.UTF-8"
-ENV LC_ALL="C.UTF-8"
+FROM python:3.13-slim-trixie AS biliup
+ENV TZ="Asia/Shanghai" LANG="C.UTF-8" LANGUAGE="C.UTF-8" LC_ALL="C.UTF-8"
+RUN pip3 install --no-cache-dir "yt-dlp>=2025.7.21" "streamlink>=7.5.0"
 EXPOSE 19159/tcp
 VOLUME /opt
+COPY --from=binary-builder /tmp/biliup /usr/local/bin/biliup
+COPY --from=binary-builder /biliup/crates/biliup-cli/assets/render-tools /usr/local/bin/render-tools
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3t64 && rm -rf /var/lib/apt/lists/*
 
-# 需要遵守 wheel 文件名规范
-COPY --from=wheel-builder /tmp/wheels/* /tmp/
-
-RUN --mount=type=cache,target=/root/.cache/pip \
-	set -eux; \
+RUN set -eux; \
 	\
 	savedAptMark="$(apt-mark showmanual)"; \
 	useApt=false; \
@@ -74,13 +60,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 		wget \
 		curl \
 		xz-utils \
-		g++ \
 	; \
-	whl=$(ls /tmp/biliup*.whl); \
-	pip3 install --no-cache-dir "$whl"; \
-	pip3 cache purge; \
-	rm -rf /tmp/*; \
-	\
 	apt-mark auto '.*' > /dev/null; \
 	apt-mark manual curl wget; \
 	\

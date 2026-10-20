@@ -4,7 +4,7 @@ import { usePathname, useRouter, useSearchParams } from 'next/navigation'
 import useSWR, { mutate as revalidate } from 'swr'
 import { Button, Empty, Popconfirm, Select, Spin, TabPane, Tabs, Tag, Toast, Typography } from '@douyinfe/semi-ui'
 import { IconPlusCircle, IconServer, IconSetting } from '@douyinfe/semi-icons'
-import PageHeader from '../components/PageHeader'
+import TaskPlatformHeader from '../status/TaskPlatformHeader'
 import dc from '@/app/ui/data-card.module.scss'
 import { fetcher } from '@/app/lib/api-streamer'
 import { useMe } from '@/app/lib/use-me'
@@ -32,9 +32,8 @@ import LocalNodeOffer from './LocalNodeOffer'
 import JoinDialog from './JoinDialog'
 import RoomsPanel, { CreateRoomButton } from './RoomsPanel'
 import TemplatesPanel from './TemplatesPanel'
+import { NodeOverrideSheet } from './FleetConfigEditor'
 import RemovalNotices from './RemovalNotices'
-import FleetTemplateModal from './FleetTemplateModal'
-import FleetConfigSheet, { type ConfigTarget } from './FleetConfigSheet'
 import NodeLabels from './NodeLabels'
 import AlertsPanel, { NodeAlertBadge } from './AlertsPanel'
 import { useFleetAlerts } from '@/app/lib/fleet-alerts'
@@ -64,7 +63,7 @@ function NotController() {
       <Empty
         image={<IconServer size="extra-large" style={{ color: 'var(--semi-color-text-3)' }} />}
         title="本机不是控制面"
-        description="用 biliup server --controller 启动后，才能在这里添加和查看节点"
+        description="已加入其他控制面的机器，请到控制面的任务平台管理节点。独立运行的 biliup 默认开启控制面。"
       />
     </div>
   )
@@ -116,6 +115,9 @@ function Nodes() {
   const requested = searchParams.get('tab')
   const nodeParam = Number(searchParams.get('node'))
   const alertNode = Number.isInteger(nodeParam) && nodeParam > 0 ? nodeParam : null
+  // 节点覆盖是节点的附属内容：在本页以抽屉打开，地址带 ?override=N，关掉即去掉
+  const overrideParam = Number(searchParams.get('override'))
+  const overrideId = Number.isInteger(overrideParam) && overrideParam > 0 ? overrideParam : null
   const controller = me?.fleet_controller === true
   const canManage = can('node.manage')
   const { data, error, isLoading, mutate } = useSWR<FleetNodes>(controller ? FLEET_NODES_KEY : null, fetcher, {
@@ -135,13 +137,11 @@ function Nodes() {
     refreshInterval: FLEET_REFRESH_MS,
   })
   const showHa = !!ha && (ha.pair !== null || Object.keys(ha.handback ?? {}).length > 0)
-  const tab: Tab = TABS.find((t) => t === requested && (t !== 'ha' || showHa)) ?? 'nodes'
+  const hasFleet = !!data?.nodes.some(n => !n.local) || !!roomList?.rooms.length || data?.local_node != null
+  const tab: Tab = hasFleet ? TABS.find((t) => t === requested && (t !== 'ha' || showHa)) ?? 'nodes' : 'nodes'
   const [labelFilter, setLabelFilter] = useState<string[]>([])
   const [joining, setJoining] = useState(false)
   const [pairing, setPairing] = useState(false)
-  /** undefined 为没打开，null 为新建 */
-  const [editingTemplate, setEditingTemplate] = useState<FleetTemplate | null | undefined>(undefined)
-  const [configTarget, setConfigTarget] = useState<ConfigTarget | null>(null)
   const canViewConfig = can('config.view')
 
   const refresh = () => {
@@ -210,14 +210,14 @@ function Nodes() {
   const openAlertCount = alerts.filter((a) => a.resolved_at === null).length
 
   const createRoom = (
-    <CreateRoomButton nodes={nodes} templates={templates ?? []} onCreated={refreshRooms}>
+    <CreateRoomButton>
       <Button icon={<IconPlusCircle />} theme="solid">
         {isMobile ? '添加' : '新建房间'}
       </Button>
     </CreateRoomButton>
   )
   const createTemplate = (
-    <Button icon={<IconPlusCircle />} theme="solid" onClick={() => setEditingTemplate(null)}>
+    <Button icon={<IconPlusCircle />} theme="solid" onClick={() => router.push('/nodes/template')}>
       {isMobile ? '添加' : '新建模板'}
     </Button>
   )
@@ -228,8 +228,8 @@ function Nodes() {
   )
   const nodeActions = (
     <>
-      {canViewConfig ? (
-        <Button icon={<IconSetting />} onClick={() => setConfigTarget({ mode: 'global' })}>
+      {canViewConfig && hasFleet ? (
+        <Button icon={<IconSetting />} onClick={() => router.push('/nodes/config')}>
           {isMobile ? '配置' : 'Fleet 配置'}
         </Button>
       ) : null}
@@ -258,11 +258,11 @@ function Nodes() {
       <div className={styles.center}>
         <Empty
           image={<IconServer size="extra-large" style={{ color: 'var(--semi-color-text-3)' }} />}
-          title="还没有节点"
+          title="当前仅本机运行"
           description={
             canManage
-              ? '点击右上角「添加节点」生成一张加入票据，在另一台运行 biliup 的机器上执行给出的命令'
-              : '还没有机器加入这个控制面'
+              ? '直播间仍在本机录制和投稿。添加其他节点后，可在这里分派房间、管理配置和查看告警。'
+              : '直播间仍在本机录制和投稿，暂时没有其他节点加入。'
           }
         />
         {canManage ? (
@@ -318,7 +318,9 @@ function Nodes() {
                   onRevoke={revoke}
                   controllerVersion={data.controller_version}
                   onEditConfig={
-                    canViewConfig ? (n) => setConfigTarget({ mode: 'override', nodeId: n.id }) : undefined
+                    canViewConfig
+                      ? (n) => router.replace(`${pathname}?override=${n.id}`, { scroll: false })
+                      : undefined
                   }
                   badge={
                     <NodeAlertBadge
@@ -353,10 +355,9 @@ function Nodes() {
 
   return (
     <>
-      <PageHeader
-        icon={<IconServer size="large" />}
-        title="节点"
-        description={DESCRIPTIONS[controller ? tab : 'nodes']}
+      <TaskPlatformHeader
+        active="nodes"
+        description={controller && !hasFleet ? '本机独立录制；需要多机协作时再添加节点' : DESCRIPTIONS[controller ? tab : 'nodes']}
         actions={actions}
       />
       <div className={dc.content}>
@@ -395,19 +396,19 @@ function Nodes() {
                 ) : null}
               </div>
             ) : null}
-            <Tabs type="line" activeKey={tab} onChange={switchTab} className={styles.tabs} lazyRender>
+            <Tabs type="line" activeKey={tab} onChange={switchTab} className={styles.tabs} tabBarStyle={hasFleet ? undefined : { display: 'none' }} lazyRender>
               <TabPane tab="节点" itemKey="nodes">
                 {data?.removals?.length ? (
                   <RemovalNotices removals={data.removals} rooms={rooms} nodes={nodes} />
                 ) : null}
-                {canManage && data && data.local_node === null ? <LocalNodeOffer onEnabled={refresh} /> : null}
+                {canManage && hasFleet && data && data.local_node === null ? <LocalNodeOffer onEnabled={refresh} /> : null}
                 {canManage && data && ha && !showHa && nodes.some((n) => !n.local) ? (
                   <PairEntry onOpen={() => setPairing(true)} />
                 ) : null}
                 {nodesBody}
                 {controller ? <PendingTokens canManage={canManage} /> : null}
               </TabPane>
-              <TabPane tab={`房间${rooms.length ? ` ${rooms.length}` : ''}`} itemKey="rooms">
+              {hasFleet && <TabPane tab={`房间${rooms.length ? ` ${rooms.length}` : ''}`} itemKey="rooms">
                 {controller ? (
                   <RoomsPanel
                     nodes={nodes}
@@ -417,8 +418,8 @@ function Nodes() {
                     onChanged={refresh}
                   />
                 ) : null}
-              </TabPane>
-              <TabPane tab={`投稿模板${templates?.length ? ` ${templates.length}` : ''}`} itemKey="templates">
+              </TabPane>}
+              {hasFleet && <TabPane tab={`投稿模板${templates?.length ? ` ${templates.length}` : ''}`} itemKey="templates">
                 {controller ? (
                   <TemplatesPanel
                     templates={templates}
@@ -428,16 +429,16 @@ function Nodes() {
                     error={templatesError}
                     canManage={canManage}
                     creating={createTemplate}
-                    onEdit={setEditingTemplate}
+                    onEdit={(template) => router.push(`/nodes/template?id=${template.id}`)}
                     onChanged={refreshTemplates}
                   />
                 ) : null}
-              </TabPane>
-              <TabPane tab={`告警${alerts.length ? ` ${alerts.length}` : ''}`} itemKey="alerts">
+              </TabPane>}
+              {hasFleet && <TabPane tab={`告警${alerts.length ? ` ${alerts.length}` : ''}`} itemKey="alerts">
                 {controller ? (
                   <AlertsPanel nodes={nodes} canManage={canManage} nodeFilter={alertNode} onNodeFilter={openAlerts} />
                 ) : null}
-              </TabPane>
+              </TabPane>}
               {showHa && ha ? (
                 <TabPane tab="一主一备" itemKey="ha">
                   <ControllerHa
@@ -468,31 +469,20 @@ function Nodes() {
           }}
         />
       ) : null}
+      {overrideId !== null && canViewConfig && data ? (
+        <NodeOverrideSheet
+          key={overrideId}
+          node={nodes.find((n) => n.id === overrideId)}
+          canManage={canManage}
+          onClose={() => router.replace(pathname, { scroll: false })}
+        />
+      ) : null}
       {joining ? (
         <JoinDialog
           onClose={() => {
             setJoining(false)
             refresh()
             revalidate(FLEET_TOKENS_KEY).catch(() => undefined)
-          }}
-        />
-      ) : null}
-      {configTarget ? (
-        <FleetConfigSheet
-          target={configTarget}
-          node={configTarget.mode === 'override' ? nodes.find((n) => n.id === configTarget.nodeId) : undefined}
-          canManage={canManage}
-          onClose={() => setConfigTarget(null)}
-        />
-      ) : null}
-      {editingTemplate !== undefined ? (
-        <FleetTemplateModal
-          template={editingTemplate}
-          nodes={nodes}
-          onClose={() => setEditingTemplate(undefined)}
-          onSaved={() => {
-            setEditingTemplate(undefined)
-            refreshTemplates()
           }}
         />
       ) : null}

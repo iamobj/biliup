@@ -5,6 +5,7 @@ import SectionTitle from '../../(app)/components/SectionTitle'
 import { Form, Select, Space, Switch, useFormApi, useFormState } from '@douyinfe/semi-ui'
 import { IconUpload, IconDownload } from '@douyinfe/semi-icons'
 import { FileSizeField } from '../FileSizeInput'
+import { SegmentTimeField } from '../SegmentTimeField'
 
 /** 打开「投稿后保留录像」时默认保留的小时数 */
 const DEFAULT_RETENTION_HOURS = 24
@@ -67,8 +68,8 @@ const Global: React.FC<Props> = ({ disabled }) => {
               <br />
               5. ytarchive：仅适用于 YouTube 直播。
               <br />
-              6. stream-gears：内置，无需额外安装，可防 FLV 流花屏；不支持 HEVC 编码和 hls_fmp4 流，FLV
-              时间戳沿用源站的原值（不从 0 开始）。
+              6. stream-gears：内置，无需额外安装，可防 FLV 流花屏；能录 AVC / HEVC / AV1（含 Enhanced FLV），
+              HLS 流也能录（TS 存 .ts，fMP4 存 .mp4，不支持加密流）；FLV 时间戳沿用源站的原值（不从 0 开始）。
             </div>
           }
           style={{ width: '100%' }}
@@ -142,38 +143,22 @@ const Global: React.FC<Props> = ({ disabled }) => {
             padding: 0,
           }}
         />
-        <Form.Input
+        <SegmentTimeField
           field="segment_time"
           extraText={
             <div style={{ fontSize: '14px' }}>
               录像单文件时间限制，超过此时长触发文件分割。
               <br />
-              格式：&apos;00:00:00&apos;（时:分:秒）
+              选择预设或自定义，例如 00:07:30、7:30（7 分 30 秒）、450（秒）。不按时长分段时仍可按文件大小分段。
+              <br />
+              分段较短时请同时检查碎片过滤阈值，低于阈值的分段会被过滤。
             </div>
           }
           label="视频分段时长（segment_time）"
-          placeholder="01:00:00"
-          style={{ width: '100%' }}
           fieldStyle={{
             alignSelf: 'stretch',
             padding: 0,
           }}
-          showClear={true}
-          rules={[
-            {
-              pattern: /^[^：]*$/,
-              message: '请使用英文冒号',
-            },
-            {
-              pattern: /^[0-9:]*$/,
-              message: '只接受数字和英文冒号',
-            },
-            {
-              pattern: /^$|^[0-9]{2,4}:[0-5][0-9]:[0-5][0-9]$/,
-              message: '分或秒不符合规范',
-            },
-          ]}
-          stopValidateWithError={true}
         />
 
         <Form.InputNumber
@@ -404,7 +389,8 @@ const Global: React.FC<Props> = ({ disabled }) => {
         <Form.Select
           field="submit_api"
           label="提交接口（submit_api）"
-          extraText="B站投稿提交接口，默认为自动选择。"
+          extraText="B站投稿提交接口，不选时用网页（web）。"
+          placeholder="网页（web）"
           style={{ width: '100%' }}
           fieldStyle={{
             alignSelf: 'stretch',
@@ -469,8 +455,10 @@ const Global: React.FC<Props> = ({ disabled }) => {
         />
         <Form.InputNumber
           field="max_upload_limit"
-          placeholder={8}
-          extraText="录播上传次数上限，防止因意外情况如B站接口抽风、录播本身损坏导致录播反复上传浪费宽带或被B站风控（注：限制是记录在程序上下文中的，重启程序会重置上传次数限制；且为了保证尽量不改动老用户使用逻辑，默认将此值设置为一个较大的值，一般推荐设置为2-3）"
+          min={1}
+          precision={0}
+          placeholder={6}
+          extraText="同一分段因断网、超时等网络故障上传失败时最多上传几次（含第一次），两次之间从 30 秒起翻倍等待、最长 5 分钟，用完仍失败就跳过该分段、保留录像文件。不填为 6 次（约 12.5 分钟内网络恢复都能补传），填 1 为不重试。B 站限流、风控等拒绝不会重试"
           label="上传重试次数限制（max_upload_limit）"
           style={{ width: '100%' }}
           fieldStyle={{

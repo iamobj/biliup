@@ -1,7 +1,7 @@
 'use client'
 import { useState } from 'react'
 import useSWR from 'swr'
-import { Banner, Button, Modal, Select, Spin, Toast, Typography } from '@douyinfe/semi-ui'
+import { Banner, Button, Select, Spin, Toast, Typography } from '@douyinfe/semi-ui'
 import { IconServer } from '@douyinfe/semi-icons'
 import { fetcher } from '@/app/lib/api-streamer'
 import { errorMessage, type FleetNode } from '@/app/lib/use-fleet'
@@ -10,6 +10,7 @@ import {
   HA_SINCE,
   PAIR_SINCE,
   candidatesKey,
+  candidatesReadable,
   designate,
   joinPair,
   paramsIssue,
@@ -20,6 +21,7 @@ import {
 } from '@/app/lib/fleet-ha'
 import ModeFields from './ModeFields'
 import { AdoptionResult, RowPicker, defaultPicked, pickedCount, type Picked } from './RowPicker'
+import { FormDialog } from '@/app/ui/shell'
 import pageStyles from '../page.module.scss'
 import styles from './ha.module.scss'
 
@@ -57,7 +59,7 @@ export default function PairDialog({
   const [draft, setDraft] = useState<Draft | null>(null)
   const [busy, setBusy] = useState(false)
   const [result, setResult] = useState<Result | null>(null)
-  const { data, error, isLoading } = useSWR<Candidates>(
+  const { data, error, isLoading, mutate: refreshCandidates } = useSWR<Candidates>(
     standby !== null && localNode !== null ? candidatesKey(standby) : null,
     fetcher,
     { revalidateOnFocus: false },
@@ -71,18 +73,30 @@ export default function PairDialog({
         ? draft
         : { standby, primary: defaultPicked(data?.primary), node: defaultPicked(data?.standby) }
   const issue = paramsIssue(params)
-  const blocked = localNode === null || standby === null || !!issue || (!data && !error)
+  // A candidate error must fail closed.  The server treats an omitted `adopt`
+  // field as "adopt every eligible local row" for a first pairing, which is
+  // unsafe when the rows were not actually shown to the administrator.
+  const candidateError = !candidatesReadable(data, error, standby ?? undefined, localNode ?? undefined)
+  const candidateErrorMessage = error
+    ? errorMessage(error)
+    : data?.standby?.error ??
+      data?.primary?.error ??
+      (!data?.standby || !data?.primary
+        ? '候选清单不完整，重试读取后才能配对'
+        : '候选清单与当前选择不匹配，请重试读取')
+  const blocked = localNode === null || standby === null || !!issue || candidateError
 
   const submit = async () => {
     if (busy || blocked || standby === null || !picks) return
     setBusy(true)
     try {
-      const readable = data?.standby && !data.standby.error
       const res = await designate({
         standby,
         mode,
         params,
-        adopt: readable ? picks.node : undefined,
+        // Always send the explicit choices.  `undefined` is omitted by
+        // JSON.stringify and means "select all" on the backend.
+        adopt: picks.node,
       })
       let primary: RowsView | null = null
       if (pickedCount(picks.primary) > 0) {
@@ -104,49 +118,37 @@ export default function PairDialog({
 
   if (result) {
     return (
-      <Modal
+      <FormDialog
         title="配对好了"
-        visible
+        size="md"
         onCancel={() => onClose(true)}
-        style={{ width: 'min(640px, 94vw)' }}
-        footer={
-          <div className={pageStyles.dialogFoot}>
-            <Button theme="solid" onClick={() => onClose(true)}>
-              完成
-            </Button>
-          </div>
-        }
+        cancelText={null}
+        okText="完成"
+        onOk={() => onClose(true)}
       >
-        <div className={`${pageStyles.dialogBody} ${styles.dialogScroll}`}>
+        <div className={pageStyles.dialogBody}>
           <Text type="tertiary" size="small">
             在录或上一场还没投完的，等这一场录完投完再加入；没纳入的照旧是那台自己的本地行，之后可以在面板上「加入配对」
           </Text>
           <AdoptionResult title={`${chosen?.name ?? '备机'}（备机）`} view={result.standby} />
           <AdoptionResult title="「本机」（主机）" view={result.primary} />
         </div>
-      </Modal>
+      </FormDialog>
     )
   }
 
   return (
-    <Modal
+    <FormDialog
       title="设置一主一备"
-      visible
-      onCancel={busy ? undefined : () => onClose(false)}
-      closeOnEsc={!busy}
-      style={{ width: 'min(720px, 94vw)' }}
-      footer={
-        <div className={pageStyles.dialogFoot}>
-          <Button onClick={() => onClose(false)} disabled={busy}>
-            取消
-          </Button>
-          <Button theme="solid" onClick={submit} loading={busy} disabled={blocked}>
-            {picks ? `配对（纳入 ${pickedCount(picks.primary) + pickedCount(picks.node)} 项）` : '配对'}
-          </Button>
-        </div>
-      }
+      size="lg"
+      closable={!busy}
+      onCancel={() => onClose(false)}
+      okText={picks ? `配对（纳入 ${pickedCount(picks.primary) + pickedCount(picks.node)} 项）` : '配对'}
+      onOk={submit}
+      confirmLoading={busy}
+      okDisabled={blocked}
     >
-      <div className={`${pageStyles.dialogBody} ${styles.dialogScroll}`}>
+      <div className={pageStyles.dialogBody}>
         <Text type="tertiary" size="small">
           两台录同样的房间，只有一台投稿，避免两份稿件。配对之后在哪台上改直播间、模板、空间配置、B 站账号都行，两台会同步
         </Text>
@@ -155,7 +157,7 @@ export default function PairDialog({
             type="warning"
             fullMode={false}
             closeIcon={null}
-            description="主机是控制面这台的「本机」节点：先在「节点」页启用「本机」，再来配对"
+            description="主机是控制面这台的「本机」节点：先在「任务平台 › 节点管理」页启用「本机」，再来配对"
           />
         ) : null}
         <div className={styles.field}>
@@ -211,8 +213,13 @@ export default function PairDialog({
               <div className={pageStyles.dialogCenter}>
                 <Spin />
               </div>
-            ) : error ? (
-              <div className={styles.pickError}>读不到清单：{errorMessage(error)}</div>
+            ) : candidateError ? (
+              <div className={styles.pickError}>
+                读不到完整清单：{candidateErrorMessage}{' '}
+                <Button size="small" theme="borderless" disabled={busy} onClick={() => refreshCandidates()}>
+                  重试读取
+                </Button>
+              </div>
             ) : picks ? (
               <>
                 <RowPicker
@@ -234,7 +241,7 @@ export default function PairDialog({
           </div>
         ) : null}
       </div>
-    </Modal>
+    </FormDialog>
   )
 }
 

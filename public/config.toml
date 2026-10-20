@@ -21,14 +21,17 @@ filtering_threshold = 20
 #segment_processor_parallel = false
 
 #------上传------#
-### b站提交接口，默认自动选择，可选web，client
-#submit_api = "client"
+### b站投稿接口，默认web，可选web，app，b-cut-android
+#submit_api = "web"
 ### 选择全局默认上传插件，Noop为不上传，但会执行后处理,可选bili_web，biliup-rs(默认值)
 #uploader = "Noop"
 ### b站上传线路选择，默认自动选择最优线路。目前可手动切换为alia（海外）, bda2（大陆）, bldsa（大陆）, tx（大陆）, txa（海外）, estx（大陆）, akbd（大陆）
 lines = "AUTO"
 ### 单文件并发上传数,未达到带宽上限时,增大此值可提高上传速度(不要设置过大,部分线路限制为8,如速度不佳优先调整上传线路)
 threads = 3
+### 同一分段因断网、超时等网络故障上传失败时最多上传几次（含第一次），两次之间从30秒起翻倍等待、最长5分钟，用完仍失败就跳过该分段、保留文件。
+### 不填为6次，1为不重试。B站限流、风控等拒绝不会重试
+#max_upload_limit = 6
 
 #------杂项------#
 ### 检测到主播下播后延迟再次检测，单位：秒，避免特殊情况提早启动上传导致漏录
@@ -64,15 +67,17 @@ check_sourcecode = 15
 #douyu_cdn = "tct-h5"
 ### 强制hs流使用构造链接，防止部分海外机器遇到频繁断流。使用时需修改douyu_cdn为hs-h5
 #douyu_force_hs = true
-### 斗鱼设备 ID：在浏览器 Cookie 中找到 acf_did，只填它的值；留空使用默认设备 ID
+### 网页版登录 Cookie：请求头字符串或浏览器导出 JSON 数组字符串；部分房间的原画需要登录
+#douyu_cookie = ""
+### 斗鱼设备 ID：留空时优先从 Cookie 读取 dy_did/acf_did，再使用默认设备 ID
 #douyu_deviceId = ""
-### 斗鱼视频编码：留空、"AVC" 或 "HEVC"；HEVC 使用 player_1 流地址
+### 斗鱼视频编码：留空、"AVC" 或 "HEVC"；HEVC 需 mesio 或兼容的新版 FFmpeg，房间不提供时回退 AVC
 #douyu_codec = ""
 ### 录制斗鱼弹幕，默认关闭
 #douyu_danmaku = false
 ### 斗鱼自选画质
 ### 刚开播可能没有除了原画之外的画质 会先录制原画 后续视频分段(仅ffmpeg streamlink)时录制设置的画质
-### 0 原画,4 蓝光4m,3 超清,2 高清
+### 0 请求原画,8 蓝光8m,4 蓝光4m,3 超清,2 高清；实际档位由平台返回，降档会记录日志
 #douyu_rate = 0
 
 
@@ -245,7 +250,7 @@ dynamic = "#空间动态#"
 user_cookie = "cookies.json" ### 使用指定的账号上传
 #use_live_cover = true # 获取BILIBILI直播间封面并作为投稿封面。此封面优先级低于单个主播指定的自定义封面。
 tags = ["biliup", "视频标签"]
-#format = "mp4" ### 视频保存格式。如需使用mp4格式，必须切换downloader为ffmpeg或者streamlink，youtube不支持。
+#format = "mp4" ### 视频保存格式。设置 mp4 时，未配置下载插件或配置为 stream-gears 的主播会自动改用 ffmpeg 转封装；youtube不支持。
 #time_range: "[\"2025-03-26T16:00:00.000Z\",\"2025-03-27T15:59:59.000Z\"]" ### 录制时间范围 ISO 8601 格式的时间数组字符串
 #excluded_keywords: ### 如果房间名包含关键词，则停止或不录制该场直播，每个关键词需单独一行
 ### 开始下载直播时触发，将按自定义顺序执行自定义操作 注：preprocessor仅支持shell指令

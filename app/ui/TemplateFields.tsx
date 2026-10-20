@@ -108,12 +108,12 @@ const TemplateFields: React.FC<TemplateFieldsProps> = ({
         direction="horizontal"
         label="互动设置"
       />
-      <Input field="dynamic" label="粉丝动态" style={{ width: 464 }} />
+      <Input field="dynamic" label="粉丝动态" style={{ width: '100%', maxWidth: 464 }} />
       <Form.Select
         field="uploader"
         label="上传插件"
         initValue={values.uploader ?? 'biliup-rs'}
-        style={{ width: 250 }}
+        style={{ width: '100%', maxWidth: 250 }}
         showClear
       >
         <Form.Select.Option value="bili_web">bili_web</Form.Select.Option>
@@ -169,6 +169,11 @@ const TemplateFields: React.FC<TemplateFieldsProps> = ({
       ),
     }
   })
+  const currentAccount = formApi.getValue('user_cookie')
+  const accountOptions =
+    currentAccount === 'account:current'
+      ? [{ value: currentAccount, label: '保留当前账号' }, ...(list ?? [])]
+      : list
   const toggle = () => {
     setOpen(!isOpen)
     formApi.scrollToField('isDtime')
@@ -204,15 +209,15 @@ const TemplateFields: React.FC<TemplateFieldsProps> = ({
           rules={[{ required: true }]}
           field="template_name"
           label="模板名称"
-          style={{ width: 464 }}
+          style={{ width: '100%', maxWidth: 464 }}
         />
         {accountField ?? (
           <Form.Select
             rules={[{ required: true }]}
             field="user_cookie"
             label={{ text: '投稿账号' }}
-            style={{ width: 176 }}
-            optionList={list}
+            style={{ width: '100%', maxWidth: 176 }}
+            optionList={accountOptions}
           />
         )}
       </Section>
@@ -220,7 +225,7 @@ const TemplateFields: React.FC<TemplateFieldsProps> = ({
         <Input
           field="title"
           label="视频标题"
-          style={{ width: 464 }}
+          style={{ width: '100%', maxWidth: 464 }}
           placeholder="稿件标题"
           extraText={
             <div style={{ fontSize: 14 }}>
@@ -239,14 +244,14 @@ const TemplateFields: React.FC<TemplateFieldsProps> = ({
           initValue={formApi.getValue('copyright') ?? 2}
           extraText={<div style={{ fontSize: 14 }}>如不填写转载来源默认为直播间地址</div>}
         >
-          <Radio value={2} style={{ alignItems: 'center', flexShrink: 0 }}>
+          <Radio value={2} style={{ alignItems: 'center', width: '100%' }} addonStyle={{ display: 'flex', alignItems: 'center', flex: 1, minWidth: 0 }}>
             <span style={{ flexShrink: 0 }}>转载</span>
             <Input
               field="copyright_source"
               onClick={() => formApi.setValue('copyright', 2)}
               placeholder="转载视频请注明来源（例：转自http://www.xx.com/yy）注明来源会更快地通过审核哦"
               noLabel
-              fieldStyle={{ padding: 0, marginLeft: 24, width: 560 }}
+              fieldStyle={{ padding: 0, marginLeft: 12, flex: 1, minWidth: 0, maxWidth: 560 }}
             />
           </Radio>
           <div onClick={() => formApi.setValue('copyright_source', '')}>
@@ -257,7 +262,7 @@ const TemplateFields: React.FC<TemplateFieldsProps> = ({
           <InputNumber
             field="tid"
             label="分区 ID"
-            style={{ width: 272 }}
+            style={{ width: '100%', maxWidth: 272 }}
             placeholder="投稿分区 tid"
             extraText="本机没有可用的 B 站账号，拉不到分区列表，请直接填分区 ID"
             rules={[{ required: true }]}
@@ -266,7 +271,7 @@ const TemplateFields: React.FC<TemplateFieldsProps> = ({
           <Cascader
             field="tid"
             label="分区"
-            style={{ width: 272 }}
+            style={{ width: '100%', maxWidth: 272 }}
             treeData={treeData}
             placeholder="投稿分区"
             dropdownStyle={{ maxWidth: 670 }}
@@ -276,7 +281,7 @@ const TemplateFields: React.FC<TemplateFieldsProps> = ({
         <InputNumber
           field="tid_v2"
           label="分区 tid_v2"
-          style={{ width: 272 }}
+          style={{ width: '100%', maxWidth: 272 }}
           placeholder="可选，新版分区 ID"
           extraText="对应 B 站 tid_v2；不填则仅使用上方分区"
         />
@@ -289,7 +294,7 @@ const TemplateFields: React.FC<TemplateFieldsProps> = ({
           addOnBlur={true}
           separator=","
           placeholder="可用英文逗号分隔以批量输入标签，失焦/Enter 以保存"
-          style={{ width: 560 }}
+          style={{ width: '100%', maxWidth: 560 }}
           rules={[{ required: true, message: 'Tag不能为空' }]}
           onExceed={v => {
             Notification.warning({
@@ -311,11 +316,11 @@ const TemplateFields: React.FC<TemplateFieldsProps> = ({
         <Input
           field="cover_path"
           label="视频封面"
-          style={{ width: 464 }}
+          style={{ width: '100%', maxWidth: 464 }}
           placeholder="/cover/up.jpg"
         />
         <TextArea
-          style={{ maxWidth: 560 }}
+          style={{ width: '100%', maxWidth: 560 }}
           field="description"
           label="简介"
           placeholder="填写更全面的相关信息，让更多的人能找到你的视频吧"
@@ -324,7 +329,7 @@ const TemplateFields: React.FC<TemplateFieldsProps> = ({
           showClear
         />
         <TextArea
-          style={{ maxWidth: 560 }}
+          style={{ width: '100%', maxWidth: 560 }}
           field="extra_fields"
           label="额外字段"
           placeholder="Json格式，示例：{key: 'value'}"
@@ -353,6 +358,13 @@ const TemplateFields: React.FC<TemplateFieldsProps> = ({
             label={{ text: '定时发布' }}
             checkedText="｜"
             uncheckedText="〇"
+            onChange={checked => {
+              // 打开时滚轮已显示一个延迟（默认 4 小时），没点「确认」也按它保存；
+              // 否则 dtime 为空，保存后定时发布被悄悄丢掉，再打开开关也是关的
+              if (checked && !formApi.getValue('dtime')) {
+                formApi.setValue('dtime', selectedHours * 3600 + selectedMinutes * 60)
+              }
+            }}
           />
           <span style={{ paddingLeft: 12, fontSize: 12 }}>
             (当前+2小时 ≤ 可选时间 ≤

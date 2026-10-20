@@ -1,6 +1,6 @@
 use crate::downloader::flv_parser::{
-    AACPacketType, AVCPacketType, CodecId, FrameType, SoundFormat, TagData, TagHeader, TagType,
-    aac_audio_packet_header, avc_video_packet_header, script_data, tag_data, tag_header,
+    AACPacketType, AVCPacketType, FrameType, SoundFormat, TagData, TagHeader, TagType,
+    aac_audio_packet_header, script_data, tag_data, tag_header, video_data,
 };
 use crate::downloader::flv_writer::{FlvFile, FlvTag, TagDataHeader};
 use crate::downloader::preview::{self, ChunkKind, PreviewSink};
@@ -58,7 +58,7 @@ pub async fn download_with_boundaries(
             info!("Done... {}", file_name);
         }
         Err(e) => {
-            warn!("{e}")
+            warn!("{} Error: {}", file_name, e);
         }
     }
 }
@@ -80,6 +80,55 @@ pub async fn parse_flv(
     .await
 }
 
+const MAX_CONSECUTIVE_MALFORMED_TAGS: u32 = 32;
+const MAX_FLV_HEADER_LEN: usize = 1024;
+
+fn unsupported_video_codec(body: &[u8]) -> Option<&'static str> {
+    let first = *body.first()?;
+    if first & 0x80 == 0 {
+        return None;
+    }
+    match body.get(1..5)? {
+        b"vp09" => Some("VP9 (Enhanced-FLV vp09)"),
+        _ => None,
+    }
+}
+
+fn truncated(bytes: &Bytes, expected: usize) -> bool {
+    bytes.len() < expected
+}
+
+enum ResentFileHeader {
+    No,
+    Skipped,
+    Truncated,
+}
+
+async fn skip_resent_file_header(
+    connection: &mut Connection,
+    tag_header_bytes: &Bytes,
+) -> crate::downloader::error::Result<ResentFileHeader> {
+    if tag_header_bytes.len() < 11 || !tag_header_bytes.starts_with(b"FLV") {
+        return Ok(ResentFileHeader::No);
+    }
+    let data_offset = u32::from_be_bytes([
+        tag_header_bytes[5],
+        tag_header_bytes[6],
+        tag_header_bytes[7],
+        tag_header_bytes[8],
+    ]) as usize;
+    if !(9..=MAX_FLV_HEADER_LEN).contains(&data_offset) {
+        return Ok(ResentFileHeader::No);
+    }
+    let rest = data_offset + 4 - 11;
+    let skipped = connection.read_frame(rest).await?;
+    Ok(if truncated(&skipped, rest) {
+        ResentFileHeader::Truncated
+    } else {
+        ResentFileHeader::Skipped
+    })
+}
+
 async fn parse_flv_with_boundaries(
     mut connection: Connection,
     file: LifecycleFile<'_>,
@@ -89,7 +138,6 @@ async fn parse_flv_with_boundaries(
     mut segment_ended: SegmentBoundaryHook<'_>,
 ) -> crate::downloader::error::Result<()> {
     let mut flv_tags_cache: Vec<(TagHeader, Bytes, Bytes)> = Vec::new();
-    // println!("parse_flv Segment: {:?}", segment);
     let _previous_tag_size = connection.read_frame(4).await?;
 
     let mut out = FlvFile::new(file)?;
@@ -100,10 +148,10 @@ async fn parse_flv_with_boundaries(
             Bytes::from_static(&preview::flv::FILE_HEADER),
         );
     }
-    // let mut downloaded_size = 9 + 4;
+
     let mut on_meta_data = None;
     let mut aac_sequence_header = None;
-    let mut h264_sequence_header: Option<(TagHeader, Bytes, Bytes)> = None;
+    let mut video_sequence_header: Option<(TagHeader, Bytes, Bytes)> = None;
     let mut prev_video_timestamp: Option<u32> = None;
     let mut prev_audio_timestamp: Option<u32> = None;
     let mut stream_max_ms: Option<u32> = None;
@@ -114,6 +162,10 @@ async fn parse_flv_with_boundaries(
     let mut current_file_started = false;
     let mut create_new = false;
     let mut read_result: crate::downloader::error::Result<()> = Ok(());
+
+    let mut seen_valid_tag = false;
+    let mut consecutive_malformed: u32 = 0;
+
     loop {
         let tag_header_bytes = match connection.read_frame(11).await {
             Ok(b) => b,
@@ -123,9 +175,39 @@ async fn parse_flv_with_boundaries(
             }
         };
         if tag_header_bytes.is_empty() {
-            // let mut rdr = Cursor::new(tag_header_bytes);
-            // println!("{}", rdr.read_u32::<BigEndian>().unwrap());
             break;
+        }
+        if seen_valid_tag && truncated(&tag_header_bytes, 11) {
+            warn!(
+                "FLV stream ended in the middle of a tag header ({} of 11 bytes); treating it as the end of the stream",
+                tag_header_bytes.len()
+            );
+            break;
+        }
+        match skip_resent_file_header(&mut connection, &tag_header_bytes).await {
+            Ok(ResentFileHeader::No) => {}
+            Ok(ResentFileHeader::Skipped) => {
+                warn!(
+                    "FLV file header resent mid-stream (upstream restarted the stream); continuing the recording"
+                );
+                continue;
+            }
+            Ok(ResentFileHeader::Truncated) if seen_valid_tag => {
+                warn!(
+                    "FLV stream ended in the middle of a resent file header; treating it as the end of the stream"
+                );
+                break;
+            }
+            Ok(ResentFileHeader::Truncated) => {
+                read_result = Err(crate::downloader::error::Error::Custom(
+                    "FLV stream ended in the middle of a resent file header".to_string(),
+                ));
+                break;
+            }
+            Err(e) => {
+                read_result = Err(e);
+                break;
+            }
         }
 
         let (_, tag_header) = match map_parse_err(tag_header(&tag_header_bytes), "tag header") {
@@ -135,9 +217,9 @@ async fn parse_flv_with_boundaries(
                 break;
             }
         };
-        // write_tag_header(&mut out, &tag_header)?;
 
-        let bytes = match connection.read_frame(tag_header.data_size as usize).await {
+        let data_size = tag_header.data_size as usize;
+        let bytes = match connection.read_frame(data_size).await {
             Ok(b) => b,
             Err(e) => {
                 read_result = Err(e);
@@ -151,6 +233,26 @@ async fn parse_flv_with_boundaries(
                 break;
             }
         };
+        if seen_valid_tag && (truncated(&bytes, data_size) || truncated(&previous_tag_size, 4)) {
+            warn!(
+                "FLV stream ended in the middle of a {:?} tag; dropping the incomplete tag and treating it as the end of the stream",
+                tag_header.tag_type
+            );
+            break;
+        }
+
+        if tag_header.tag_type == TagType::Video
+            && let Some(codec) = unsupported_video_codec(&bytes)
+        {
+            read_result = Err(crate::downloader::error::Error::Custom(format!(
+                "收到 {codec} 编码的视频流，stream-gears 下载器不支持这种编码。\n\
+                解决方案：\n\
+                1. 将下载器切换为 mesio 或 ffmpeg\n\
+                2. 或在平台设置中将视频编码改为 AVC (H.264)、HEVC 或 AV1"
+            )));
+            break;
+        }
+
         if let Some(sink) = preview.as_mut() {
             let tag_type = tag_header.tag_type as u8;
             sink.push(
@@ -162,93 +264,111 @@ async fn parse_flv_with_boundaries(
                 ),
             );
         }
-        // out.write(&bytes)?;
-        let (i, flv_tag_data) = match map_parse_err(
-            tag_data(tag_header.tag_type, tag_header.data_size as usize)(&bytes),
-            "tag data",
-        ) {
+
+        let parsed = 'parse: {
+            let (i, flv_tag_data) = match map_parse_err(
+                tag_data(tag_header.tag_type, data_size)(&bytes),
+                "tag data",
+            ) {
+                Ok(res) => res,
+                Err(e) => break 'parse Err(e),
+            };
+            Ok(match flv_tag_data {
+                TagData::Audio(audio_data) => {
+                    let packet_type = if audio_data.sound_format == SoundFormat::AAC {
+                        let (_, packet_header) = match map_parse_err(
+                            aac_audio_packet_header(audio_data.sound_data),
+                            "aac audio packet header",
+                        ) {
+                            Ok(res) => res,
+                            Err(e) => break 'parse Err(e),
+                        };
+                        if packet_header.packet_type == AACPacketType::SequenceHeader {
+                            if aac_sequence_header.is_some() {
+                                warn!("Unexpected aac sequence header tag. {tag_header:?}");
+                            }
+                            aac_sequence_header =
+                                Some((tag_header, bytes.clone(), previous_tag_size.clone()))
+                        }
+                        Some(packet_header.packet_type)
+                    } else {
+                        None
+                    };
+
+                    FlvTag {
+                        header: tag_header,
+                        data: TagDataHeader::Audio {
+                            sound_format: audio_data.sound_format,
+                            sound_rate: audio_data.sound_rate,
+                            sound_size: audio_data.sound_size,
+                            sound_type: audio_data.sound_type,
+                            packet_type,
+                        },
+                    }
+                }
+                TagData::Video(video_data) => {
+                    if video_data.is_sequence_header() {
+                        if let Some((_, binary_data, _)) = &video_sequence_header {
+                            warn!("Unexpected video sequence header tag. {tag_header:?}");
+                            if bytes != binary_data {
+                                create_new = true;
+                                warn!("Different video sequence header tag. {tag_header:?}");
+                            }
+                        }
+                        video_sequence_header =
+                            Some((tag_header, bytes.clone(), previous_tag_size.clone()))
+                    }
+
+                    FlvTag {
+                        header: tag_header,
+                        data: TagDataHeader::Video {
+                            frame_type: video_data.frame_type,
+                            codec_id: video_data.codec_id,
+                            packet_type: video_data.packet_type,
+                            composition_time: video_data
+                                .packet_type
+                                .map(|_| video_data.composition_time),
+                            fourcc: video_data.fourcc_name(),
+                        },
+                    }
+                }
+                TagData::Script => {
+                    let (_, tag_data) = match map_parse_err(script_data(i), "script tag") {
+                        Ok(res) => res,
+                        Err(e) => break 'parse Err(e),
+                    };
+                    if on_meta_data.is_some() {
+                        warn!("Unexpected script tag. {tag_header:?}");
+                    }
+                    on_meta_data = Some((tag_header, bytes.clone(), previous_tag_size.clone()));
+
+                    FlvTag {
+                        header: tag_header,
+                        data: TagDataHeader::Script(tag_data),
+                    }
+                }
+            })
+        };
+
+        let flv_tag = match parsed {
             Ok(res) => res,
+            Err(e) if seen_valid_tag && consecutive_malformed < MAX_CONSECUTIVE_MALFORMED_TAGS => {
+                consecutive_malformed += 1;
+                warn!(
+                    "skipping a malformed {:?} tag (raw timestamp {} ms): {e}",
+                    tag_header.tag_type, tag_header.timestamp
+                );
+                continue;
+            }
             Err(e) => {
                 read_result = Err(e);
                 break;
             }
         };
-        let flv_tag = match flv_tag_data {
-            TagData::Audio(audio_data) => {
-                let packet_type = if audio_data.sound_format == SoundFormat::AAC {
-                    let (_, packet_header) = aac_audio_packet_header(audio_data.sound_data)
-                        .expect("Error in parsing aac audio packet header.");
-                    if packet_header.packet_type == AACPacketType::SequenceHeader {
-                        if aac_sequence_header.is_some() {
-                            warn!("Unexpected aac sequence header tag. {tag_header:?}");
-                            // panic!("Unexpected aac_sequence_header tag.");
-                            // create_new = true;
-                        }
-                        aac_sequence_header =
-                            Some((tag_header, bytes.clone(), previous_tag_size.clone()))
-                    }
-                    Some(packet_header.packet_type)
-                } else {
-                    None
-                };
 
-                FlvTag {
-                    header: tag_header,
-                    data: TagDataHeader::Audio {
-                        sound_format: audio_data.sound_format,
-                        sound_rate: audio_data.sound_rate,
-                        sound_size: audio_data.sound_size,
-                        sound_type: audio_data.sound_type,
-                        packet_type,
-                    },
-                }
-            }
-            TagData::Video(video_data) => {
-                let (packet_type, composition_time) = if CodecId::H264 == video_data.codec_id {
-                    let (_, avc_video_header) = avc_video_packet_header(video_data.video_data)
-                        .expect("Error in parsing avc video packet header.");
-                    if avc_video_header.packet_type == AVCPacketType::SequenceHeader {
-                        if let Some((_, binary_data, _)) = &h264_sequence_header {
-                            warn!("Unexpected h264 sequence header tag. {tag_header:?}");
-                            if bytes != binary_data {
-                                create_new = true;
-                                warn!("Different h264 sequence header tag. {tag_header:?}");
-                            }
-                        }
-                        h264_sequence_header =
-                            Some((tag_header, bytes.clone(), previous_tag_size.clone()))
-                    }
-                    (
-                        Some(avc_video_header.packet_type),
-                        Some(avc_video_header.composition_time),
-                    )
-                } else {
-                    (None, None)
-                };
+        seen_valid_tag = true;
+        consecutive_malformed = 0;
 
-                FlvTag {
-                    header: tag_header,
-                    data: TagDataHeader::Video {
-                        frame_type: video_data.frame_type,
-                        codec_id: video_data.codec_id,
-                        packet_type,
-                        composition_time,
-                    },
-                }
-            }
-            TagData::Script => {
-                let (_, tag_data) = script_data(i).expect("Error in parsing script tag.");
-                if on_meta_data.is_some() {
-                    warn!("Unexpected script tag. {tag_header:?}");
-                }
-                on_meta_data = Some((tag_header, bytes.clone(), previous_tag_size.clone()));
-
-                FlvTag {
-                    header: tag_header,
-                    data: TagDataHeader::Script(tag_data),
-                }
-            }
-        };
         match &flv_tag {
             FlvTag {
                 data:
@@ -264,9 +384,7 @@ async fn parse_flv_with_boundaries(
                     segment.set_start_time(Duration::from_millis(timestamp));
                 }
                 segment.set_time_position(Duration::from_millis(timestamp));
-                // 关键帧边界：先把缓存 tag 刷到当前文件。
-                // 仅对“媒体帧”做时间戳异常检测；script / sequence header 不参与 prev 推进，
-                // 否则新段写入的 header(ts=0 或旧 ts) 会和后续媒体帧形成假跳变。
+
                 let mut discard_rest_of_cache = false;
                 let mut dropped_after_anomaly = 0usize;
                 for (tag_header, flv_tag_data, previous_tag_size_bytes) in flv_tags_cache.drain(..)
@@ -274,8 +392,8 @@ async fn parse_flv_with_boundaries(
                     let is_media_for_ts = is_media_timestamp_tag(&tag_header, &flv_tag_data);
                     let track_prev = if is_media_for_ts {
                         match tag_header.tag_type {
-                            crate::downloader::flv_parser::TagType::Video => prev_video_timestamp,
-                            crate::downloader::flv_parser::TagType::Audio => prev_audio_timestamp,
+                            TagType::Video => prev_video_timestamp,
+                            TagType::Audio => prev_audio_timestamp,
                             _ => None,
                         }
                     } else {
@@ -336,10 +454,10 @@ async fn parse_flv_with_boundaries(
                     segment.increase_size((11 + tag_header.data_size + 4) as u64);
                     if is_media_for_ts {
                         match tag_header.tag_type {
-                            crate::downloader::flv_parser::TagType::Video => {
+                            TagType::Video => {
                                 prev_video_timestamp = Some(tag_header.timestamp);
                             }
-                            crate::downloader::flv_parser::TagType::Audio => {
+                            TagType::Audio => {
                                 prev_audio_timestamp = Some(tag_header.timestamp);
                             }
                             _ => {}
@@ -350,7 +468,6 @@ async fn parse_flv_with_boundaries(
                     warn!("时间戳异常后丢弃 {dropped_after_anomaly} 个缓存 tag，避免写入损坏帧");
                 }
 
-                // 当前关键帧本身也参与检测；它一定是媒体帧。
                 let threshold_ms = segment.timestamp_anomaly_threshold_ms();
                 let keyframe_anomaly = prev_video_timestamp
                     .map(|prev| is_timestamp_anomaly(prev, flv_tag.header.timestamp, threshold_ms))
@@ -364,7 +481,6 @@ async fn parse_flv_with_boundaries(
                     );
                     create_new = true;
                 } else if prev_video_timestamp.is_some_and(|prev| flv_tag.header.timestamp < prev) {
-                    // 小幅回退：保留在当前文件，避免直播抖动导致碎切（由单调钳位平滑写入）
                     warn!(
                         "关键帧处 DTS 小幅回退，忽略切分 previous={:?} current={} delta_ms={}",
                         prev_video_timestamp,
@@ -396,10 +512,6 @@ async fn parse_flv_with_boundaries(
                     last_audio_output_ms = None;
                     current_file_started = false;
 
-                    // 开启新分段时补齐已捕获的头部标签。这些头部并非所有直播流都具备
-                    // （例如纯视频流没有 AAC 序列头，部分流缺少 onMetaData 脚本标签），
-                    // 缺失时跳过并告警，而不是像原先那样直接 expect/panic 中断录制。
-                    // onMetaData
                     if let Some((meta_header, meta_bytes, previous_meta_tag_size)) =
                         on_meta_data.as_ref()
                     {
@@ -420,22 +532,19 @@ async fn parse_flv_with_boundaries(
                     } else {
                         warn!("切分新文件时缺少 AAC sequence header");
                     }
-                    // 始终写入 H264SequenceHeader，否则新段缺少 SPS/PPS 会无法解码。
-                    if let Some(h264_header) = h264_sequence_header.as_ref() {
+                    if let Some(video_header) = video_sequence_header.as_ref() {
                         flv_tags_cache.push((
-                            retimestamp_tag_header(&h264_header.0, 0),
-                            h264_header.1.clone(),
-                            h264_header.2.clone(),
+                            retimestamp_tag_header(&video_header.0, 0),
+                            video_header.1.clone(),
+                            video_header.2.clone(),
                         ));
                     } else {
-                        warn!("切分新文件时缺少 h264 sequence header，后续视频可能无法播放");
+                        warn!("切分新文件时缺少 video sequence header，后续视频可能无法播放");
                     }
                     create_new = false;
                 }
+
                 if !current_file_started {
-                    // A freshly split file only has sequence headers queued.
-                    // Persist them and the boundary keyframe immediately so
-                    // Start reflects the first media write, not the next GOP.
                     for (cached_header, cached_data, cached_previous_size) in
                         flv_tags_cache.drain(..)
                     {
@@ -455,7 +564,7 @@ async fn parse_flv_with_boundaries(
                         );
                         out.write_tag(&output_header, &cached_data, &cached_previous_size)?;
                         segment.increase_size((11 + cached_header.data_size + 4) as u64);
-                        if is_media && cached_header.tag_type == crate::downloader::flv_parser::TagType::Audio {
+                        if is_media && cached_header.tag_type == TagType::Audio {
                             prev_audio_timestamp = Some(cached_header.timestamp);
                         }
                     }
@@ -485,8 +594,7 @@ async fn parse_flv_with_boundaries(
             }
         }
     }
-    // 连接因 EOF、读超时或解析错误结束时，缓存里还留着最后一个 GOP（都是完整读到并解析过的 tag）：
-    // 先写出再返回原结果，否则每次断流、重连、下播都会丢掉最后 1–10 秒
+
     let drain_result: std::io::Result<()> = (|| {
         for (tag_header, flv_tag_data, previous_tag_size_bytes) in flv_tags_cache.drain(..) {
             let is_media = is_media_timestamp_tag(&tag_header, &flv_tag_data);
@@ -526,14 +634,13 @@ fn rebase_media_timestamp(
     is_media: bool,
     output_timestamp_base: &mut Option<u32>,
 ) -> TagHeader {
-    if !is_media {
+    if output_timestamp_base.is_none() && !is_media {
         return retimestamp_tag_header(header, 0);
     }
-    let base = *output_timestamp_base.get_or_insert(header.timestamp);
+    let base = *output_timestamp_base.get_or_insert(if header.timestamp <= 1000 { 0 } else { header.timestamp });
     retimestamp_tag_header(header, header.timestamp.saturating_sub(base))
 }
 
-/// 写入前：先按 source 前跳压平 base，再 rebase 到段内时间轴，并对容差内回退做分轨单调钳位平滑。
 fn rebase_media_timestamp_for_write(
     header: &TagHeader,
     is_media: bool,
@@ -556,21 +663,28 @@ fn rebase_media_timestamp_for_write(
         }
     }
     let mut out_header = rebase_media_timestamp(header, is_media, output_timestamp_base);
-    if is_media {
-        let prev_offset = *regression_offset;
-        let last_track_output = match header.tag_type {
-            TagType::Video => last_video_output_ms,
-            TagType::Audio => last_audio_output_ms,
-            _ => return out_header,
+    if !is_media {
+        let floor = match header.tag_type {
+            TagType::Video => last_video_output_ms.unwrap_or(0),
+            TagType::Audio => last_audio_output_ms.unwrap_or(0),
+            _ => 0,
         };
-        out_header.timestamp = clamp_regression_monotonic(
-            out_header.timestamp,
-            regression_offset,
-            last_track_output,
-        );
+        out_header.timestamp = out_header.timestamp.max(floor);
+        return out_header;
+    }
+    let prev_offset = *regression_offset;
+    let last_track_output = match header.tag_type {
+        TagType::Video => last_video_output_ms,
+        TagType::Audio => last_audio_output_ms,
+        _ => return out_header,
+    };
+    out_header.timestamp = clamp_regression_monotonic(
+        out_header.timestamp,
+        regression_offset,
+        last_track_output,
+    );
         if *regression_offset > prev_offset {
             let gap = *regression_offset - prev_offset;
-            // 优化日志级别：微小容差平滑（< 100ms）使用 debug 避免刷屏，显著回退（>= 100ms）才使用 warn 提醒
             if gap >= 100 {
                 warn!(
                     "输出时间戳已单调钳位平滑 tag_type={:?} raw_timestamp={} output_timestamp={} clamped_gap_ms={gap} total_offset_ms={}",
@@ -589,17 +703,14 @@ fn rebase_media_timestamp_for_write(
                 );
             }
         }
-    }
     out_header
 }
 
 fn is_media_timestamp_tag(tag_header: &TagHeader, body: &Bytes) -> bool {
     match tag_header.tag_type {
-        crate::downloader::flv_parser::TagType::Script => false,
-        crate::downloader::flv_parser::TagType::Audio => {
-            // AAC sequence header 不推进媒体时间轴
+        TagType::Script => false,
+        TagType::Audio => {
             if body.len() >= 2 {
-                // sound_format 高 4 bit == 10 (AAC) 且 packet_type == 0
                 let sound_format = body[0] >> 4;
                 let packet_type = body[1];
                 !(sound_format == 10 && packet_type == 0)
@@ -607,12 +718,12 @@ fn is_media_timestamp_tag(tag_header: &TagHeader, body: &Bytes) -> bool {
                 true
             }
         }
-        crate::downloader::flv_parser::TagType::Video => {
-            // AVC sequence header: frame/codec 后 packet_type == 0
-            if body.len() >= 2 {
+        TagType::Video => {
+            if let Ok((_, video)) = video_data(body, body.len()) {
+                !video.is_sequence_header()
+            } else if body.len() >= 2 {
                 let codec_id = body[0] & 0x0f;
                 let packet_type = body[1];
-                // 7 = AVC/H264
                 !(codec_id == 7 && packet_type == 0)
             } else {
                 true
@@ -657,37 +768,20 @@ impl Connection {
         &mut self,
         chunk_size: usize,
     ) -> crate::downloader::error::Result<Bytes> {
-        // let mut buf = [0u8; 8 * 1024];
         loop {
             if chunk_size <= self.buffer.len() {
                 let bytes = Bytes::copy_from_slice(&self.buffer[..chunk_size]);
                 self.buffer.advance(chunk_size);
                 return Ok(bytes);
             }
-            // BytesMut::with_capacity(0).deref_mut()
-            // tokio::fs::File::open("").read()
-            // self.resp.chunk()
             match timeout(Duration::from_secs(30), self.resp.chunk()).await? {
                 Ok(Some(chunk)) => {
-                    // let n = chunk.len();
-                    // println!("Chunk: {:?}", chunk);
                     self.buffer.put(chunk);
-                    // self.buffer.put_slice(&buf[..n]);
                 }
                 _ => {
                     return Ok(self.buffer.split().freeze());
                 }
             }
-            // let n = match self.resp.read(&mut buf).await {
-            //     Ok(n) => n,
-            //     Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            //     Err(e) => return Err(e),
-            // };
-
-            // if n == 0 {
-            //     return Ok(self.buffer.split().freeze());
-            // }
-            // self.buffer.put_slice(&buf[..n]);
         }
     }
 }
@@ -1636,4 +1730,447 @@ mod tests {
         Ok(())
     }
 
+
+    fn push_tag(data: &mut Vec<u8>, tag_type: u8, ts: u32, body: &[u8]) {
+        data.push(tag_type);
+        data.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        data.extend_from_slice(&(ts & 0xff_ffff).to_be_bytes()[1..]);
+        data.push((ts >> 24) as u8);
+        data.extend_from_slice(&[0, 0, 0]);
+        data.extend_from_slice(body);
+        data.extend_from_slice(&((11 + body.len()) as u32).to_be_bytes());
+    }
+
+    /// 从 `offset` 起逐个读出 tag 的（类型, 时间戳）。
+    fn tag_timestamps(bytes: &[u8], mut offset: usize) -> Vec<(u8, u32)> {
+        let mut out = Vec::new();
+        while offset + 11 <= bytes.len() {
+            let h = &bytes[offset..offset + 11];
+            let size = u32::from_be_bytes([0, h[1], h[2], h[3]]) as usize;
+            out.push((h[0], u32::from_be_bytes([h[7], h[4], h[5], h[6]])));
+            offset += 15 + size;
+        }
+        out
+    }
+
+    /// 音视频交错：音频 tag 先到、时间戳比紧随其后的视频帧晚 30 ms（FLV 只要求同一轨道单调），
+    /// 中途还重发了一次时间戳为 0 的 onMetaData。这些都不是时间戳断裂：落盘的音视频时间戳
+    /// 必须与源流逐个相同，不能每遇到一次交错就把 offset 累加一次、把整条时间轴越拉越长。
+    #[tokio::test]
+    async fn interleaved_audio_video_timestamps_are_kept_as_is() {
+        let meta = [
+            0x02, 0x00, 0x0A, b'o', b'n', b'M', b'e', b't', b'a', b'D', b'a', b't', b'a', 0x05,
+        ];
+        let mut body = vec![0, 0, 0, 0];
+        push_tag(&mut body, 18, 0, &meta);
+        push_tag(&mut body, 9, 0, &[0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64]);
+        push_tag(&mut body, 8, 0, &[0xaf, 0x00, 0x12, 0x10]);
+        for i in 0..50u32 {
+            let video_ts = i * 40;
+            push_tag(&mut body, 8, video_ts + 30, &[0xaf, 0x01, 0x21]);
+            let video: &[u8] = if i % 10 == 0 {
+                &[0x17, 0x01, 0, 0, 0, 0xaa]
+            } else {
+                &[0x27, 0x01, 0, 0, 0, 0xbb]
+            };
+            push_tag(&mut body, 9, video_ts, video);
+            if i == 25 {
+                push_tag(&mut body, 18, 0, &meta);
+            }
+        }
+
+        let (result, data) = record_unsegmented(body.clone().into()).await;
+        result.unwrap();
+        let media = |tags: Vec<(u8, u32)>| -> Vec<(u8, u32)> {
+            tags.into_iter().filter(|(t, _)| *t != 18).collect()
+        };
+        let written = media(tag_timestamps(&data, 13));
+        let source = media(tag_timestamps(&body, 4));
+        assert_eq!(written.len(), 102);
+        assert_eq!(written, source);
+    }
+
+    /// A restart of only the audio encoder must not shift the video timeline.
+    /// The correction is tracked per media track; the old global offset made
+    /// the video jump forward when an audio timestamp reset to zero.
+    #[tokio::test]
+    async fn an_audio_timestamp_reset_does_not_shift_video() {
+        let mut body = vec![0, 0, 0, 0];
+        push_tag(&mut body, 18, 0, &META);
+        push_tag(&mut body, 9, 0, &AVC_SEQUENCE_HEADER);
+        push_tag(&mut body, 8, 0, &AAC_SEQUENCE_HEADER);
+        push_tag(&mut body, 9, 1000, &[0x17, 0x01, 0, 0, 0, 0xaa]);
+        push_tag(&mut body, 8, 1000, &[0xaf, 0x01, 0x21]);
+        // Only the audio clock restarts at zero.
+        push_tag(&mut body, 8, 0, &[0xaf, 0x01, 0x21]);
+        push_tag(&mut body, 9, 1040, &[0x17, 0x01, 0, 0, 0, 0xbb]);
+        push_tag(&mut body, 8, 40, &[0xaf, 0x01, 0x21]);
+
+        let (result, data) = record_unsegmented(body.into()).await;
+        result.unwrap();
+        let video_timestamps: Vec<u32> = tag_timestamps(&data, 13)
+            .into_iter()
+            .filter(|(tag_type, _)| *tag_type == 9)
+            .map(|(_, timestamp)| timestamp)
+            .collect();
+        assert!(video_timestamps.windows(2).all(|w| w[0] <= w[1]));
+        assert_eq!(video_timestamps[0], 0);
+        assert_eq!(video_timestamps[1], 1000);
+        assert!(video_timestamps[2] >= 1040);
+    }
+
+    /// 每个关键帧前都重发一次时间戳为 0 的 onMetaData 时，按时长分段照常进行：
+    /// 写出的脚本 tag 不能让「已写出的时间戳」退回 0，否则每个关键帧都会重置分段起点、永远不切。
+    #[tokio::test]
+    async fn resent_metadata_does_not_reset_the_segment_clock() {
+        use crate::downloader::util::{LifecycleFile, Segmentable};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let meta = [
+            0x02, 0x00, 0x0A, b'o', b'n', b'M', b'e', b't', b'a', b'D', b'a', b't', b'a', 0x05,
+        ];
+        let mut body = vec![0, 0, 0, 0];
+        push_tag(&mut body, 18, 0, &meta);
+        push_tag(&mut body, 9, 0, &[0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64]);
+        for i in 0..10u32 {
+            push_tag(&mut body, 18, 0, &meta);
+            push_tag(&mut body, 9, i * 500, &[0x17, 0x01, 0, 0, 0, 0xaa]);
+            push_tag(&mut body, 9, i * 500 + 250, &[0x27, 0x01, 0, 0, 0, 0xbb]);
+        }
+
+        let http_resp = http::Response::builder().status(200).body(body).unwrap();
+        let connection = super::Connection::new(reqwest::Response::from(http_resp));
+        let dir = tempfile::tempdir().unwrap();
+        let segments = Arc::new(Mutex::new(0usize));
+        let file = LifecycleFile::with_hook(dir.path().join("rec").to_str().unwrap(), "flv", {
+            let segments = segments.clone();
+            move |_: &str| *segments.lock().unwrap() += 1
+        });
+        let segment = Segmentable::new(Some(Duration::from_secs(1)), None);
+        super::parse_flv(connection, file, segment, None)
+            .await
+            .unwrap();
+        let segments = *segments.lock().unwrap();
+        assert!(
+            segments >= 4,
+            "4.5 s of stream split every second, got {segments} segment(s)"
+        );
+    }
+
+    const META: [u8; 14] = [
+        0x02, 0x00, 0x0A, b'o', b'n', b'M', b'e', b't', b'a', b'D', b'a', b't', b'a', 0x05,
+    ];
+    const AVC_SEQUENCE_HEADER: [u8; 7] = [0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64];
+    const AAC_SEQUENCE_HEADER: [u8; 4] = [0xaf, 0x00, 0x12, 0x10];
+
+    /// 开头的 onMetaData + 序列头，接着 `frames` 帧音视频（视频每 40 ms 一帧、每 25 帧一个关键帧，
+    /// 音频比同一帧的视频晚 20 ms），时间戳从 `start` 起。CDN 切换后的新流同样以这一组头开头。
+    fn douyu_segment(body: &mut Vec<u8>, start: u32, frames: u32) {
+        push_tag(body, 18, start, &META);
+        push_tag(body, 9, start, &AVC_SEQUENCE_HEADER);
+        push_tag(body, 8, start, &AAC_SEQUENCE_HEADER);
+        for i in 0..frames {
+            let ts = start + i * 40;
+            let video: &[u8] = if i % 25 == 0 {
+                &[0x17, 0x01, 0, 0, 0, 0xaa]
+            } else {
+                &[0x27, 0x01, 0, 0, 0, 0xbb]
+            };
+            push_tag(body, 9, ts, video);
+            push_tag(body, 8, ts + 20, &[0xaf, 0x01, 0x21]);
+        }
+    }
+
+    /// 音频、视频各自的落盘时间戳必须单调不减，返回（音频, 视频）时间戳。
+    fn assert_tracks_monotonic(written: &[(u8, u32)]) -> (Vec<u32>, Vec<u32>) {
+        let track = |kind: u8| -> Vec<u32> {
+            written
+                .iter()
+                .filter(|(t, _)| *t == kind)
+                .map(|(_, ts)| *ts)
+                .collect()
+        };
+        let (audio, video) = (track(8), track(9));
+        for (name, ts) in [("audio", &audio), ("video", &video)] {
+            assert!(
+                ts.windows(2).all(|w| w[0] <= w[1]),
+                "{name} timestamps go backwards: {ts:?}"
+            );
+        }
+        (audio, video)
+    }
+
+    /// 斗鱼 CDN 切换（日志里的 `Non-monotonous DTS ... previous: 4877, current: 0`）：时间戳归 0，
+    /// 切换瞬间夹着一个空的视频 tag，随后重发 onMetaData 与序列头，最后连接在一个 tag 中间断开。
+    /// 录制要一直录到断开为止并正常结束：空 tag 丢掉，切换后的时间戳接在切换前后面，
+    /// 不能因为时间戳回退、空 tag 或残缺的结尾把整场录制当成失败。
+    #[tokio::test]
+    async fn douyu_cdn_switch_keeps_recording_across_the_timestamp_reset() {
+        let mut body = vec![0, 0, 0, 0];
+        douyu_segment(&mut body, 0, 122); // 视频最后一帧在 4840 ms，音频在 4860 ms
+        push_tag(&mut body, 9, 0, &[]); // 切换瞬间的空视频 tag
+        douyu_segment(&mut body, 0, 50);
+        let source = tag_timestamps(&body, 4);
+        body.extend_from_slice(&[0x09, 0x00, 0x00, 0x06, 0x00]); // 下一个 tag 头只到了 5 字节
+
+        let (result, data) = record_unsegmented(body.into()).await;
+        result.expect("a CDN switch must not end the recording with an error");
+        let written = tag_timestamps(&data, 13);
+        let (_, video) = assert_tracks_monotonic(&written);
+
+        // 空 tag 之外的每个 tag 都落盘
+        assert_eq!(written.len(), source.len() - 1);
+        // 切换前 122 帧 + 两次序列头 + 切换后 50 帧
+        assert_eq!(video.len(), 122 + 2 + 50);
+        // 切换后的帧接在切换前最后一帧之后，间隔与源流一致，而不是从 0 重来
+        let after_switch = &video[123..];
+        assert!(
+            after_switch.iter().all(|&ts| ts >= 4840),
+            "{after_switch:?}"
+        );
+        assert_eq!(
+            after_switch[after_switch.len() - 1] - after_switch[1],
+            49 * 40
+        );
+    }
+
+    /// 推流端重连时，有的 CDN 在原连接上重新发一遍 FLV 文件头，再从时间戳 0 开始发新流。
+    /// 文件头要跳过，录制接着进行，而不是把 `FLV` 当成 tag 头解析失败。
+    #[tokio::test]
+    async fn a_resent_flv_file_header_does_not_end_the_recording() {
+        let mut body = vec![0, 0, 0, 0];
+        douyu_segment(&mut body, 0, 30);
+        let before = tag_timestamps(&body, 4).len();
+        body.extend_from_slice(b"FLV\x01\x05\x00\x00\x00\x09\x00\x00\x00\x00");
+        let mut rest = Vec::new();
+        douyu_segment(&mut rest, 0, 30);
+        let after = tag_timestamps(&rest, 0).len();
+        body.extend_from_slice(&rest);
+
+        let (result, data) = record_unsegmented(body.into()).await;
+        result.expect("a resent FLV header must not end the recording");
+        let written = tag_timestamps(&data, 13);
+        assert_eq!(written.len(), before + after);
+        let (_, video) = assert_tracks_monotonic(&written);
+        assert!(video[video.len() - 1] >= 29 * 40 + 29 * 40);
+
+        // 连接断在重发的文件头中间：按正常断流结束，此前的内容都已落盘
+        let mut cut = vec![0, 0, 0, 0];
+        douyu_segment(&mut cut, 0, 30);
+        cut.extend_from_slice(b"FLV\x01\x05\x00\x00\x00\x09\x00\x00");
+        let (result, data) = record_unsegmented(cut.into()).await;
+        result.expect("a cut inside a resent header ends the stream normally");
+        assert_eq!(tag_timestamps(&data, 13).len(), before);
+    }
+
+    /// 一个有效 tag 都还没读到就断开或解析失败：照旧报错（地址不对、根本不是 FLV 流），
+    /// 与 stream-gears 的 `download` 对 `truncated.flv` / `bad-script.flv` 抛错的约定一致。
+    #[tokio::test]
+    async fn problems_before_the_first_valid_tag_are_still_errors() {
+        let mut truncated = vec![0, 0, 0, 0];
+        truncated.extend_from_slice(&[0x09, 0x00, 0x00, 0x10, 0x00]);
+        let (result, _) = record_unsegmented(truncated.into()).await;
+        assert!(result.is_err());
+
+        let mut bad_script = vec![0, 0, 0, 0];
+        push_tag(&mut bad_script, 18, 0, &[0x02, 0x00, 0x00]);
+        let (result, _) = record_unsegmented(bad_script.into()).await;
+        let error = result.expect_err("a malformed first tag must be reported");
+        assert!(error.to_string().contains("script tag"), "{error}");
+    }
+
+    /// 流开头正常、之后连续几十个 tag 都解析不了：流已错位，报错而不是一直跳过去。
+    #[tokio::test]
+    async fn a_run_of_malformed_tags_is_an_error() {
+        let mut body = vec![0, 0, 0, 0];
+        douyu_segment(&mut body, 0, 10);
+        for _ in 0..=super::MAX_CONSECUTIVE_MALFORMED_TAGS {
+            push_tag(&mut body, 9, 400, &[]);
+        }
+        douyu_segment(&mut body, 400, 10);
+        let (result, data) = record_unsegmented(body.into()).await;
+        assert!(result.is_err(), "{result:?}");
+        // 出错之前读到的都已落盘
+        assert_eq!(keyframes(&data), 1);
+    }
+
+    /// HEVC / AV1 的流照常录制：老式 codec id 12/13 与 Enhanced-FLV 的 `hvc1` / `av01` 都逐字节
+    /// 落盘，视频 tag 不是被跳过、也不会录出一个只有音频的文件。
+    #[tokio::test]
+    async fn hevc_and_av1_streams_are_recorded_verbatim() {
+        let cases: [(&str, Vec<u8>, Vec<u8>, Vec<u8>); 4] = [
+            // 国内 CDN 常用的 HEVC / AV1 codec id：载荷与 AVC 同构（序列头 / 关键帧 / 普通帧）
+            (
+                "HEVC (codec id 12)",
+                vec![0x1c, 0x00, 0, 0, 0, 0x01, 0x64],
+                vec![0x1c, 0x01, 0, 0, 0, 0xaa],
+                vec![0x2c, 0x01, 0, 0, 0, 0xbb],
+            ),
+            (
+                "AV1 (codec id 13)",
+                vec![0x1d, 0x00, 0, 0, 0, 0x0a, 0x0b],
+                vec![0x1d, 0x01, 0, 0, 0, 0xaa],
+                vec![0x2d, 0x01, 0, 0, 0, 0xbb],
+            ),
+            // Enhanced-FLV：IsExHeader 位 + FourCC，CodedFrames 带 3 字节 composition time
+            (
+                "Enhanced-FLV hvc1",
+                vec![0x90, b'h', b'v', b'c', b'1', 0x01, 0x64],
+                vec![0x91, b'h', b'v', b'c', b'1', 0, 0, 0, 0xaa],
+                vec![0xa1, b'h', b'v', b'c', b'1', 0, 0, 0, 0xbb],
+            ),
+            (
+                "Enhanced-FLV av01",
+                vec![0x90, b'a', b'v', b'0', b'1', 0x0a, 0x0b],
+                vec![0x91, b'a', b'v', b'0', b'1', 0, 0, 0, 0xaa],
+                vec![0xa1, b'a', b'v', b'0', b'1', 0, 0, 0, 0xbb],
+            ),
+        ];
+        for (name, sequence_header, keyframe, inter) in cases {
+            let mut body = vec![0, 0, 0, 0];
+            push_tag(&mut body, 18, 0, &META);
+            push_tag(&mut body, 9, 0, &sequence_header);
+            push_tag(&mut body, 8, 0, &AAC_SEQUENCE_HEADER);
+            for i in 0..50u32 {
+                let video = if i % 25 == 0 { &keyframe } else { &inter };
+                push_tag(&mut body, 9, i * 40, video);
+                push_tag(&mut body, 8, i * 40 + 20, &[0xaf, 0x01, 0x21]);
+            }
+            let (result, data) = record_unsegmented(body.clone().into()).await;
+            result.unwrap_or_else(|e| panic!("{name} 应该能录：{e}"));
+            // 每个 tag（含全部视频 tag）原样落盘，时间戳没有被改写
+            assert_eq!(&data[13..], &body[4..], "{name}：源流的每个 tag 都要落盘");
+            let video_tags: Vec<(u8, u32)> = tag_timestamps(&data, 13)
+                .into_iter()
+                .filter(|(tag_type, _)| *tag_type == 9)
+                .collect();
+            // 1 个序列头 + 50 个视频帧（每 25 帧一个关键帧）
+            assert_eq!(video_tags.len(), 51, "{name}：视频 tag 一个都不能少");
+            assert_eq!(video_tags[0].1, 0);
+            assert_eq!(video_tags[50].1, 49 * 40);
+            assert!(
+                data.windows(keyframe.len()).any(|w| w == &keyframe[..]),
+                "{name}：关键帧必须写进文件"
+            );
+            assert!(
+                data.windows(sequence_header.len())
+                    .any(|w| w == &sequence_header[..]),
+                "{name}：序列头必须写进文件"
+            );
+        }
+    }
+
+    /// 真正不支持的编码（Enhanced-FLV 的 VP9）仍然报错：整条视频轨录不了，不能悄悄录成纯音频文件。
+    #[tokio::test]
+    async fn an_unsupported_codec_is_an_error_not_an_audio_only_recording() {
+        let mut body = vec![0, 0, 0, 0];
+        push_tag(&mut body, 18, 0, &META);
+        push_tag(&mut body, 8, 0, &AAC_SEQUENCE_HEADER);
+        for i in 0..50u32 {
+            let video: &[u8] = if i % 25 == 0 {
+                &[0x91, b'v', b'p', b'0', b'9', 0, 0, 0, 0xaa]
+            } else {
+                &[0xa1, b'v', b'p', b'0', b'9', 0, 0, 0, 0xbb]
+            };
+            push_tag(&mut body, 9, i * 40, video);
+            push_tag(&mut body, 8, i * 40 + 20, &[0xaf, 0x01, 0x21]);
+        }
+        let (result, _) = record_unsegmented(body.into()).await;
+        let error = result.expect_err("an unsupported codec must not be recorded as audio only");
+        assert!(error.to_string().contains("VP9"), "{error}");
+        assert!(
+            !error.to_string().contains("只支持 H.264"),
+            "错误文案得说清楚支持哪些编码：{error}"
+        );
+    }
+
+    /// 序列头变化（编码器重启、换编码参数）时另开分段：每个分段都自带序列头，且序列头在第一个
+    /// 关键帧之前 —— 新分段少了它就没法解码。
+    #[tokio::test]
+    async fn a_changed_hevc_sequence_header_starts_a_new_segment() {
+        use crate::downloader::util::{LifecycleFile, Segmentable};
+        use std::sync::{Arc, Mutex};
+
+        let first_header = [0x90, b'h', b'v', b'c', b'1', 0x01, 0x64, 0x00, 0x1f];
+        let second_header = [0x90, b'h', b'v', b'c', b'1', 0x01, 0x64, 0x00, 0x2f];
+        let keyframe = [0x91, b'h', b'v', b'c', b'1', 0, 0, 0, 0xaa];
+        let inter = [0xa1, b'h', b'v', b'c', b'1', 0, 0, 0, 0xbb];
+
+        let mut body = vec![0, 0, 0, 0];
+        push_tag(&mut body, 18, 0, &META);
+        push_tag(&mut body, 8, 0, &AAC_SEQUENCE_HEADER);
+        push_tag(&mut body, 9, 0, &first_header);
+        for i in 0..4u32 {
+            push_tag(&mut body, 9, 1000 + i * 40, &keyframe);
+            push_tag(&mut body, 8, 1000 + i * 40 + 20, &[0xaf, 0x01, 0x21]);
+        }
+        // 编码器重启：新的序列头跟着新的关键帧来
+        push_tag(&mut body, 9, 1400, &second_header);
+        for i in 0..4u32 {
+            push_tag(
+                &mut body,
+                9,
+                1400 + i * 40,
+                if i == 0 { &keyframe } else { &inter },
+            );
+            push_tag(&mut body, 8, 1400 + i * 40 + 20, &[0xaf, 0x01, 0x21]);
+        }
+
+        let http_resp = http::Response::builder().status(200).body(body).unwrap();
+        let connection = super::Connection::new(reqwest::Response::from(http_resp));
+        let dir = tempfile::tempdir().unwrap();
+        let segments: Arc<Mutex<Vec<std::path::PathBuf>>> = Arc::default();
+        let file = LifecycleFile::with_hook(dir.path().join("rec").to_str().unwrap(), "flv", {
+            let segments = segments.clone();
+            let dir = dir.path().to_path_buf();
+            move |name: &str| {
+                let mut segments = segments.lock().unwrap();
+                let path = dir.join(format!("seg-{:04}.flv", segments.len()));
+                std::fs::rename(name, &path).unwrap();
+                segments.push(path);
+            }
+        });
+        // 不按大小 / 时长分段，只有序列头变化能切开
+        super::parse_flv(connection, file, Segmentable::new(None, None), None)
+            .await
+            .unwrap();
+
+        let segments = segments.lock().unwrap();
+        assert!(
+            segments.len() >= 2,
+            "the changed sequence header must split the recording, got {} segment(s)",
+            segments.len()
+        );
+        for path in segments.iter() {
+            let bytes = std::fs::read(path).unwrap();
+            let header_at = bytes
+                .windows(first_header.len())
+                .position(|w| w == &first_header[..] || w == &second_header[..])
+                .unwrap_or_else(|| panic!("{}: no video sequence header", path.display()));
+            let keyframe_at = bytes
+                .windows(keyframe.len())
+                .position(|w| w == &keyframe[..])
+                .unwrap_or_else(|| panic!("{}: no keyframe", path.display()));
+            assert!(
+                header_at < keyframe_at,
+                "{}: the sequence header must come before the first keyframe",
+                path.display()
+            );
+        }
+        // 第一个分段带旧序列头，最后一个分段带新的
+        let first = std::fs::read(&segments[0]).unwrap();
+        let last = std::fs::read(segments.last().unwrap()).unwrap();
+        assert!(
+            first
+                .windows(first_header.len())
+                .any(|w| w == &first_header[..])
+        );
+        assert!(
+            last.windows(second_header.len())
+                .any(|w| w == &second_header[..]),
+            "the new segment must carry the new sequence header"
+        );
+    }
 }
+

@@ -1,7 +1,7 @@
 'use client'
+
 import {
   Form,
-  Modal,
   Notification,
   Collapse,
   Select,
@@ -11,7 +11,7 @@ import {
 } from '@douyinfe/semi-ui'
 import { FormApi } from '@douyinfe/semi-ui/lib/es/form'
 import React, { useMemo, useRef, useState } from 'react'
-import { LiveStreamerEntity } from '../lib/api-streamer'
+import { LiveStreamerEntity, type MosaicConfig } from '../lib/api-streamer'
 import { SupportedPlatforms } from '@/app/ui/plugins'
 import { useBiliUsers } from '../lib/use-streamers'
 import {
@@ -19,12 +19,18 @@ import {
   cloneOverride,
   compactOverrideRecord,
   formatOverrideText,
-  parseOverrideText,
+  parseOverrideText as parseSparseOverrideText,
   pickStreamerPayload,
   type OverrideRecord,
 } from '@/app/lib/override-config'
 import OverrideSwitch, { IsOverrideFormContext } from '@/app/ui/components/OverrideSwitch'
 import { FileSizeField } from './FileSizeInput'
+import { FormSheet } from './shell'
+import { MosaicPanel } from './MosaicPanel'
+import { SegmentTimeField } from './SegmentTimeField'
+import { updateSegmentTimeOverride, validateSegmentTime, type SegmentTimeValue } from '../lib/segment-time'
+import { parseOverrideText, updateMosaicOverrideText, validateMosaicConfig } from '../lib/mosaic-config'
+import { applyLocalMaterialPreset } from '../lib/local-material-preset'
 
 type PluginProps = {
   entity?: LiveStreamerEntity
@@ -36,6 +42,7 @@ type TemplateModalProps = {
   visible?: boolean
   entity?: LiveStreamerEntity
   children?: React.ReactNode
+  initialPanel?: 'plugin' | 'mosaic'
   onOk: (e: any) => Promise<void>
 }
 
@@ -47,13 +54,15 @@ type PlatformPattern = keyof typeof SupportedPlatforms
 const matchPlatformPattern = (url?: string): PlatformPattern | undefined =>
   (Object.keys(SupportedPlatforms) as PlatformPattern[]).find(pattern => url?.match(new RegExp(pattern)))
 
-const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk }) => {
+const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, initialPanel = 'plugin', onOk }) => {
+  const [activePanels, setActivePanels] = useState<string[]>([initialPanel])
   const api = useRef<FormApi>(undefined)
   const lastEditedRef = useRef<LastEdited>('form')
   const overrideRef = useRef<OverrideRecord>({})
   const syncingRef = useRef(false)
   const [visible, setVisible] = useState(false)
   const [formKey, setFormKey] = useState(0)
+  const localMaterialPresetApplied = useRef(false)
 
   const { biliUsers } = useBiliUsers()
   const list = biliUsers?.map(item => {
@@ -70,8 +79,6 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
 
   const initialOverride = useMemo(
     () => compactOverrideRecord(entity?.override as OverrideRecord | undefined),
-    // re-init only when opening a different entity or after external entity change while closed
-    // eslint-disable-next-line react-hooks/exhaustive-deps
     [entity?.id, visible]
   )
 
@@ -81,6 +88,8 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
   }, [entity?.url])
 
   const showDialog = () => {
+    setActivePanels([initialPanel])
+    localMaterialPresetApplied.current = false
     const current = compactOverrideRecord(entity?.override as OverrideRecord | undefined)
     overrideRef.current = current
     lastEditedRef.current = 'form'
@@ -101,100 +110,165 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
       override_text: formatOverrideText(override),
     }
     formApi.setValues(nextValues, { isOverride: true })
-    // allow form fields to settle before accepting user edits again
     queueMicrotask(() => {
       syncingRef.current = false
     })
   }
 
-  const writeOverrideText = (override: OverrideRecord) => {
-    const text = formatOverrideText(override)
-    const currentText = api.current?.getValue('override_text')
-    if (currentText === text) return
-    syncingRef.current = true
-    api.current?.setValue('override_text', text)
-    queueMicrotask(() => {
-      syncingRef.current = false
-    })
-  }
-
-  // Only merge explicitly changed form paths into override.
-  // Untouched controls never enter JSON.
-  const syncFormChangeToOverride = (changedValue?: Record<string, any>) => {
-    if (syncingRef.current) return
-    const override = applyChangedValuesToOverride(overrideRef.current, changedValue)
-    overrideRef.current = override
+  const syncFormChangeToOverride = (changedValue: Record<string, any>) => {
     lastEditedRef.current = 'form'
-    writeOverrideText(override)
+    const next = applyChangedValuesToOverride(overrideRef.current, changedValue)
+    overrideRef.current = next
+
+    syncingRef.current = true
+    api.current?.setValue('override_text', formatOverrideText(next))
+    queueMicrotask(() => {
+      syncingRef.current = false
+    })
   }
 
-  const syncJsonToForm = (text?: string) => {
-    if (syncingRef.current) return
-    const parsed = parseOverrideText(text)
-    if (!parsed.ok) {
-      return false
-    }
+  const syncJsonToForm = (jsonText?: string) => {
+    const parsed = parseSparseOverrideText(jsonText)
+    if (!parsed.ok) return
     applyOverrideToForm(parsed.value, 'json')
-    return true
   }
 
-  const handleOk = async () => {
-    try {
-      await api.current?.validate()
-    } catch {
-      return
-    }
-
-    let override: OverrideRecord
-    if (lastEditedRef.current === 'json') {
-      const text = api.current?.getValue('override_text')
-      const parsed = parseOverrideText(text)
-      if (!parsed.ok) {
-        Notification.error({
-          title: '错误',
-          content: parsed.error,
-        })
-        return
-      }
-      override = compactOverrideRecord(parsed.value)
+  const syncMosaicConfig = (mosaicConfig?: MosaicConfig | null) => {
+    const next = cloneOverride(overrideRef.current)
+    if (mosaicConfig && mosaicConfig.enabled) {
+      next.mosaic_config = mosaicConfig
+    } else if (mosaicConfig && !mosaicConfig.enabled) {
+      next.mosaic_config = { enabled: false, regions: [] }
     } else {
-      // form edits already merged into overrideRef via onValueChange
-      override = compactOverrideRecord(overrideRef.current)
+      delete next.mosaic_config
     }
+    overrideRef.current = compactOverrideRecord(next)
+    syncingRef.current = true
+    api.current?.setValue('mosaic_config', next.mosaic_config)
+    api.current?.setValue('override_text', formatOverrideText(overrideRef.current))
+    queueMicrotask(() => {
+      syncingRef.current = false
+    })
+  }
 
-    const payload = {
-      ...pickStreamerPayload(entity as Record<string, any>),
-      override,
+  const syncSegmentTime = (value: SegmentTimeValue) => {
+    const next = cloneOverride(overrideRef.current)
+    if (value === undefined) {
+      delete next.segment_time
+    } else {
+      next.segment_time = value
     }
+    overrideRef.current = next
+    syncingRef.current = true
+    api.current?.setValue('segment_time', value)
+    api.current?.setValue('override_text', formatOverrideText(next))
+    queueMicrotask(() => {
+      syncingRef.current = false
+    })
+  }
 
-    await onOk(payload)
-    setVisible(false)
+  const applyLocalMaterialPresetToForm = () => {
+    localMaterialPresetApplied.current = true
+    const current = cloneOverride(overrideRef.current)
+    const updated = applyLocalMaterialPreset(current)
+    applyOverrideToForm(updated, 'form')
   }
 
   const handleCancel = () => {
     setVisible(false)
   }
 
-  const childrenWithProps = React.Children.map(children, child => {
-    if (React.isValidElement<{ onClick?: () => void }>(child)) {
-      return React.cloneElement(child, {
-        onClick: () => {
-          showDialog()
-          child.props.onClick?.()
-        },
+  const handleOk = async () => {
+    const submitted = await api.current?.validate()
+    if (!submitted) return
+
+    // 校验 JSON
+    const jsonText = api.current?.getValue('override_text')
+    if (jsonText && typeof jsonText === 'string') {
+      const parsed = parseSparseOverrideText(jsonText)
+      if (!parsed.ok) {
+        Notification.error({
+          title: '错误',
+          content: '配置格式不正确，请检查 JSON 格式',
+        })
+        return
+      }
+    }
+
+    const currentOverride = cloneOverride(overrideRef.current)
+    const segmentTime = currentOverride.segment_time
+    if (segmentTime !== undefined && segmentTime !== null) {
+      const errorMsg = validateSegmentTime(segmentTime)
+      if (errorMsg) {
+        Notification.error({
+          title: '视频分段时长无效',
+          content: errorMsg,
+        })
+        return
+      }
+    }
+
+    if (currentOverride.mosaic_config) {
+      const errorMsg = validateMosaicConfig(currentOverride.mosaic_config)
+      if (errorMsg) {
+        Notification.error({
+          title: '画面遮挡配置无效',
+          content: errorMsg,
+        })
+        return
+      }
+    }
+
+    const finalOverride = compactOverrideRecord(currentOverride)
+    const payload: Record<string, any> = {
+      ...pickStreamerPayload(entity),
+      override: finalOverride,
+    }
+
+    if (localMaterialPresetApplied.current) {
+      payload.postprocessor = []
+    }
+
+    try {
+      await onOk(payload)
+      setVisible(false)
+    } catch (e: any) {
+      Notification.error({
+        title: '更新失败',
+        content: e?.message ?? String(e),
       })
     }
+  }
+
+  const childrenWithProps = React.Children.map(children, child => {
+    if (React.isValidElement(child)) {
+      return React.cloneElement(child, {
+        // @ts-ignore
+        onClick: showDialog,
+      })
+    }
+    return child
   })
 
   const downloadSettings = (
     <Collapse.Panel header="下载设置" itemKey="download">
       <div style={{ marginBottom: 12 }}>
-        请到
+        请到{' '}
         <a href="/dashboard" style={{ textDecoration: 'none', color: 'var(--semi-color-primary)' }}>
           空间配置
-        </a>
+        </a>{' '}
         查看选项说明
       </div>
+      <Form.Slot label="录制模式">
+        <div>
+          <Button theme="light" type="primary" onClick={applyLocalMaterialPresetToForm}>
+            使用本地素材录制预设
+          </Button>
+          <div className="semi-form-field-extra">
+            使用 mesio 落盘，不上传、不删除原始分段，并关闭录制阶段的画面遮挡；录后合成和切片在工作台完成。
+          </div>
+        </div>
+      </Form.Slot>
       <Form.Select
         label="下载插件（downloader）"
         field="downloader"
@@ -213,6 +287,8 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
         <Select.Option value="mesio">mesio（默认）</Select.Option>
       </Form.Select>
 
+      <Form.Input field="uploader" initValue={entity?.override?.uploader} noLabel style={{ display: 'none' }} />
+
       <FileSizeField
         label="视频分段大小（file_size）"
         field="file_size"
@@ -223,49 +299,14 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
         }}
       />
 
-      <Form.Input
+      <SegmentTimeField
         field="segment_time"
+        scope="room"
+        initValue={initialOverride.segment_time}
+        onChange={syncSegmentTime}
         label="视频分段时长（segment_time）"
-        placeholder="01:00:00"
-        style={{ width: '100%' }}
-        fieldStyle={{
-          alignSelf: 'stretch',
-          padding: 0,
-        }}
-        showClear={true}
-        rules={[
-          {
-            pattern: /^[^：]*$/,
-            message: '请使用英文冒号',
-          },
-          {
-            pattern: /^[0-9:]*$/,
-            message: '只接受数字和英文冒号',
-          },
-          {
-            pattern: /^$|^[0-9]{2,4}:[0-5][0-9]:[0-5][0-9]$/,
-            message: '分或秒不符合规范',
-          },
-        ]}
-        stopValidateWithError={true}
-      />
-
-      <Form.InputNumber
-        field="timestamp_anomaly_threshold_ms"
-        label="时间戳异常切文件阈值（timestamp_anomaly_threshold_ms）"
-        extraText={
-          <div style={{ fontSize: '14px' }}>
-            检测到时间戳回退达到或超过该阈值时自动切文件，单位毫秒。设为 0 时禁用切分；阈值内小回退自动单调钳位平滑。未覆写时继承全局配置（默认 5000 ms）。
-          </div>
-        }
-        suffix={'ms'}
-        min={0}
-        style={{ width: '100%' }}
-        fieldStyle={{
-          alignSelf: 'stretch',
-          padding: 0,
-        }}
-        showClear={true}
+        extraText="可选择预设或自定义时长。跟随全局、不按时长分段和独立时长分别保存；分段较短时请同时检查碎片过滤阈值，低于阈值的分段会被过滤。"
+        fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
       />
 
       <Form.InputNumber
@@ -287,107 +328,112 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
   return (
     <>
       {childrenWithProps}
-      <Modal
-        title="配置覆写"
+      <FormSheet
+        title={`${initialPanel === 'mosaic' ? '画面遮挡' : '配置覆写'}${entity?.remark ? `「${entity.remark}」` : ''}`}
         visible={visible}
+        size="md"
+        okText="保存"
         onOk={handleOk}
-        style={{ width: 'min(600px, 90vw)' }}
         onCancel={handleCancel}
-        bodyStyle={{
-          overflow: 'auto',
-          maxHeight: 'calc(100vh - 320px)',
-          paddingLeft: 10,
-          paddingRight: 10,
-        }}
       >
         {visible ? (
           <IsOverrideFormContext.Provider value={true}>
-          <Form
-            key={`${entity?.id ?? 'new'}-${formKey}`}
-            initValues={{
-              ...cloneOverride(initialOverride),
-              override_text: formatOverrideText(initialOverride),
-            }}
-            getFormApi={formApi => {
-              api.current = formApi
-              overrideRef.current = compactOverrideRecord(initialOverride)
-            }}
-            onValueChange={(_values, changedValue) => {
-              if (syncingRef.current) return
-              const changedKeys = Object.keys(changedValue || {})
-              if (changedKeys.length === 1 && changedKeys[0] === 'override_text') {
-                lastEditedRef.current = 'json'
-                return
-              }
-              // Ignore bulk setValues payloads that only refresh override_text
-              const meaningful = Object.keys(changedValue || {}).filter(
-                key => key !== 'override_text'
-              )
-              if (!meaningful.length) return
-              syncFormChangeToOverride(changedValue)
-            }}
-          >
-            <div
-              style={{
-                display: 'flex',
-                justifyContent: 'space-between',
-                alignItems: 'center',
-                marginBottom: 8,
+            <Form
+              key={`${entity?.id ?? 'new'}-${formKey}`}
+              initValues={{
+                ...cloneOverride(initialOverride),
+                override_text: formatOverrideText(initialOverride),
               }}
-            >
-              <Typography.Text type="tertiary" size="small">
-                仅保存显式覆写项；清除字段后继承全局配置
-              </Typography.Text>
-              <Button
-                theme="borderless"
-                type="tertiary"
-                size="small"
-                onClick={() => applyOverrideToForm({}, 'form')}
-              >
-                清空全部覆写
-              </Button>
-            </div>
-            <Form.TextArea
-              field="override_text"
-              label="配置覆写"
-              placeholder="请输入 JSON 格式的配置"
-              style={{ marginBottom: 12 }}
-              onBlur={e => {
-                const text = (e?.target as HTMLTextAreaElement | undefined)?.value
-                  ?? api.current?.getValue('override_text')
-                const parsed = parseOverrideText(text)
-                if (!parsed.ok) {
-                  Notification.error({
-                    title: '错误',
-                    content: parsed.error,
-                  })
+              getFormApi={formApi => {
+                api.current = formApi
+                overrideRef.current = compactOverrideRecord(initialOverride)
+              }}
+              onValueChange={(_values, changedValue) => {
+                if (syncingRef.current) return
+                const changedKeys = Object.keys(changedValue || {})
+                if (changedKeys.length === 1 && changedKeys[0] === 'override_text') {
+                  lastEditedRef.current = 'json'
                   return
                 }
-                syncJsonToForm(text)
+                const meaningful = Object.keys(changedValue || {}).filter(
+                  key => key !== 'override_text'
+                )
+                if (!meaningful.length) return
+                syncFormChangeToOverride(changedValue)
               }}
-              rules={[
-                { required: false },
-                {
-                  validator: (_rule, value) => {
-                    if (!value) return true
-                    return parseOverrideText(value).ok
+            >
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  marginBottom: 8,
+                }}
+              >
+                <Typography.Text type="tertiary" size="small">
+                  仅保存显式覆写项；清除字段后继承全局配置
+                </Typography.Text>
+                <Button
+                  theme="borderless"
+                  type="tertiary"
+                  size="small"
+                  onClick={() => applyOverrideToForm({}, 'form')}
+                >
+                  清空全部覆写
+                </Button>
+              </div>
+              <Form.TextArea
+                field="override_text"
+                label="配置覆写"
+                placeholder="请输入 JSON 格式的配置"
+                style={{ marginBottom: 12 }}
+                onBlur={e => {
+                  const text = (e?.target as HTMLTextAreaElement | undefined)?.value
+                    ?? api.current?.getValue('override_text')
+                  const parsed = parseSparseOverrideText(text)
+                  if (!parsed.ok) {
+                    Notification.error({
+                      title: '错误',
+                      content: parsed.error,
+                    })
+                    return
+                  }
+                  syncJsonToForm(text)
+                }}
+                rules={[
+                  { required: false },
+                  {
+                    validator: (_rule, value) => {
+                      if (!value) return true
+                      return parseSparseOverrideText(value).ok
+                    },
+                    message: '请输入有效的 JSON 格式',
                   },
-                  message: '请输入有效的 JSON 格式',
-                },
-              ]}
-            />
-            <Form.Section>
-              <Collapse defaultActiveKey={['plugin', 'download']}>
-                {downloadSettings}
-                {Plugin ? (
-                  <Plugin entity={entity} list={list} initValues={initialOverride} />
-                ) : null}
-              </Collapse>
-            </Form.Section>
-          </Form>
+                ]}
+              />
+              <Form.Section>
+                <Collapse
+                  activeKey={activePanels}
+                  onChange={keys => setActivePanels(Array.isArray(keys) ? keys : keys ? [keys] : [])}
+                  keepDOM
+                  lazyRender={false}
+                >
+                  {downloadSettings}
+                  <MosaicPanel
+                    entity={entity}
+                    active={visible && activePanels.includes('mosaic')}
+                    initValues={initialOverride}
+                    onChange={syncMosaicConfig}
+                  />
+                  {Plugin ? (
+                    <Plugin entity={entity} list={list} initValues={initialOverride} />
+                  ) : null}
+                </Collapse>
+              </Form.Section>
+            </Form>
           </IsOverrideFormContext.Provider>
         ) : null}
-      </Modal>
+      </FormSheet>
     </>
   )
 }

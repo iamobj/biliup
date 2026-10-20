@@ -1,7 +1,7 @@
 'use client'
 import React, { useEffect } from 'react'
 import { Form, Select, useFormApi } from '@douyinfe/semi-ui'
-import PlatformPanel from './PlatformPanel'
+import PlatformPanel, { digitsToNumber } from './PlatformPanel'
 import OverrideSwitch from '@/app/ui/components/OverrideSwitch'
 
 type Props = {
@@ -30,6 +30,7 @@ const Huya: React.FC<Props> = props => {
           allowCreate={true}
           filter
           field="huya_max_ratio"
+          convert={digitsToNumber}
           extraText={
             <div style={{ fontSize: '14px' }}>
               录制码率上限，默认 0 表示不限制、录原画。

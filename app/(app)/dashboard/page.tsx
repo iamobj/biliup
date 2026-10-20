@@ -1,5 +1,6 @@
 'use client'
-import React, { useRef, useState } from 'react'
+import React, { Suspense, useRef, useState } from 'react'
+import { useRouter, useSearchParams } from 'next/navigation'
 import { flushSync } from 'react-dom'
 import {
   Button,
@@ -77,13 +78,16 @@ const { data: entity, error, isLoading, mutate } = useSWR('/v1/configuration', f
 
   const { biliUsers } = useBiliUsers()
   const { can, me } = useMe()
-  // 加入了控制面、配置由控制面下发的节点：整页只读，本机密钥另开侧栏保存
+  // 加入了控制面、配置由控制面下发的节点：整页只读，本机密钥在本页的抽屉里保存（/dashboard?secrets=1）
   const managedBy = me?.fleet_node?.config ? me.fleet_node.controller : null
   // 一主一备里的节点：控制面不再下发配置，本机照常保存，改动与对端双向同步
   const pair = me?.fleet_node?.pair
   // 非超管拿到的是脱敏后的配置（凭据、账号 Cookie 等为空），只读展示，不能保存
   const editable = can('config.edit') && !managedBy
-  const [secretsOpen, setSecretsOpen] = useState(false)
+
+  const router = useRouter()
+  const searchParams = useSearchParams()
+  const secretsOpen = searchParams.get('secrets') === '1' && !!managedBy && can('config.edit')
   const [formKey, setFormKey] = useState(0)
 
   // 平台设置：左列平台名是唯一的导航，右栏只显示选中平台的字段。列表来自插件注册表 PlatformPanels
@@ -150,7 +154,11 @@ const { data: entity, error, isLoading, mutate } = useSWR('/v1/configuration', f
         actions={
           managedBy ? (
             can('config.edit') && (
-              <Button icon={<IconKey />} theme="solid" onClick={() => setSecretsOpen(true)}>
+              <Button
+                icon={<IconKey />}
+                theme="solid"
+                onClick={() => router.replace('/dashboard?secrets=1', { scroll: false })}
+              >
                 本机密钥
               </Button>
             )
@@ -191,6 +199,9 @@ const { data: entity, error, isLoading, mutate } = useSWR('/v1/configuration', f
               }
               if (payload.preview_max_minutes === undefined || payload.preview_max_minutes === '') {
                 payload.preview_max_minutes = null
+              }
+              if (payload.max_upload_limit === undefined || payload.max_upload_limit === '') {
+                payload.max_upload_limit = null
               }
               // 后端是非负整数，不接受空值；清空即关闭
               if (
@@ -275,10 +286,10 @@ const { data: entity, error, isLoading, mutate } = useSWR('/v1/configuration', f
         <LocalSecretsSheet
           entity={entity}
           list={list}
-          onClose={() => setSecretsOpen(false)}
+          onClose={() => router.replace('/dashboard', { scroll: false })}
           onSaved={() => {
-            setSecretsOpen(false)
-            mutate().then(() => setFormKey(key => key + 1)).catch(() => undefined)
+            router.replace('/dashboard', { scroll: false })
+            mutate().then(() => setFormKey((key) => key + 1)).catch(() => undefined)
           }}
         />
       ) : null}
@@ -286,4 +297,10 @@ const { data: entity, error, isLoading, mutate } = useSWR('/v1/configuration', f
   )
 }
 
-export default Dashboard
+export default function DashboardPage() {
+  return (
+    <Suspense>
+      <Dashboard />
+    </Suspense>
+  )
+}
