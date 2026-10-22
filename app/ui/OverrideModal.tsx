@@ -44,6 +44,7 @@ type TemplateModalProps = {
   children?: React.ReactNode
   initialPanel?: 'plugin' | 'mosaic'
   onOk: (e: any) => Promise<void>
+  onCancel?: () => void
 }
 
 type LastEdited = 'form' | 'json'
@@ -54,17 +55,22 @@ type PlatformPattern = keyof typeof SupportedPlatforms
 const matchPlatformPattern = (url?: string): PlatformPattern | undefined =>
   (Object.keys(SupportedPlatforms) as PlatformPattern[]).find(pattern => url?.match(new RegExp(pattern)))
 
-const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, initialPanel = 'plugin', onOk }) => {
+const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, initialPanel = 'plugin', onOk, visible: controlledVisible, onCancel }) => {
   const [activePanels, setActivePanels] = useState<string[]>([initialPanel])
   const api = useRef<FormApi>(undefined)
   const lastEditedRef = useRef<LastEdited>('form')
   const overrideRef = useRef<OverrideRecord>({})
   const syncingRef = useRef(false)
-  const [visible, setVisible] = useState(false)
+  const [internalVisible, setInternalVisible] = useState(false)
+  const visible = controlledVisible ?? internalVisible
+  const setVisible = (next: boolean) => {
+    setInternalVisible(next)
+    if (!next) onCancel?.()
+  }
   const [formKey, setFormKey] = useState(0)
   const localMaterialPresetApplied = useRef(false)
 
-  const { biliUsers } = useBiliUsers()
+  const { biliUsers } = useBiliUsers(visible)
   const list = biliUsers?.map(item => {
     return {
       value: item.value,
@@ -86,7 +92,6 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, initial
     const pattern = matchPlatformPattern(entity?.url)
     return pattern ? (SupportedPlatforms[pattern] as React.ComponentType<PluginProps>) : null
   }, [entity?.url])
-
   const showDialog = () => {
     setActivePanels([initialPanel])
     localMaterialPresetApplied.current = false
@@ -328,7 +333,7 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, initial
   return (
     <>
       {childrenWithProps}
-      <FormSheet
+      {visible && <FormSheet
         title={`${initialPanel === 'mosaic' ? '画面遮挡' : '配置覆写'}${entity?.remark ? `「${entity.remark}」` : ''}`}
         visible={visible}
         size="md"
@@ -433,7 +438,7 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, initial
             </Form>
           </IsOverrideFormContext.Provider>
         ) : null}
-      </FormSheet>
+      </FormSheet>}
     </>
   )
 }
