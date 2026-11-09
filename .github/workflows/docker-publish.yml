@@ -9,6 +9,7 @@ on:
     # Publish `v1.2.3` tags as releases.
     tags:
       - v*
+  workflow_dispatch: # 允许手动触发
 
 # 顶层只保留读权限，构建与推送任务按需获取 packages: write
 permissions:
