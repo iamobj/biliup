@@ -7,11 +7,6 @@
   - `url`：开播地址
   - `title`：直播间标题
   - `start_time`：开播时间，Unix 秒级时间戳
-- 主播“暂停录制”状态持久化对齐上游 `livestreamers.recording_paused`：
-  - 对齐上游 `19_recording_pause.sql` 原生实现；二开历史库中的 `paused` 列在启动时自动回填同步。
-  - 仅 pause API（`toggle_pause`）写入与维护；表单/配置覆写保存不得覆盖。
-  - 启动时由 `DownloadManager.add_room` 按 DB 恢复 `WorkerStatus::Pause`，暂停房间不进入监测队列。
-  - 列表 UI 仍以 runtime `status === 'Pause'` 显示。
 - 录播管理支持「复制新建」：
   - 卡片操作栏复制按钮打开与新建相同的 `TemplateModal`，标题为「复制录播」。
   - `cloneStreamerForCreate` 深拷贝可配置字段（含 `url`/`remark`/各类 processor/`override` 等），
@@ -58,7 +53,7 @@
   - stream-gears 同一秒连续切段时，若最终文件或 `.part` 已存在需追加数字序号，
     不得复用路径覆盖上一段。
   - 全局配置与主播 override 均可配置数值；override 支持清除继承全局（设为 0 时关闭异常切段）。
-  - 历史配置迁移：通过 `migrations/5_migrate_timestamp_anomaly.sql` 由 `sqlx::migrate!()` 自动迁移 SQLite 数据库（`configuration` 与 `livestreamers.override`），
+  - 历史配置迁移：通过 `crates/biliup-cli/migrations/20_migrate_timestamp_anomaly.sql` 由 `sqlx::migrate!()` 自动迁移 SQLite 数据库（`configuration` 与 `livestreamers.override`），
     将旧布尔字段 `split_on_timestamp_anomaly` 转换为 `timestamp_anomaly_threshold_ms`（true/null -> 5000, false -> 0）
     并删除旧字段；同时提供 `scripts/migrate_timestamp_anomaly.py` 独立脚本用于手动或离线迁移。
 - 抖音画质支持 `douyin_prefer_uhd` 优先策略：
