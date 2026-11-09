@@ -241,7 +241,6 @@ mod tests {
             postprocessor: None,
             opt_args: None,
             excluded_keywords: None,
-            paused: false,
         }
     }
 

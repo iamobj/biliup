@@ -80,8 +80,14 @@ where
     F: FnMut(&SegmentInfo),
 {
     // 1. 初始化上传环境
-    let upload_context =
-        initialize_upload_context(&ctx.config(), &ctx.stateless_client(), upload_config).await?;
+    // A session hook must still run when login fails. Initialize only when the
+    // processed file list is ready to upload.
+    let upload_context = tokio::sync::OnceCell::new();
+    if !super::downloaded::configured(ctx) {
+        let context =
+            initialize_upload_context(&ctx.config(), ctx.stateless_client(), upload_config).await?;
+        let _ = upload_context.set(context);
+    }
     if let Some(task) = TaskObservation::current() {
         task.phase("waiting_segment");
     }
@@ -95,18 +101,29 @@ where
         .clone()
         .unwrap_or_default();
     let uploaded_videos = pipeline_upload_videos(rx, &segment_processors, ctx, |path| {
-        let retries = upload_retries(ctx.config().max_upload_limit);
-        upload_owned_file(path, &upload_context, retries)
+        let upload_context = &upload_context;
+        async move {
+            let context = upload_context
+                .get_or_try_init(|| async {
+                    initialize_upload_context(&ctx.config(), ctx.stateless_client(), upload_config)
+                        .await
+                })
+                .await?;
+            upload_owned_file(path, context, upload_retries(ctx.config().max_upload_limit)).await
+        }
     })
     .await?;
 
     // 4. 提交到B站
     if !uploaded_videos.videos.is_empty() {
+        let upload_context = upload_context
+            .get()
+            .expect("uploaded files have an upload context");
         let mut recorder = ctx.recorder(ctx.streamer_info().clone()).clone();
         recorder.filename_prefix = upload_config.title.clone();
 
         let studio = build_studio(
-            &upload_config,
+            upload_config,
             &upload_context.bilibili,
             uploaded_videos.videos,
             &recorder,
@@ -244,28 +261,44 @@ async fn prepare_upload_audio(path: &Path) -> AppResult<()> {
     Ok(())
 }
 
-async fn update_processed_path(ctx: &Context, from: &Path, to: &Path) -> AppResult<()> {
+async fn update_processed_path(
+    ctx: &Context,
+    from: &Path,
+    to: &Path,
+    replaced: &[PathBuf],
+    danmaku: Option<&Path>,
+) -> AppResult<()> {
     use crate::server::workbench::{index, segment_path};
+    let _lifecycle = crate::server::workbench::retention::MEDIA_LIFECYCLE
+        .write()
+        .await;
     let from = segment_path(from).to_string_lossy().into_owned();
     let to_path = segment_path(to);
     let to = to_path.to_string_lossy().into_owned();
     let bytes = std::fs::metadata(&to_path).ok().map(|m| m.len() as i64);
-    sqlx::query("UPDATE segments SET path = ?, bytes = ?, index_path = NULL WHERE session_id = ? AND path = ?")
-        .bind(&to).bind(bytes).bind(ctx.id()).bind(&from).execute(ctx.pool()).await
+    let mut tx = ctx.pool().begin().await.change_context(AppError::Unknown)?;
+    crate::server::workbench::retention::record_processed_sources(&mut tx, &to_path, replaced)
+        .await
+        .change_context(AppError::Unknown)?;
+    sqlx::query("UPDATE segments SET path = ?, bytes = ?, index_path = NULL, danmaku_path = COALESCE(danmaku_path, ?) WHERE session_id = ? AND path = ?")
+        .bind(&to).bind(bytes)
+        .bind(danmaku.map(|path| segment_path(path).to_string_lossy().into_owned()))
+        .bind(ctx.id()).bind(&from).execute(&mut *tx).await
         .change_context(AppError::Unknown)?;
     sqlx::query("UPDATE filelist SET file = ? WHERE session_id = ? AND file = ?")
         .bind(&to)
         .bind(ctx.id())
         .bind(&from)
-        .execute(ctx.pool())
+        .execute(&mut *tx)
         .await
         .change_context(AppError::Unknown)?;
     // Protected segments are inserted here synchronously, after publication.
     // An async inspector insert could finish after this update and resurrect a
     // stale raw path in the file list.
     sqlx::query("INSERT INTO filelist (file, session_id) SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM filelist WHERE file = ? AND session_id = ?)")
-        .bind(&to).bind(ctx.id()).bind(&to).bind(ctx.id()).execute(ctx.pool()).await
+        .bind(&to).bind(ctx.id()).bind(&to).bind(ctx.id()).execute(&mut *tx).await
         .change_context(AppError::Unknown)?;
+    tx.commit().await.change_context(AppError::Unknown)?;
     // Transcoding changes byte offsets. Rebuild only after the recorder's
     // shared ready barrier settled; indexes from the original are removed.
     let refreshed = tokio::task::spawn_blocking(move || index::refresh(&to_path, true)).await;
@@ -297,6 +330,8 @@ where
     Fut: Future<Output = AppResult<Video>>,
 {
     let mut uploaded = UploadedVideos::default();
+    let deferred = super::downloaded::configured(ctx);
+    let mut prepared = Vec::new();
     pin!(rx);
     // 流式处理后续事件
     while let Some(mut event) = rx.next().await {
@@ -384,12 +419,22 @@ where
         } else {
             None
         };
-        if let Err(error) =
-            process_video_paths_with_source(&mut paths, &steps, source.as_ref()).await
-        {
-            error!(%error, file = ?original, "segment_processor 失败，本段停止投稿");
-            continue;
-        }
+        let replaced =
+            match process_video_paths_with_source(&mut paths, &steps, source.as_ref()).await {
+                Ok(replaced) => replaced,
+                Err(error) => {
+                    error!(%error, file = ?original, "segment_processor 失败，本段停止投稿");
+                    if let Some(task) = TaskObservation::current() {
+                        task.file(
+                            &original.file_name().unwrap_or_default().to_string_lossy(),
+                            original_bytes,
+                        )
+                        .finish(Some(&format!("分段后处理失败：{error}")));
+                        task.phase("waiting_segment");
+                    }
+                    continue;
+                }
+            };
         if let Some(path) = paths.first() {
             event.prev_file_path = path.clone();
         }
@@ -403,7 +448,15 @@ where
             continue;
         }
         if original != event.prev_file_path {
-            if let Err(error) = update_processed_path(ctx, &original, &event.prev_file_path).await {
+            if let Err(error) = update_processed_path(
+                ctx,
+                &original,
+                &event.prev_file_path,
+                &replaced,
+                event.danmaku_file_path.as_deref(),
+            )
+            .await
+            {
                 error!(%error, "更新处理后的录像路径失败，本段停止投稿");
                 continue;
             }
@@ -436,37 +489,48 @@ where
             continue;
         }
 
-        let upload_path = paths
-            .first()
-            .cloned()
-            .unwrap_or_else(|| event.prev_file_path.clone());
-        if crate::server::common::processing::masking::is_unmasked(&upload_path) {
-            error!(file = ?upload_path, "segment_processor 返回未遮挡录像，本段停止投稿");
-            continue;
-        }
-        match upload(upload_path.clone()).await {
-            Ok(video) => {
-                uploaded.videos.push(video);
-                // 1.0.7 的 FileInfo(video, danmaku) 语义：上传完成后的 postprocessor
-                // 继续接收本段视频路径和对应弹幕路径。segment_processor 可能已把
-                // 首个视频路径原地替换（例如 Remux .ts→.mp4），因此这里保留转换后的路径集。
-                uploaded.paths.extend(paths);
-            }
-            Err(e) => {
-                error!(
-                    file = ?upload_path,
-                    "upload_single_file failed, skipping segment: {:?}", e
-                );
-            }
+        if deferred {
+            prepared.push(super::downloaded::HookFile::from_paths(paths));
+        } else {
+            upload_prepared(paths, &upload, &mut uploaded).await;
         }
         if let Some(task) = TaskObservation::current() {
             task.phase("waiting_segment");
         }
     }
 
+    if deferred {
+        let prepared = super::downloaded::run(prepared, ctx).await?;
+        // Shell results may reorder, merge or split videos. Do not infer segment
+        // ownership from positions in the returned list; preserve indexed sources.
+        // Native remux/render already updates exact source mappings above.
+        for file in prepared {
+            upload_prepared(file.paths(), &upload, &mut uploaded).await;
+        }
+    }
     Ok(uploaded)
 }
 
+async fn upload_prepared<U, Fut>(paths: Vec<PathBuf>, upload: &U, uploaded: &mut UploadedVideos)
+where
+    U: Fn(PathBuf) -> Fut,
+    Fut: Future<Output = AppResult<Video>>,
+{
+    let path = paths[0].clone();
+    if crate::server::common::processing::masking::is_unmasked(&path) {
+        error!(?path, "未遮挡录像禁止上传");
+        return;
+    }
+    match upload(path.clone()).await {
+        Ok(video) => {
+            uploaded.videos.push(video);
+            uploaded.paths.extend(paths);
+        }
+        Err(error) => error!(?path, ?error, "upload_single_file failed, skipping segment"),
+    }
+}
+
+#[cfg(test)]
 async fn collect_processed_segment_paths<F>(
     rx: Inspect<Receiver<SegmentInfo>, F>,
     segment_processors: &[HookStep],
@@ -572,6 +636,23 @@ pub(crate) async fn upload_single_file_with_progress(
     context: &UploadContext,
     progress: impl Fn(usize) -> bool + Send + Sync,
 ) -> AppResult<Video> {
+    upload_observed_file(file_path, context, progress, true).await
+}
+
+/// Completed renders already have their final audio; uploading must not rewrite that artifact.
+pub(crate) async fn upload_prepared_file_with_progress(
+    file_path: &Path,
+    context: &UploadContext,
+    progress: impl Fn(usize) -> bool + Send + Sync,
+) -> AppResult<Video> {
+    upload_observed_file(file_path, context, progress, false).await
+}
+async fn upload_observed_file(
+    file_path: &Path,
+    context: &UploadContext,
+    progress: impl Fn(usize) -> bool + Send + Sync,
+    repair_audio: bool,
+) -> AppResult<Video> {
     let name = file_path.file_name().unwrap_or_default().to_string_lossy();
     let observation = TaskObservation::current().map(|task| {
         task.file(
@@ -581,7 +662,14 @@ pub(crate) async fn upload_single_file_with_progress(
                 .map(|metadata| metadata.len()),
         )
     });
-    let result = upload_file_inner(file_path, context, &progress, observation.as_ref()).await;
+    let result = upload_file_inner(
+        file_path,
+        context,
+        &progress,
+        observation.as_ref(),
+        repair_audio,
+    )
+    .await;
     if let Some(observation) = observation {
         observation.finish(
             result
@@ -625,11 +713,14 @@ async fn upload_file_inner(
     context: &UploadContext,
     progress: &(impl Fn(usize) -> bool + Send + Sync),
     observation: Option<&FileObservation>,
+    repair_audio: bool,
 ) -> AppResult<Video> {
     if crate::server::common::processing::masking::is_unmasked(file_path) {
         return Err(AppError::Custom("未遮挡录像禁止上传，请先完成画面遮挡".into()).into());
     }
-    prepare_upload_audio(file_path).await?;
+    if repair_audio {
+        prepare_upload_audio(file_path).await?;
+    }
     let video_path = file_path;
     let UploadContext {
         bilibili,
@@ -807,10 +898,10 @@ where
         )
         .await
         .change_context(AppError::Unknown);
-    if let Some(observation) = &observation {
-        if let Ok(uploaded) = &uploaded {
-            observation.total_bytes(uploaded.uploaded_size());
-        }
+    if let Some(observation) = &observation
+        && let Ok(uploaded) = &uploaded
+    {
+        observation.total_bytes(uploaded.uploaded_size());
     }
     let uploaded = uploaded?;
     let t = instant.elapsed().as_millis().max(1);
@@ -985,13 +1076,36 @@ pub(crate) async fn build_studio(
     recorder: &Recorder,
 ) -> AppResult<Studio> {
     let mut studio = studio_from_template(upload_config, videos, recorder);
-    // 处理封面上传
-    if !studio.cover.is_empty()
-        && let Ok(c) = &std::fs::read(&studio.cover).inspect_err(|e| error!(e=?e))
-        && let Ok(url) = bilibili.cover_up(c).await.inspect_err(|e| error!(e=?e))
-    {
-        studio.cover = url;
-    };
+    // 处理封面上传。
+    //
+    // 这里必须“读不到就退化成不带封面”，不能把本地路径原样交给投稿接口：
+    // 投稿接口只会校验这个字符串是不是可用的图片地址，本地路径会被判为
+    // “该封面地址不合法”（21008），导致整次投稿失败、视频白传一遍。
+    // 相对路径按进程工作目录解析，日志里一并打出 cwd，方便定位封面脚本
+    // 究竟把封面写到了哪里。
+    if !studio.cover.is_empty() {
+        match std::fs::read(&studio.cover) {
+            Ok(bytes) => match bilibili.cover_up(&bytes).await {
+                Ok(url) => studio.cover = url,
+                Err(e) => {
+                    error!(e=?e, cover=%studio.cover, "封面上传失败，本次投稿改用 B 站默认封面");
+                    studio.cover.clear();
+                }
+            },
+            Err(e) => {
+                let cwd = std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                error!(
+                    e=?e,
+                    cover=%studio.cover,
+                    cwd=%cwd,
+                    "封面文件不存在或不可读（请确认 downloaded_processor 已生成该文件），本次投稿改用 B 站默认封面"
+                );
+                studio.cover.clear();
+            }
+        }
+    }
 
     Ok(studio)
 }
@@ -1006,6 +1120,9 @@ pub(crate) fn studio_from_template(
         recorder.format(&upload_config.description.clone().unwrap_or_default()),
         upload_config.credits.as_ref(),
     );
+    // B 站稿件标题上限 80 字。标题模板带上视频原标题后很容易超限，超了投稿会直接报错，
+    // 这里按字符数截断（与上传文件名用的 `Video::truncate_title` 同一套规则）。
+    let title = Video::truncate_title(&recorder.format_title(), 80);
     Studio::builder()
         .desc(desc)
         .maybe_dtime(scheduled_publish_ts(upload_config.dtime, now_unix()))
@@ -1019,7 +1136,7 @@ pub(crate) fn studio_from_template(
         .tag(upload_config.tags.join(","))
         .maybe_tid(upload_config.tid)
         .maybe_tid_v2(upload_config.tid_v2)
-        .title(recorder.format_title())
+        .title(title)
         .videos(videos)
         .dolby(upload_config.dolby.unwrap_or_default())
         // .lossless_music(upload_config.)
@@ -1044,16 +1161,19 @@ pub async fn execute_postprocessor(video_paths: Vec<PathBuf>, ctx: &Context) -> 
     if video_paths.is_empty() {
         return Ok(());
     }
-    if let Some(processor) = &ctx.live_streamer().postprocessor {
-        let processor: Vec<_> = processor
-            .iter()
-            .filter(|step| !matches!(step, HookStep::Webhook { .. }))
-            .cloned()
-            .collect();
-        let paths: Vec<&Path> = video_paths.iter().map(|p| p.as_path()).collect();
-        let retention = Retention::after_upload(ctx.pool().clone(), &ctx.config());
-        process_video(&paths, &processor, Some(&retention)).await?;
-    }
+    let default = [HookStep::Remove("rm".into())];
+    let processor: Vec<_> = ctx
+        .live_streamer()
+        .postprocessor
+        .as_deref()
+        .unwrap_or(&default)
+        .iter()
+        .filter(|step| !matches!(step, HookStep::Webhook { .. }))
+        .cloned()
+        .collect();
+    let paths: Vec<&Path> = video_paths.iter().map(|p| p.as_path()).collect();
+    let retention = Retention::after_upload(ctx.pool().clone(), &ctx.config());
+    process_video(&paths, &processor, Some(&retention)).await?;
     Ok(())
 }
 
@@ -1125,6 +1245,9 @@ pub async fn upload(
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod downloaded;
+
+    mod cleanup;
 
     fn observed_test_context(
         observations: Arc<crate::server::common::upload_observation::UploadObservations>,
@@ -1241,8 +1364,10 @@ mod tests {
                 format!("bad-{i}.unmasked.flv")
             } else { format!("bad-{i}.flv.unmasked") });
             std::fs::write(&path, b"raw recording").unwrap();
-            let mut config = Config::default();
-            config.mosaic_config = Some(value);
+            let config = Config {
+mosaic_config: Some(value),
+..Default::default()
+};
             let ctx = test_context(config);
             let calls = std::sync::atomic::AtomicUsize::new(0);
             let result = pipeline_upload_videos(
@@ -1309,15 +1434,33 @@ mod tests {
             crate::tools::note_skipped_test("FFmpeg libx264 unavailable");
             return;
         }
-        let mut config = Config::default();
-        config.filtering_threshold = 0;
-        config.mosaic_config = Some(
-            json!({"enabled": true, "regions": [{"id":"solid","x":0.25,"y":0.25,"width":0.5,"height":0.5,"effectType":"solid","strength":0,"color":"#000000"}]}),
-        );
+        let config = Config {
+            filtering_threshold: 0,
+            mosaic_config: Some(
+                json!({"enabled": true, "regions": [{"id":"solid","x":0.25,"y":0.25,"width":0.5,"height":0.5,"effectType":"solid","strength":0,"color":"#000000"}]}),
+            ),
+            ..Default::default()
+        };
         let ctx = test_context(config);
         // The fixture needs only the persistence tables used by the processing
         // pipeline, avoiding a network/real uploader dependency in this test.
-        sqlx::raw_sql("CREATE TABLE segments (id INTEGER PRIMARY KEY, session_id INTEGER, path TEXT, bytes INTEGER, index_path TEXT, start_ms INTEGER NOT NULL DEFAULT 0, end_ms INTEGER DEFAULT 200, recorded_at_ms INTEGER); CREATE TABLE filelist (id INTEGER PRIMARY KEY, file TEXT, session_id INTEGER)")
+        // This test inspects the retained result; absent postprocessor now
+        // deliberately invokes the v1.0.7 default cleanup.
+        let mut room = ctx.live_streamer().clone();
+        room.postprocessor = Some(vec![]);
+        let worker = crate::server::infrastructure::context::Worker::new(
+            room,
+            None,
+            Arc::new(std::sync::RwLock::new(ctx.config())),
+            Default::default(),
+        );
+        let ctx = Context::new(
+            ctx.id(),
+            Arc::new(worker),
+            ctx.pool().clone(),
+            ctx.live_stream().clone(),
+        );
+        sqlx::raw_sql("CREATE TABLE segments (id INTEGER PRIMARY KEY, session_id INTEGER, path TEXT, bytes INTEGER, index_path TEXT, danmaku_path TEXT, start_ms INTEGER NOT NULL DEFAULT 0, end_ms INTEGER DEFAULT 200, recorded_at_ms INTEGER); CREATE TABLE filelist (id INTEGER PRIMARY KEY, file TEXT, session_id INTEGER)")
             .execute(ctx.pool()).await.unwrap();
         sqlx::query("INSERT INTO segments (session_id, path) VALUES (1, ?)")
             .bind(raw.to_string_lossy().as_ref())
@@ -1423,12 +1566,14 @@ mod tests {
             }
             let original_bytes = std::fs::metadata(&raw).unwrap().len();
             assert!(original_bytes < 20_000_000);
-            let mut config = Config::default();
-            config.filtering_threshold = 20;
-            config.mosaic_config = Some(json!({"enabled":true,"regions":[{
-                "id":"solid","x":0.25,"y":0.25,"width":0.5,"height":0.5,
-                "effectType":"solid","strength":0,"color":"#000000"
-            }]}));
+            let config = Config {
+                filtering_threshold: 20,
+                mosaic_config: Some(json!({"enabled":true,"regions":[{
+                    "id":"solid","x":0.25,"y":0.25,"width":0.5,"height":0.5,
+                    "effectType":"solid","strength":0,"color":"#000000"
+                }]})),
+                ..Default::default()
+            };
             let base = test_context(config);
             let pool =
                 ConnectionManager::new_pool(dir.path().join("data.sqlite3").to_str().unwrap())
@@ -1978,15 +2123,19 @@ pub(crate) fn observe_context(
     let template = ctx
         .upload_config()
         .as_ref()
-        .filter(|template| !template.is_noop_uploader())?;
+        .filter(|template| !template.is_noop_uploader());
     ctx.upload_observations().map(|registry| {
         registry.register(NewTask {
-            source,
+            source: if template.is_some() {
+                source
+            } else {
+                "processing"
+            },
             scheduler_group: group,
             title: &ctx.streamer_info().title,
             streamer_name: Some(&ctx.live_streamer().remark),
             session_id: Some(ctx.id()),
-            template_name: Some(&template.template_name),
+            template_name: template.map(|template| template.template_name.as_str()),
             fifo,
         })
     })
@@ -2336,6 +2485,34 @@ mod credit_tests {
                 "",
             ),
         )
+    }
+
+    #[tokio::test]
+    async fn studio_defaults_and_missing_cover_are_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut upload_config = template("", serde_json::Value::Null);
+        upload_config.copyright = None;
+        upload_config.cover_path = Some(
+            dir.path()
+                .join("missing.jpg")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let mut recorder = recorder();
+        recorder.filename_prefix = Some("直播🎬".repeat(40));
+        let studio = build_studio(&upload_config, &fake_bilibili(), Vec::new(), &recorder)
+            .await
+            .unwrap();
+        assert_eq!(studio.copyright, 1);
+        assert_eq!(studio.title.chars().count(), 80);
+        assert!(studio.cover.is_empty());
+        for copyright in [1, 2] {
+            upload_config.copyright = Some(copyright);
+            assert_eq!(
+                studio_from_template(&upload_config, Vec::new(), &recorder).copyright,
+                copyright
+            );
+        }
     }
 
     /// `submit_by_app` / `submit_by_web` / `edit_by_*` 都是 `.json(studio)`，

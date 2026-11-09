@@ -22,6 +22,7 @@ use tracing::{error, info};
 /// 应用程序上下文，包含工作器和扩展信息
 #[derive(Debug, Clone)]
 pub struct Context {
+    pub(crate) download_end: Arc<crate::server::common::downloaded::SessionEnd>,
     id: i64,
     /// 工作器实例
     worker: Arc<Worker>,
@@ -39,6 +40,7 @@ impl Context {
         let mut streamer_info = streamer_info(&stream);
         streamer_info.id = id;
         Self {
+            download_end: Arc::default(),
             id,
             worker,
             stream,
@@ -60,7 +62,7 @@ impl Context {
     }
 
     pub fn live_streamer(&self) -> &LiveStreamer {
-        &self.worker.get_streamer()
+        self.worker.get_streamer()
     }
 
     pub fn stateless_client(&self) -> &StatelessClient {
@@ -136,7 +138,7 @@ impl Context {
             recorder: self.recorder(stream_info),
             // output_dir: PathBuf::from("./downloads")
             output_dir: PathBuf::from("."),
-            suffix,
+            suffix: suffix.trim().trim_start_matches('.').to_ascii_lowercase(),
             bytes_written: Default::default(),
             preview: Default::default(),
             index_tap: None,
@@ -147,6 +149,8 @@ impl Context {
 /// 工作器结构体，管理单个主播的录制和上传任务
 #[derive(Debug)]
 pub struct Worker {
+    /// 串行处理同一房间的暂停/恢复，保持持久化状态与运行状态一致。
+    pub(crate) recording_control: tokio::sync::Mutex<()>,
     /// 下载器状态
     pub downloader_status: RwLock<WorkerStatus>,
     /// 上传器状态
@@ -184,13 +188,9 @@ impl Worker {
         config: Arc<RwLock<Config>>,
         client: StatelessClient,
     ) -> Self {
-        let downloader_status = if live_streamer.paused {
-            WorkerStatus::Pause
-        } else {
-            WorkerStatus::default()
-        };
         Self {
-            downloader_status: RwLock::new(downloader_status),
+            recording_control: tokio::sync::Mutex::new(()),
+            downloader_status: RwLock::new(Default::default()),
             uploader_status: Default::default(),
             live_streamer,
             upload_streamer,
@@ -418,7 +418,6 @@ mod tests {
             postprocessor: None,
             opt_args: None,
             excluded_keywords: None,
-            paused: false,
         }
     }
 

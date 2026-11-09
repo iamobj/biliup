@@ -266,14 +266,12 @@ pub async fn download_with_boundaries(
     let mut previous_last_segment: Option<u64> = None;
     let mut current_file_started = false;
     let mut last_playlist_load = Instant::now();
-
     let result: Result<()> = async {
         loop {
             if pl.segments.is_empty() {
                 debug!("Segments array is empty - waiting for playlist update");
             }
-            let mut seq = pl.media_sequence;
-            for segment in &pl.segments {
+            for (seq, segment) in (pl.media_sequence..).zip(&pl.segments) {
                 if should_download_sequence(previous_last_segment, seq) {
                     let gap = has_sequence_gap(previous_last_segment, seq);
                     if gap {
@@ -330,7 +328,6 @@ pub async fn download_with_boundaries(
                     }
                     previous_last_segment = Some(seq);
                 }
-                seq += 1;
             }
 
             if !playlist_should_refresh(&pl) {
@@ -456,7 +453,7 @@ where
         length = bytes.len() as u64;
         on_first_write();
         out.write_chunk(&bytes)?;
-        if let Some(sink) = preview.as_deref_mut() {
+        if let Some(sink) = preview {
             sink.push_fmp4_segment(bytes);
         }
     }
@@ -789,7 +786,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let dir = tempfile::tempdir().unwrap();
-        let kept: Arc<Mutex<Vec<(String, Vec<u8>)>>> = Arc::default();
+        let kept = Arc::new(Mutex::new(Vec::new()));
         let file = LifecycleFile::with_hook(dir.path().join("rec").to_str().unwrap(), "ts", {
             let kept = kept.clone();
             move |name: &str| {

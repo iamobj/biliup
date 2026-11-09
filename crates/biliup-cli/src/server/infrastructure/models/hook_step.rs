@@ -16,8 +16,16 @@ use tracing::{error, info};
 #[derive(PartialEq, Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum HookStep {
-    /// 执行命令格式：{run: "command"}
-    Run { run: String },
+    /// 执行命令格式：`{run: "command"}`。
+    ///
+    /// 默认把**换行分隔的文件路径**写到 stdin；加上 `json = true` 后改成写一个
+    /// JSON 对象（`name` / `url` / `room_title` / `start_time` / `end_time` / `file_list`），
+    /// 与 Python 版 biliup 的 downloaded_processor 入参一致，现有脚本可以直接复用。
+    Run {
+        run: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        json: bool,
+    },
     /// 移动文件格式：{mv: "target_dir"}
     Move { mv: String },
     /// 上传结果回调；在任何文件后处理之前由上传流程执行。
@@ -26,7 +34,7 @@ pub enum HookStep {
     /// 解决 B 站对 .ts 直传时常见的 "时间戳跳变" 转码失败。
     /// 用 ffmpeg `-c copy -fflags +genpts+igndts -bsf:a aac_adtstoasc -movflags +faststart`，
     /// 重新生成 PTS。仅当输入扩展名为 .ts/.m2ts 时生效；其它格式跳过。
-    /// 路径列表会被原地替换为新生成的 .mp4，原文件保留（postprocessor 中再 "rm"）。
+    /// 路径列表会被原地替换为新生成的 .mp4，原文件登记为成品的来源，随后由后处理 rm 一起清理。
     Remux { remux: String },
     /// Native masking and danmaku burn-in, sharing the manual export engine.
     Render {
@@ -34,6 +42,56 @@ pub enum HookStep {
     },
     /// 删除文件格式："rm"
     Remove(String),
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Only marked stdout lines are parsed, with a bounded line buffer. Stderr and
+/// ordinary (possibly non-UTF8) output cannot replace the upload file list.
+#[derive(Default)]
+struct HookOutputCapture {
+    line: Vec<u8>,
+    overflow: bool,
+    result: Option<String>,
+    error: Option<&'static str>,
+}
+impl HookOutputCapture {
+    fn feed(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if byte == b'\n' {
+                self.end_line();
+            } else if self.line.len() < 1024 * 1024 {
+                self.line.push(byte);
+            } else {
+                self.overflow = true;
+            }
+        }
+    }
+    fn end_line(&mut self) {
+        if let Some(json) = self.line.strip_prefix(b"BILIUP_OUTPUT=") {
+            if self.overflow {
+                self.error = Some("BILIUP_OUTPUT 超过 1 MiB");
+            } else if self.result.is_some() {
+                self.error = Some("每个脚本只能输出一条 BILIUP_OUTPUT");
+            } else {
+                match std::str::from_utf8(json) {
+                    Ok(json) => self.result = Some(json.trim_end_matches('\r').to_string()),
+                    Err(_) => self.error = Some("BILIUP_OUTPUT 必须使用 UTF-8 JSON"),
+                }
+            }
+        }
+        self.line.clear();
+        self.overflow = false;
+    }
+    fn finish(mut self) -> AppResult<Option<String>> {
+        self.end_line();
+        if let Some(error) = self.error {
+            bail!(AppError::Custom(error.into()));
+        }
+        Ok(self.result)
+    }
 }
 
 impl HookStep {
@@ -56,7 +114,7 @@ impl HookStep {
         retention: Option<&Retention>,
     ) -> AppResult<()> {
         match self {
-            HookStep::Run { run } => {
+            HookStep::Run { run, .. } => {
                 // 执行自定义命令
                 let paths: Vec<String> = video_paths
                     .iter()
@@ -74,7 +132,9 @@ impl HookStep {
                     .await?;
             }
             HookStep::Webhook { .. } => {
-                bail!(AppError::Custom("webhook 只支持上传结束后的结果回调".into()));
+                bail!(AppError::Custom(
+                    "webhook 只支持上传结束后的结果回调".into()
+                ));
             }
             HookStep::Render { .. } => {
                 bail!(AppError::Custom(
@@ -106,13 +166,13 @@ impl HookStep {
 
     /// Path-mutating variant: lets steps swap entries in the working set
     /// (e.g. Remux replaces .ts with the newly-created .mp4).
-    pub async fn execute_paths(&self, video_paths: &mut Vec<PathBuf>) -> AppResult<()> {
+    pub async fn execute_paths(&self, video_paths: &mut [PathBuf]) -> AppResult<()> {
         self.execute_paths_with_source(video_paths, None).await
     }
 
     pub async fn execute_paths_with_source(
         &self,
-        video_paths: &mut Vec<PathBuf>,
+        video_paths: &mut [PathBuf],
         source: Option<&crate::server::common::processing::model::RenderSource>,
     ) -> AppResult<()> {
         match self {
@@ -177,14 +237,50 @@ impl HookStep {
     }
 
     async fn ffmpeg_remux_to_mp4(src: &Path, dst: &Path) -> AppResult<()> {
+        let mut observation = crate::server::common::upload_observation::TaskObservation::current()
+            .map(|task| task.begin_processing("remux", src));
+        let result = Self::ffmpeg_remux_observed(src, dst, observation.as_ref()).await;
+        if let Some(observation) = observation.as_mut() {
+            match &result {
+                Ok(()) => observation.finish(Some(dst), None),
+                Err(error) => observation.finish(None, Some(&error.to_string())),
+            }
+        }
+        result
+    }
+
+    async fn ffmpeg_remux_observed(
+        src: &Path,
+        dst: &Path,
+        task: Option<&crate::server::common::upload_observation::ProcessingObservation>,
+    ) -> AppResult<()> {
         info!("remux ts→mp4: {} → {}", src.display(), dst.display());
-        let started = std::time::Instant::now();
-        let status = tools::ffmpeg_command()
+        use crate::server::common::processing::engine;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let duration = engine::probe(src, &cancel)
+            .await
+            .map_err(AppError::Custom)?
+            .duration_ms;
+        if let Some(task) = task {
+            task.progress(0, duration);
+        }
+        // Publish only a completed container; failed/interrupted writes must not be mistaken for reusable MP4s.
+        let temp = tempfile::Builder::new()
+            .prefix(".biliup-remux-")
+            .suffix(".mp4")
+            .tempfile_in(dst.parent().unwrap_or_else(|| Path::new(".")))
+            .map_err(|e| AppError::Custom(e.to_string()))?
+            .into_temp_path();
+        let mut command = tools::ffmpeg_command();
+        command
             .args([
                 "-hide_banner",
+                "-nostdin",
                 "-loglevel",
                 "warning",
                 "-y",
+                "-progress",
+                "pipe:1",
                 "-fflags",
                 "+genpts+igndts",
                 "-i",
@@ -200,39 +296,35 @@ impl HookStep {
                 "-avoid_negative_ts",
                 "make_zero",
             ])
-            .arg(dst)
-            .kill_on_drop(true)
-            .status()
+            .arg(&temp);
+        engine::run_process(
+            command,
+            &cancel,
+            Duration::from_secs(180),
+            |processed, _| {
+                if let Some(task) = task {
+                    task.progress(processed, duration);
+                }
+            },
+        )
+        .await
+        .map_err(AppError::Custom)?;
+        let meta = tokio::fs::metadata(&temp)
             .await
-            .change_context(AppError::Custom("failed to spawn ffmpeg".into()))?;
-        if !status.success() {
-            // Clean up partial output so a retry restarts cleanly.
-            let _ = tokio::fs::remove_file(dst).await;
-            bail!(AppError::Custom(format!(
-                "ffmpeg remux failed (status {:?}) for {}",
-                status,
-                src.display()
-            )));
-        }
-        let meta = tokio::fs::metadata(dst).await.change_context_lazy(|| {
-            AppError::Custom(format!("remux output missing: {}", dst.display()))
-        })?;
+            .map_err(|e| AppError::Custom(e.to_string()))?;
         if meta.len() == 0 {
-            let _ = tokio::fs::remove_file(dst).await;
-            bail!(AppError::Custom(format!(
-                "ffmpeg produced empty mp4: {}",
-                dst.display()
-            )));
+            bail!(AppError::Custom("remux produced an empty MP4".into()));
+        }
+        temp.persist_noclobber(dst)
+            .map_err(|e| AppError::Custom(e.to_string()))?;
+        if let Some(task) = task {
+            task.progress(duration.unwrap_or(0), duration);
         }
         info!(
-            "remux done {} ({:.1} MiB) in {:.1}s",
+            "remux done {} ({:.1} MiB)",
             dst.display(),
-            meta.len() as f64 / 1048576.0,
-            started.elapsed().as_secs_f64()
+            meta.len() as f64 / 1048576.0
         );
-        // Suppress unused-import warning for Duration on platforms that don't
-        // need it (kept for future timeout work).
-        let _ = Duration::from_secs(0);
         Ok(())
     }
 
@@ -245,7 +337,7 @@ impl HookStep {
     /// 执行成功返回Ok(())，失败返回错误信息
     pub async fn execute_with(&self, src: &[u8]) -> AppResult<()> {
         match self {
-            HookStep::Run { run } => {
+            HookStep::Run { run, .. } => {
                 self.execute_command(run, src).await?;
             }
             cmd => {
@@ -262,32 +354,65 @@ impl HookStep {
     /// * `cmd` - 要执行的命令字符串
     /// * `video_paths` - 视频文件路径列表
     async fn execute_command(&self, cmd: &str, src: &[u8]) -> AppResult<()> {
+        self.execute_command_result(cmd, src, false)
+            .await
+            .map(|_| ())
+    }
+
+    /// Downloaded hooks may report exact replacement paths on stdout. Ordinary
+    /// output stays byte-for-byte in the log; no directory discovery is used.
+    pub(crate) async fn execute_downloaded(&self, src: &[u8]) -> AppResult<Option<String>> {
+        match self {
+            Self::Run { run, .. } => self.execute_command_result(run, src, true).await,
+            _ => bail!(AppError::Custom("downloaded_processor 仅支持 run".into())),
+        }
+    }
+
+    async fn execute_command_result(
+        &self,
+        cmd: &str,
+        src: &[u8],
+        capture: bool,
+    ) -> AppResult<Option<String>> {
         // 1. 跨平台 Shell 处理 (对应 shell=True)
         // Windows 使用 "cmd /C"，Unix/Mac 使用 "sh -c"
-        let (shell, flag) = if cfg!(target_os = "windows") {
-            ("cmd", "/C")
-        } else {
-            ("sh", "-c")
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = tools::command("cmd");
+            // cmd parses shell syntax, not the C runtime's escaped argv syntax.
+            // /S removes this outer pair while preserving quotes in the script.
+            command
+                .args(["/D", "/S", "/C"])
+                .raw_arg(format!("\"{cmd}\""));
+            command
         };
-        // 执行自定义命令
-        // 解析命令和参数
-        // 启动子进程，配置标准输入管道
-        let mut process = tools::command(shell)
-            .arg(flag)
-            .arg(cmd)
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = tools::command("sh");
+            command.arg("-c").arg(cmd);
+            command
+        };
+        let mut process = command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .change_context(AppError::Unknown)?;
 
-        // 将自定义输入写入标准输入
-        if let Some(mut stdin) = process.stdin.take() {
-            stdin
-                .write_all(src)
-                .await
-                .change_context(AppError::Unknown)?;
-        }
+        // Drain stdout/stderr while supplying a potentially large session list.
+        // A notification-only command is allowed to close stdin without reading.
+        let stdin = process.stdin.take();
+        let src = src.to_vec();
+        let stdin_task = tokio::spawn(async move {
+            if let Some(mut stdin) = stdin {
+                match stdin.write_all(&src).await {
+                    Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                    result => result,
+                }
+            } else {
+                Ok(())
+            }
+        });
 
         let stdout = process
             .stdout
@@ -300,11 +425,24 @@ impl HookStep {
 
         // 子命令输出可能是 GBK、UTF-8 或任意字节流。这里不能按文本解码，
         // 而是原样转发到控制台并追加到 Web 可查看的日志文件。
-        let stdout_task = tokio::spawn(Self::tee_command_output(stdout, tokio::io::stdout()));
-        let stderr_task = tokio::spawn(Self::tee_command_output(stderr, tokio::io::stderr()));
+        let stdout_task = tokio::spawn(Self::tee_command_result(
+            stdout,
+            tokio::io::stdout(),
+            "download.log",
+            capture,
+        ));
+        let stderr_task = tokio::spawn(Self::tee_command_output(
+            stderr,
+            tokio::io::stderr(),
+            "download.log",
+        ));
 
         let status = process.wait().await.change_context(AppError::Unknown)?;
-        stdout_task.await.change_context(AppError::Unknown)??;
+        stdin_task
+            .await
+            .change_context(AppError::Unknown)?
+            .change_context(AppError::Unknown)?;
+        let result = stdout_task.await.change_context(AppError::Unknown)??;
         stderr_task.await.change_context(AppError::Unknown)??;
 
         if !status.success() {
@@ -314,14 +452,30 @@ impl HookStep {
             )));
         }
 
-        Ok(())
+        Ok(result)
     }
 
-    async fn tee_command_output<R, W>(mut reader: R, mut terminal: W) -> AppResult<()>
+    async fn tee_command_output<R, W>(
+        reader: R,
+        terminal: W,
+        log_file: &'static str,
+    ) -> AppResult<()>
     where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
+        Self::tee_command_result(reader, terminal, log_file, false)
+            .await
+            .map(|_| ())
+    }
+
+    async fn tee_command_result<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+        mut reader: R,
+        mut terminal: W,
+        _log_file: &'static str,
+        capture: bool,
+    ) -> AppResult<Option<String>> {
+        let mut result = HookOutputCapture::default();
         let mut log = download_log_writer();
         let mut buf = [0; 8192];
         loop {
@@ -332,6 +486,9 @@ impl HookStep {
             if n == 0 {
                 break;
             }
+            if capture {
+                result.feed(&buf[..n]);
+            }
             terminal
                 .write_all(&buf[..n])
                 .await
@@ -340,7 +497,7 @@ impl HookStep {
         }
         terminal.flush().await.change_context(AppError::Unknown)?;
         std::io::Write::flush(&mut log).change_context(AppError::Unknown)?;
-        Ok(())
+        result.finish()
     }
 
     /// 移动文件到指定目录
@@ -470,29 +627,64 @@ pub async fn process_video(
 /// in-place transforms (e.g. Remux replaces .ts with .mp4). Callers can read the
 /// final paths to find the actual files to upload / postprocess.
 pub async fn process_video_paths(
-    video_paths: &mut Vec<PathBuf>,
+    video_paths: &mut [PathBuf],
     processors: &[HookStep],
 ) -> AppResult<()> {
-    process_video_paths_with_source(video_paths, processors, None).await
+    process_video_paths_with_source(video_paths, processors, None)
+        .await
+        .map(|_| ())
 }
 
+/// Return the replaced inputs separately from the paths passed to upload and
+/// user hooks. The caller persists them as cleanup dependencies of the output.
 pub async fn process_video_paths_with_source(
-    video_paths: &mut Vec<PathBuf>,
+    video_paths: &mut [PathBuf],
     processors: &[HookStep],
     source: Option<&crate::server::common::processing::model::RenderSource>,
-) -> AppResult<()> {
+) -> AppResult<Vec<PathBuf>> {
     info!("Starting video processing (path-mutating)...");
+    let mut replaced = Vec::new();
     for processor in processors {
+        let before = video_paths.to_vec();
         processor
             .execute_paths_with_source(video_paths, source)
             .await?;
+        for path in before {
+            if !video_paths.contains(&path) && !replaced.contains(&path) {
+                replaced.push(path);
+            }
+        }
     }
     info!("Video processing completed");
-    Ok(())
+    Ok(replaced)
+}
+
+pub async fn process(input: &[u8], processors: &Option<Vec<HookStep>>) {
+    if let Some(hooks) = processors {
+        // 依次执行每个处理器步骤
+        for processor in hooks {
+            info!(processor=?processor, "Starting processing...");
+            if let Err(e) = processor.execute_with(input).await {
+                error!(error=?e, "自定义处理执行出错");
+            }
+            info!(processor=?processor, "processing completed");
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn output_capture_keeps_logs_out_of_results_and_handles_chunk_boundaries() {
+        let mut capture = super::HookOutputCapture::default();
+        capture.feed(b"normal log\n\xff\xfe\nBILIUP_OUT");
+        capture.feed(b"PUT={\"files\":[]}\r\nmore logs");
+        assert_eq!(capture.finish().unwrap().as_deref(), Some("{\"files\":[]}"));
+        let mut duplicate = super::HookOutputCapture::default();
+        duplicate.feed(b"BILIUP_OUTPUT={}\nBILIUP_OUTPUT={}\n");
+        assert!(duplicate.finish().is_err());
+    }
+
     use super::*;
 
     #[test]
@@ -509,6 +701,24 @@ mod tests {
         assert!(matches!(steps[1], HookStep::Move { .. }));
         assert!(matches!(steps[2], HookStep::Remux { .. }));
         assert!(matches!(steps[3], HookStep::Remove(_)));
+    }
+
+    #[test]
+    fn run_step_json_flag_is_opt_in() {
+        // 不写 json 时保持原行为：换行分隔的文件路径
+        let yaml = "- run: \"sh ./a.sh\"\n- run: \"sh ./cover.sh\"\n  json: true\n";
+        let steps: Vec<HookStep> = serde_yaml::from_str(yaml).unwrap();
+        match &steps[0] {
+            HookStep::Run { json, .. } => assert!(!*json, "默认必须是路径模式"),
+            other => panic!("应为 run 步骤: {other:?}"),
+        }
+        match &steps[1] {
+            HookStep::Run { json, .. } => assert!(*json, "显式 json = true 才走 JSON"),
+            other => panic!("应为 run 步骤: {other:?}"),
+        }
+        // 序列化时不写出默认值，避免配置文件被写脏
+        let back = serde_yaml::to_string(&steps).unwrap();
+        assert!(!back.contains("json: false"), "默认值不应被序列化: {back}");
     }
 
     #[test]
@@ -590,6 +800,7 @@ mod tests {
             HookStep::Remove("rm".into()),
             HookStep::Run {
                 run: format!("echo postprocessor-ran > \"{}\"", marker.display()),
+                json: false,
             },
         ];
 
@@ -620,18 +831,5 @@ mod tests {
         );
         // 失败时不要把破损的 mp4 留在磁盘上（idempotent retry 前提）
         assert!(!bogus.with_extension("mp4").exists());
-    }
-}
-
-pub async fn process(input: &[u8], processors: &Option<Vec<HookStep>>) {
-    if let Some(hooks) = processors {
-        // 依次执行每个处理器步骤
-        for processor in hooks {
-            info!(processor=?processor, "Starting processing...");
-            if let Err(e) = processor.execute_with(input).await {
-                error!(error=?e, "自定义处理执行出错");
-            }
-            info!(processor=?processor, "processing completed");
-        }
     }
 }

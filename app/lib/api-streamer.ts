@@ -209,6 +209,7 @@ export interface LiveStreamerEntity {
 	opt_args?: string[];
 	override?: Record<string, any>;
 	/** 用户主动暂停（DB 持久化）；列表 UI 仍以 status 为准 */
+	recording_paused?: boolean;
 	paused?: boolean;
 	// runtime / UI-only fields returned by list API
 	status?: string;
@@ -235,12 +236,13 @@ export interface LiveStreamerEntity {
 /** 从已有录播复制新建：深拷贝可配置字段，剔除 id/运行时状态/暂停。 */
 export function cloneStreamerForCreate(
 	source: LiveStreamerEntity
-): Omit<LiveStreamerEntity, 'id' | 'status' | 'statusTag' | 'upload_status' | 'paused'> {
+): Omit<LiveStreamerEntity, 'id' | 'status' | 'statusTag' | 'upload_status' | 'recording_paused' | 'paused'> {
 	const {
 		id: _id,
 		status: _status,
 		statusTag: _statusTag,
 		upload_status: _uploadStatus,
+		recording_paused: _recPaused,
 		paused: _paused,
 		live_bytes_per_sec: _bytes,
 		live_cover_url: _cover,

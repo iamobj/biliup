@@ -7,15 +7,16 @@
   - `url`：开播地址
   - `title`：直播间标题
   - `start_time`：开播时间，Unix 秒级时间戳
-- 主播“暂停录制”状态持久化到 `livestreamers.paused`：
-  - 仅 pause API 写入；表单/配置覆写保存不得覆盖。
-  - 启动时按 DB 恢复 `WorkerStatus::Pause`，暂停房间不进入监测队列。
+- 主播“暂停录制”状态持久化对齐上游 `livestreamers.recording_paused`：
+  - 对齐上游 `19_recording_pause.sql` 原生实现；二开历史库中的 `paused` 列在启动时自动回填同步。
+  - 仅 pause API（`toggle_pause`）写入与维护；表单/配置覆写保存不得覆盖。
+  - 启动时由 `DownloadManager.add_room` 按 DB 恢复 `WorkerStatus::Pause`，暂停房间不进入监测队列。
   - 列表 UI 仍以 runtime `status === 'Pause'` 显示。
 - 录播管理支持「复制新建」：
   - 卡片操作栏复制按钮打开与新建相同的 `TemplateModal`，标题为「复制录播」。
   - `cloneStreamerForCreate` 深拷贝可配置字段（含 `url`/`remark`/各类 processor/`override` 等），
-    剔除 `id`、`status`、`statusTag`、`upload_status`、`paused`；提交走 `POST /v1/streamers`。
-  - 后端创建仍强制 `paused=false`；不新增 API。
+    剔除 `id`、`status`、`statusTag`、`upload_status`、`recording_paused`（以及历史 `paused`）；提交走 `POST /v1/streamers`。
+  - 后端创建仍强制 `recording_paused=0`；不新增 API。
   - `TemplateModal` 以克隆 `initValues` 预填，避免原地改写列表 `time_range`；
     Form 未登记的 `override` 提交时从 entity 补回。
 - `segment_processor` Hook 在没有配置投稿模板时仍会执行。

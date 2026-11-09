@@ -346,15 +346,11 @@ impl<'a> TarsInputStream<'a> {
     }
 
     fn skip_to_struct_end_at(&mut self, depth: usize) {
-        loop {
-            if let Some((_, tars_type)) = self.read_head() {
-                if tars_type == TarsType::StructEnd {
-                    break;
-                }
-                self.skip_field_at(tars_type, depth);
-            } else {
+        while let Some((_, tars_type)) = self.read_head() {
+            if tars_type == TarsType::StructEnd {
                 break;
             }
+            self.skip_field_at(tars_type, depth);
         }
     }
 

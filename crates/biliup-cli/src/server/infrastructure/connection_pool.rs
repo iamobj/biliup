@@ -25,10 +25,11 @@ struct SupersededMigration {
     repair: &'static [&'static str],
 }
 
-/// 迁移文件是只读历史：sqlx 会用文件内容的 SHA-384 校验每条已应用的迁移，一旦
+/// 已发布的迁移文件是只读历史：sqlx 会用文件内容的 SHA-384 校验每条已应用的迁移，一旦
 /// 就地改写，所有老库都会在启动时以
 /// `migration N was previously applied but has been modified` 整体失败 —— 服务起不来，
-/// 容器无限重启（#1701 / #1702）。修 SQL 的正确做法始终是新增一个迁移文件。
+/// 容器无限重启（#1701 / #1702）。修改已发布结构须新增迁移；未发布功能的中间迁移
+/// 应合并成最终结构，不登记开发过程中的摘要或为临时工程添加升级路径。
 ///
 /// 这张表只给**已经发生过**的改写兜底，不是继续改写的许可。登记一条的前提是：
 /// 对已经跑过旧内容的库来说，新旧内容的差异能用下面这组幂等语句补齐。
@@ -81,6 +82,8 @@ impl ConnectionManager {
         migrator.run(&pool).await.change_context(AppError::Custom(
             "error while running database migrations".to_string(),
         ))?;
+
+        Self::migrate_legacy_paused_column(&pool).await?;
 
         Ok(pool)
     }
@@ -352,11 +355,10 @@ impl ConnectionManager {
     }
 
     /// 兼容二开历史迁移版本号：
-    /// - timestamp_anomaly (历史版本为 5、16 或 17) 对齐为 18
-    /// - paused (历史版本为 3、15 或 16) 对齐为 17
-    /// - 必须先迁移 timestamp_anomaly (16/17 -> 18)，再迁移 paused (15/16 -> 17)，避免 PRIMARY KEY 唯一约束冲突
-    /// - 如果 livestreamers 表中已存在 paused 列，确保 version 17 在记账表中，防止重复加列报错
-    /// - 如果 _sqlx_migrations 中存在 version 15，但 douyu_cookie_keeper 表不存在，说明 version 15 是旧二开 paused 记录或未真正执行 baseline 的记录，将其从记账表中删除以便执行上游 migration 15
+    /// - timestamp_anomaly (历史版本为 5、16、17 或 18) 对齐为 20
+    /// - 历史二开 paused 迁移 (3、15、16 或 17)：
+    ///   移除其在 _sqlx_migrations 中的残留记录（避免占用上游 15/16/17 版本号，确保上游 17 processed_video_sources 能正常运行），
+    ///   实际的暂停状态数据将在 migrator 运行后由 `migrate_legacy_paused_column` 安全转入 recording_paused。
     async fn adopt_fork_migrations(
         pool: &ConnectionPool,
         migrator: &Migrator,
@@ -377,65 +379,38 @@ impl ConnectionManager {
         .execute(&mut *tx)
         .await;
 
-        // 1. 先迁移 timestamp_anomaly (5, 16 或 17) -> 18。
-        // 关键：必须先让出 version 17，才能容纳 paused 从 16 变迁至 17！
-        if let Some(m18) = find(18) {
+        // 1. 将二开 timestamp_anomaly (5, 16, 17 或 18) 对齐为 20。
+        // 关键：先挪到 20，让出 16, 17, 18 给上游迁移
+        if let Some(m20) = find(20) {
             let updated = sqlx::query(
-                "UPDATE _sqlx_migrations SET version = 18, description = ?, checksum = ? \
-                 WHERE (version = 5 OR version = 16 OR version = 17) AND description LIKE '%timestamp_anomaly%'",
+                "UPDATE _sqlx_migrations SET version = 20, description = ?, checksum = ? \
+                 WHERE (version = 5 OR version = 16 OR version = 17 OR version = 18) AND description LIKE '%timestamp_anomaly%'",
             )
-            .bind(m18.description.as_ref())
-            .bind(m18.checksum.to_vec())
+            .bind(m20.description.as_ref())
+            .bind(m20.checksum.to_vec())
             .execute(&mut *tx)
             .await
             .change_context_lazy(err)?
             .rows_affected();
 
             if updated > 0 {
-                info!("已将二开 timestamp_anomaly 迁移版本号对齐为 18");
+                info!("已将二开 timestamp_anomaly 迁移版本号对齐为 20");
             }
         }
 
-        // 2. 迁移 paused (3, 15 或 16) -> 17
-        // 关键：此时 version 17 已让出，可从 16 迁至 17，并顺带让出 version 16 给上游 room_listing_index
-        if let Some(m17) = find(17) {
-            let updated = sqlx::query(
-                "UPDATE _sqlx_migrations SET version = 17, description = ?, checksum = ? \
-                 WHERE (version = 3 OR version = 15 OR version = 16) AND description LIKE '%paused%'",
-            )
-            .bind(m17.description.as_ref())
-            .bind(m17.checksum.to_vec())
-            .execute(&mut *tx)
-            .await
-            .change_context_lazy(err)?
-            .rows_affected();
+        // 2. 清理历史二开 paused 迁移在 _sqlx_migrations 中的旧记账（版本 3, 15, 16, 17）。
+        // 这些旧记录不能留着，否则会阻止上游 17 (processed_video_sources) 的执行。
+        // 其物理列上的数据会在 migrator.run 之后转存入 recording_paused。
+        let deleted_paused = sqlx::query(
+            "DELETE FROM _sqlx_migrations WHERE (version = 3 OR version = 15 OR version = 16 OR version = 17) AND description LIKE '%paused%'",
+        )
+        .execute(&mut *tx)
+        .await
+        .change_context_lazy(err)?
+        .rows_affected();
 
-            if updated > 0 {
-                info!("已将二开 livestreamers.paused 迁移版本号对齐为 17");
-            }
-
-            // 兜底：如果 livestreamers 表中已经存在 paused 列，但 _sqlx_migrations 中没有 version 17，
-            // 则将 version 17 标记为已成功应用，防止重复 ADD COLUMN 报错
-            let paused_col_exists: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM pragma_table_info('livestreamers') WHERE name = 'paused'",
-            )
-            .fetch_optional(&mut *tx)
-            .await
-            .change_context_lazy(err)?;
-
-            if paused_col_exists.is_some() {
-                sqlx::query(
-                    "INSERT OR IGNORE INTO _sqlx_migrations \
-                     (version, description, success, checksum, execution_time) \
-                     VALUES (?, ?, TRUE, ?, 0)",
-                )
-                .bind(m17.version)
-                .bind(m17.description.as_ref())
-                .bind(m17.checksum.to_vec())
-                .execute(&mut *tx)
-                .await
-                .change_context_lazy(err)?;
-            }
+        if deleted_paused > 0 {
+            info!("已清理历史二开 paused 迁移记录，准备转由上游 19_recording_pause 接管");
         }
 
         // 3. 修复 version 15 (上游 15_service_feature_baseline.sql)：
@@ -461,6 +436,42 @@ impl ConnectionManager {
         }
 
         tx.commit().await.change_context_lazy(err)?;
+        Ok(())
+    }
+
+    /// 在 migrator.run 之后执行：
+    /// 如果物理库中存在二开历史留下的 `paused` 列，将其值为 1 的行同步到上游原生的 `recording_paused` 列中。
+    async fn migrate_legacy_paused_column(pool: &ConnectionPool) -> AppResult<()> {
+        let err = || AppError::Custom("error while migrating legacy paused column".into());
+        let paused_exists: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM pragma_table_info('livestreamers') WHERE name = 'paused'",
+        )
+        .fetch_optional(pool)
+        .await
+        .change_context_lazy(err)?;
+
+        if paused_exists.is_some() {
+            let rec_paused_exists: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM pragma_table_info('livestreamers') WHERE name = 'recording_paused'",
+            )
+            .fetch_optional(pool)
+            .await
+            .change_context_lazy(err)?;
+
+            if rec_paused_exists.is_some() {
+                let updated = sqlx::query(
+                    "UPDATE livestreamers SET recording_paused = 1 WHERE paused = 1 AND recording_paused = 0",
+                )
+                .execute(pool)
+                .await
+                .change_context_lazy(err)?
+                .rows_affected();
+
+                if updated > 0 {
+                    info!(updated, "已将二开历史 paused 状态无缝迁移至 recording_paused");
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -640,10 +651,18 @@ mod tests {
             ),
             (
                 17,
-                "31d3f0a5566df81f4ad4a8fb9265f6de5d3f5addfdf607fcfea170d7ba70bda93b5c10a351d2df6b53682148711d2c06",
+                "7186a4ca1c54defbcab04f485f2365fb1677e346703c0f5d5bfd3cd6b7d8208895be4608024585dbb73a7e0463b548ec",
             ),
             (
                 18,
+                "dd77be0c39401b245fb8291a6db4b0b3a7c56c9ca62ebf4ad0764afdb3f937b121bb25feb6c0febb79abd7b5c5aa8f18",
+            ),
+            (
+                19,
+                "517da1681f3b9277489924d659e02874800b5c59a97f014e7fbd86eadf11634b90db7e5aaff398147157244d7afde462",
+            ),
+            (
+                20,
                 "fa46e816fb13ffbf2ad8e886ed96e062e964e60d42e08ac78a3bc00d2a6b0748788bf3299bc65b9f22a8b34639295186",
             ),
         ];
@@ -710,12 +729,12 @@ mod tests {
                 .fetch_all(&pool)
                 .await
                 .unwrap();
+        let embedded = sqlx::migrate!();
         assert_eq!(
             migrations.iter().map(|m| m.0).collect::<Vec<_>>(),
-            (1..=18).collect::<Vec<_>>(),
+            embedded.iter().map(|m| m.version).collect::<Vec<_>>(),
             "待应用的迁移必须补齐"
         );
-        let embedded = sqlx::migrate!();
         for (version, checksum) in &migrations {
             let expected = embedded.iter().find(|m| m.version == *version).unwrap();
             assert_eq!(
@@ -784,7 +803,10 @@ mod tests {
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert_eq!(applied, (1..=18).collect::<Vec<_>>());
+        assert_eq!(
+            applied,
+            embedded.iter().map(|m| m.version).collect::<Vec<_>>()
+        );
         let seeded: Vec<i64> = sqlx::query_scalar("SELECT id FROM stream_session_ids ORDER BY id")
             .fetch_all(&pool)
             .await
@@ -1030,7 +1052,13 @@ mod tests {
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert_eq!(versions, (1..=18).collect::<Vec<_>>());
+        assert_eq!(
+            versions,
+            sqlx::migrate!()
+                .iter()
+                .map(|m| m.version)
+                .collect::<Vec<_>>()
+        );
         let tables: Vec<String> = sqlx::query_scalar(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN \
              ('streamerinfo', 'stream_sessions', 'session_streamerinfo', 'segments') ORDER BY name",
@@ -1234,8 +1262,8 @@ mod tests {
             .await
             .unwrap();
 
-        // 模拟升级场景：回退并重新运行 migration 18
-        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 18")
+        // 模拟升级场景：回退并重新运行 migration 20
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 20")
             .execute(&pool)
             .await
             .unwrap();
@@ -1393,7 +1421,7 @@ mod tests {
             .fetch_all(&pool)
             .await
             .unwrap();
-        assert_eq!(versions, (1..=18).collect::<Vec<_>>());
+        assert_eq!(versions, (1..=20).collect::<Vec<_>>());
 
         // 确认上游 15 真正跑了
         let table_exists: Option<String> = sqlx::query_scalar(
@@ -1414,11 +1442,11 @@ mod tests {
         assert!(index_exists.is_some(), "上游 migration 16 必须执行并创建 idx_sessions_room_latest 索引");
     }
 
-    /// 分支版（迁移 16 = paused, 17 = timestamp_anomaly）建立的库（v1.3.2 状态）：
-    /// 升级到 v1.3.3 时，上游引入了新的迁移 16（room_listing_index），
-    /// 分支版迁移顺延为 17 和 18。
-    /// 升级必须：将旧 17 变为 18、旧 16 变为 17、补跑上游 16（创建 idx_sessions_room_latest 索引），
-    /// 并且不报 duplicate column name: paused。
+    /// 分支版（曾有迁移 16/17 = paused, 17/18 = timestamp_anomaly）建立的库：
+    /// 升级到最新版本时，上游引入了新的迁移 17（processed_video_sources）、18（editor_projects）、19（recording_pause），
+    /// 分支版 timestamp_anomaly 迁移顺延为 20。
+    /// 升级必须：将旧 timestamp_anomaly 对齐为 20、清理旧 paused 迁移记账、跑完上游 17~19、
+    /// 并将旧 paused 列的暂停状态无缝同步至 recording_paused。
     #[tokio::test]
     async fn upgrade_from_fork_v16_paused_and_v17_timestamp_anomaly() {
         let dir = tempfile::tempdir().unwrap();
@@ -1440,11 +1468,17 @@ mod tests {
         };
         through_15.run(&pool).await.unwrap();
 
-        // 模拟旧分支（v1.3.2）上运行过的二开迁移：
+        // 模拟旧分支上运行过的二开迁移与暂停数据：
         sqlx::query("ALTER TABLE livestreamers ADD COLUMN paused BOOLEAN NOT NULL DEFAULT FALSE")
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query(
+            "INSERT INTO livestreamers (id, url, remark, paused) VALUES (100, 'https://test.example', 'test', TRUE)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query(
             "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
              VALUES (16, 'add livestreamers paused', TRUE, X'1234', 0), \
@@ -1459,13 +1493,13 @@ mod tests {
         // 重新初始化，触发升级与对齐
         let pool = ConnectionManager::new_pool(db.to_str().unwrap())
             .await
-            .expect("旧分支版（v1.3.2）数据库必须能平滑升级到新版本");
+            .expect("旧分支版数据库必须能平滑升级到新版本");
 
         let versions: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&pool)
             .await
             .unwrap();
-        assert_eq!(versions, (1..=18).collect::<Vec<_>>());
+        assert_eq!(versions, (1..=20).collect::<Vec<_>>());
 
         // 确认上游 16 真正跑了
         let index_exists: Option<String> = sqlx::query_scalar(
@@ -1475,10 +1509,37 @@ mod tests {
         .await
         .unwrap();
         assert!(index_exists.is_some(), "上游 migration 16 必须执行并创建 idx_sessions_room_latest 索引");
+
+        // 确认上游 17 真正跑了
+        let sources_table_exists: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'processed_video_sources'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert!(sources_table_exists.is_some(), "上游 migration 17 必须执行并创建 processed_video_sources 表");
+
+        // 确认上游 18 真正跑了
+        let editor_table_exists: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'editor_projects'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert!(editor_table_exists.is_some(), "上游 migration 18 必须执行并创建 editor_projects 表");
+
+        // 确认上游 19 真正跑了且旧库 paused 状态已同步到 recording_paused
+        let rec_paused: i64 = sqlx::query_scalar(
+            "SELECT recording_paused FROM livestreamers WHERE id = 100",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rec_paused, 1, "旧库 paused=1 的主播必须自动同步为 recording_paused=1");
     }
 
     /// 针对初次升级失败的中间状态（version 15 被误标记为已跑、version 16 缺失、paused 列已存在）：
-    /// 必须自动识别并恢复，补跑 15 并标记 17，不再报错 duplicate column name: paused。
+    /// 必须自动识别并恢复，补跑 15，最终全部跑完 1..=20。
     #[tokio::test]
     async fn recovers_from_half_migrated_paused_error_state() {
         let dir = tempfile::tempdir().unwrap();
@@ -1506,14 +1567,14 @@ mod tests {
             .unwrap();
 
         let current_15 = embedded.iter().find(|m| m.version == 15).unwrap();
-        let current_18 = embedded.iter().find(|m| m.version == 18).unwrap();
+        let current_20 = embedded.iter().find(|m| m.version == 20).unwrap();
         sqlx::query(
             "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
              VALUES (15, 'add livestreamers paused', TRUE, ?, 0), \
-                    (18, 'migrate timestamp anomaly', TRUE, ?, 0)",
+                    (20, 'migrate timestamp anomaly', TRUE, ?, 0)",
         )
         .bind(current_15.checksum.to_vec())
-        .bind(current_18.checksum.to_vec())
+        .bind(current_20.checksum.to_vec())
         .execute(&pool)
         .await
         .unwrap();
@@ -1529,7 +1590,7 @@ mod tests {
             .fetch_all(&pool)
             .await
             .unwrap();
-        assert_eq!(versions, (1..=18).collect::<Vec<_>>());
+        assert_eq!(versions, (1..=20).collect::<Vec<_>>());
 
         let table_exists: Option<String> = sqlx::query_scalar(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'douyu_cookie_keeper'",

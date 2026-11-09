@@ -119,7 +119,6 @@ mod tests {
             id: 1,
             url: "https://www.douyu.com/5146843".to_string(),
             remark: "test".to_string(),
-            paused: false,
             filename_prefix: None,
             time_range,
             upload_streamers_id: None,

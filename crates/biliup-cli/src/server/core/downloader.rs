@@ -177,7 +177,7 @@ pub enum DownloaderRuntime {
     Ffmpeg(FfmpegDownloader),
     StreamGears(StreamGears),
     StreamLink(Streamlink),
-    YtDlp(YouTubeDownloader),
+    YtDlp(Box<YouTubeDownloader>),
     Sync(SyncDownloader),
     Mesio(Mesio),
 }
@@ -206,6 +206,18 @@ impl DownloaderRuntime {
                 Self::StreamGears(StreamGears::new(None))
             }
         }
+    }
+
+    /// 把房间的「ffmpeg参数」（`opt_args`）追加到 ffmpeg 的输出参数里，与 Python 版一样只对 ffmpeg 生效
+    pub fn with_ffmpeg_args(mut self, args: Vec<String>) -> Self {
+        match &mut self {
+            Self::Ffmpeg(ffmpeg) => ffmpeg.extra_args = args,
+            _ if !args.is_empty() => {
+                warn!("房间设了 ffmpeg 参数，但本次录制不走 ffmpeg，参数不生效")
+            }
+            _ => {}
+        }
+        self
     }
 
     pub async fn download<'a>(

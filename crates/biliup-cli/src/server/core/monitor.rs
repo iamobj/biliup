@@ -1078,7 +1078,6 @@ mod tests {
             postprocessor: None,
             opt_args: None,
             excluded_keywords: None,
-            paused: false,
         };
         Arc::new(Worker::new(
             streamer,
@@ -1510,7 +1509,7 @@ mod tests {
         // until that API has returned, matching sequential browser operations.
         let pausing = tokio::spawn({
             let managers = managers.clone();
-            async move { toggle_pause(&managers, 1).await }
+            async move { toggle_pause(&managers, 1).await.unwrap() }
         });
         tokio::time::timeout(Duration::from_secs(5), async {
             while !matches!(*room.downloader_status.read().unwrap(), WorkerStatus::Pause) {
@@ -1528,7 +1527,7 @@ mod tests {
             WorkerStatus::Pause
         ));
 
-        toggle_pause(&managers, 1).await;
+        toggle_pause(&managers, 1).await.unwrap();
         tokio::time::timeout(Duration::from_secs(10), resumed_rx.recv())
             .await
             .unwrap_or_else(|_| {

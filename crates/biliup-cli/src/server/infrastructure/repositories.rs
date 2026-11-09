@@ -76,25 +76,6 @@ pub async fn get_all_streamer(pool: &ConnectionPool) -> AppResult<Vec<LiveStream
         .change_context(AppError::Unknown)
 }
 
-/// 更新主播的暂停状态
-///
-/// # 参数
-/// * `pool` - 数据库连接池
-/// * `id` - 主播 ID
-/// * `paused` - 是否暂停
-pub async fn set_streamer_paused(
-    pool: &ConnectionPool,
-    id: i64,
-    paused: bool,
-) -> AppResult<LiveStreamer> {
-    let mut streamer = get_streamer(pool, id).await?;
-    streamer.paused = paused;
-    streamer
-        .update_all_fields(pool)
-        .await
-        .change_context(AppError::Unknown)
-}
-
 /// 从数据库获取全局配置
 ///
 /// # 参数
@@ -527,12 +508,12 @@ async fn delete_bilibili_cookie_from(
             bail!(AppError::Custom("B 站用户不存在".into()));
         }
         Err(error) => {
-            if let Some(quarantine) = quarantine.as_ref() {
-                if let Err(restore_error) = std::fs::rename(quarantine, &target_path) {
-                    bail!(AppError::Custom(format!(
-                        "数据库删除失败且无法恢复已隔离的凭据文件: {error}; {restore_error}"
-                    )));
-                }
+            if let Some(quarantine) = quarantine.as_ref()
+                && let Err(restore_error) = std::fs::rename(quarantine, &target_path)
+            {
+                bail!(AppError::Custom(format!(
+                    "数据库删除失败且无法恢复已隔离的凭据文件: {error}; {restore_error}"
+                )));
             }
             return Err(error).change_context(AppError::Unknown);
         }

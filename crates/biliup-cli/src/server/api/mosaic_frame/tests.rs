@@ -324,7 +324,6 @@ async fn endpoint_missing_room_and_offline_room_return_explicit_no_store_errors(
         postprocessor: None,
         opt_args: None,
         excluded_keywords: None,
-        paused: false,
     };
     let worker = Worker::new(
         streamer,

@@ -1,12 +1,12 @@
 'use client'
 
 import {
+  Button,
   Form,
   Notification,
   Collapse,
   Select,
   Avatar,
-  Button,
   Typography,
 } from '@douyinfe/semi-ui'
 import { FormApi } from '@douyinfe/semi-ui/lib/es/form'
@@ -30,7 +30,6 @@ import { MosaicPanel } from './MosaicPanel'
 import { SegmentTimeField } from './SegmentTimeField'
 import { updateSegmentTimeOverride, validateSegmentTime, type SegmentTimeValue } from '../lib/segment-time'
 import { parseOverrideText, updateMosaicOverrideText, validateMosaicConfig } from '../lib/mosaic-config'
-import { applyLocalMaterialPreset } from '../lib/local-material-preset'
 
 type PluginProps = {
   entity?: LiveStreamerEntity
@@ -68,7 +67,6 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, initial
     if (!next) onCancel?.()
   }
   const [formKey, setFormKey] = useState(0)
-  const localMaterialPresetApplied = useRef(false)
 
   const { biliUsers } = useBiliUsers(visible)
   const list = biliUsers?.map(item => {
@@ -94,7 +92,6 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, initial
   }, [entity?.url])
   const showDialog = () => {
     setActivePanels([initialPanel])
-    localMaterialPresetApplied.current = false
     const current = compactOverrideRecord(entity?.override as OverrideRecord | undefined)
     overrideRef.current = current
     lastEditedRef.current = 'form'
@@ -172,13 +169,6 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, initial
     })
   }
 
-  const applyLocalMaterialPresetToForm = () => {
-    localMaterialPresetApplied.current = true
-    const current = cloneOverride(overrideRef.current)
-    const updated = applyLocalMaterialPreset(current)
-    applyOverrideToForm(updated, 'form')
-  }
-
   const handleCancel = () => {
     setVisible(false)
   }
@@ -230,10 +220,6 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, initial
       override: finalOverride,
     }
 
-    if (localMaterialPresetApplied.current) {
-      payload.postprocessor = []
-    }
-
     try {
       await onOk(payload)
       setVisible(false)
@@ -264,16 +250,6 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, initial
         </a>{' '}
         查看选项说明
       </div>
-      <Form.Slot label="录制模式">
-        <div>
-          <Button theme="light" type="primary" onClick={applyLocalMaterialPresetToForm}>
-            使用本地素材录制预设
-          </Button>
-          <div className="semi-form-field-extra">
-            使用 mesio 落盘，不上传、不删除原始分段，并关闭录制阶段的画面遮挡；录后合成和切片在工作台完成。
-          </div>
-        </div>
-      </Form.Slot>
       <Form.Select
         label="下载插件（downloader）"
         field="downloader"
@@ -291,8 +267,6 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, initial
         <Select.Option value="sync-downloader">sync-downloader（边录边传）</Select.Option>
         <Select.Option value="mesio">mesio（默认）</Select.Option>
       </Form.Select>
-
-      <Form.Input field="uploader" initValue={entity?.override?.uploader} noLabel style={{ display: 'none' }} />
 
       <FileSizeField
         label="视频分段大小（file_size）"

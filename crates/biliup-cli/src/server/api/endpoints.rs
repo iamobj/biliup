@@ -10,7 +10,7 @@ use crate::server::config::{Config, compact_override_value};
 use crate::server::core::download_manager::DownloadManager;
 use crate::server::errors::{ApiError, AppError, report_to_response};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
-use crate::server::infrastructure::context::{Stage, Worker, WorkerStatus};
+use crate::server::infrastructure::context::{Worker, WorkerStatus};
 use crate::server::infrastructure::dto::{LivePreviewResponse, LiveStreamerResponse};
 use crate::server::infrastructure::models::live_streamer::{InsertLiveStreamer, LiveStreamer};
 use crate::server::infrastructure::models::upload_streamer::{
@@ -20,13 +20,12 @@ use crate::server::infrastructure::models::{Configuration, FileItem, StreamerInf
 use crate::server::infrastructure::permissions::Permission;
 use crate::server::infrastructure::policy::{Field, Subject};
 use crate::server::infrastructure::repositories::{
-    delete_bilibili_cookie, get_all_streamer, get_streamer, register_bilibili_cookie,
-    set_streamer_paused,
+    delete_bilibili_cookie, get_all_streamer, register_bilibili_cookie,
 };
 use crate::server::infrastructure::service_register::ServiceRegister;
 use crate::server::services::configuration::{ApplyConfigError, apply_config};
 use crate::server::services::streamers::{
-    AddStreamerError, add_streamer, delete_streamer, update_streamer,
+    AddStreamerError, add_streamer, delete_streamer, toggle_pause, update_streamer,
 };
 use crate::server::workbench;
 use crate::{LogHandle, UploadLine};
@@ -74,7 +73,9 @@ pub async fn get_streamers_endpoint(
 ) -> Result<Json<Vec<LiveStreamerResponse>>, Response> {
     let live_streamers = get_all_streamer(&pool).await.map_err(report_to_response)?;
     let workers = managers.get_rooms().await;
-    Ok(Json(streamer_responses(&caller, &pool, &config, live_streamers, &workers).await))
+    Ok(Json(
+        streamer_responses(&caller, &pool, &config, live_streamers, &workers).await,
+    ))
 }
 
 pub(super) async fn streamer_responses(
@@ -169,13 +170,15 @@ async fn fill_marker_counts(pool: &ConnectionPool, results: &mut [LiveStreamerRe
     }
 }
 
-/// 钩子走 `sh -c`、`override` 能覆盖任意全局配置，两者合起来等于服务器 shell，见 [`Field::StreamerHooks`]。
+/// 钩子走 `sh -c`、`override` 能覆盖任意全局配置、ffmpeg 参数能让 ffmpeg 写任意文件，
+/// 合起来等于服务器 shell，见 [`Field::StreamerHooks`]。
 fn strip_hooks(streamer: &mut LiveStreamer) {
     streamer.override_cfg = None;
     streamer.preprocessor = None;
     streamer.segment_processor = None;
     streamer.downloaded_processor = None;
     streamer.postprocessor = None;
+    streamer.opt_args = None;
 }
 
 pub async fn post_streamers_endpoint(
@@ -189,14 +192,12 @@ pub async fn post_streamers_endpoint(
         payload.segment_processor = None;
         payload.downloaded_processor = None;
         payload.postprocessor = None;
+        payload.opt_args = None;
     }
     payload.override_cfg = compact_override_value(payload.override_cfg.take());
-    payload.paused = false;
-    validate_streamer_mosaic(&payload.override_cfg)?;
+    validate_streamer_mosaic(&payload.override_cfg).map_err(IntoResponse::into_response)?;
     match add_streamer(&service_register, payload).await {
-        Ok(live_streamers) => {
-            Ok(Json(live_streamers))
-        }
+        Ok(live_streamers) => Ok(Json(live_streamers)),
         Err(AddStreamerError::UnsupportedUrl) => {
             Err((StatusCode::BAD_REQUEST, "Not supported url").into_response())
         }
@@ -210,13 +211,7 @@ pub async fn put_streamers_endpoint(
     State(pool): State<ConnectionPool>,
     Json(payload): Json<LiveStreamer>,
 ) -> Result<Json<LiveStreamer>, Response> {
-    // 暂停状态仅由 pause API 维护，表单/覆写保存不得覆盖
-    let existing_paused = get_streamer(&pool, payload.id)
-        .await
-        .map_err(report_to_response)?
-        .paused;
     let mut payload = normalize_streamer_override(payload);
-    payload.paused = existing_paused;
 
     if !caller.can_access(Field::StreamerHooks) {
         // 表单是整体覆盖保存；没有钩子权限的人看不到这几项，这里以库里原值为准，不看请求体。
@@ -233,8 +228,9 @@ pub async fn put_streamers_endpoint(
         payload.segment_processor = current.segment_processor;
         payload.downloaded_processor = current.downloaded_processor;
         payload.postprocessor = current.postprocessor;
+        payload.opt_args = current.opt_args;
     }
-    validate_streamer_mosaic(&payload.override_cfg)?;
+    validate_streamer_mosaic(&payload.override_cfg).map_err(IntoResponse::into_response)?;
     let mut streamer = update_streamer(&service_register, payload)
         .await
         .map_err(report_to_response)?;
@@ -246,11 +242,16 @@ pub async fn put_streamers_endpoint(
 
 fn validate_streamer_mosaic(
     override_val: &Option<serde_json::Value>,
-) -> Result<(), Response> {
+) -> Result<(), (StatusCode, Json<ApiError>)> {
     let patch = match override_val.as_ref() {
         Some(v) => match crate::server::config::config_patch_from_override_value(v) {
             Ok(p) => Some(p),
-            Err(e) => return Err((StatusCode::BAD_REQUEST, format!("Invalid override: {e}")).into_response()),
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiError::new(format!("Invalid override: {e}"))),
+                ));
+            }
         },
         None => None,
     };
@@ -275,11 +276,10 @@ fn validate_streamer_mosaic(
                 "视频分段时长格式无效，请输入大于 0 的时:分:秒、分:秒或秒数".to_string(),
             )),
         )
-            .into_response()
     })?;
     config
         .validate_mosaic()
-        .map_err(|message| (StatusCode::BAD_REQUEST, Json(ApiError::new(message))).into_response())
+        .map_err(|message| (StatusCode::BAD_REQUEST, Json(ApiError::new(message))))
 }
 
 pub async fn delete_streamers_endpoint(
@@ -296,32 +296,11 @@ pub async fn delete_streamers_endpoint(
 // #[axum::debug_handler(state = ServiceRegister)]
 pub async fn pause_streamers_endpoint(
     State(managers): State<Arc<DownloadManager>>,
-    State(pool): State<ConnectionPool>,
     Path(id): Path<i64>,
 ) -> Result<Json<()>, Response> {
-    let worker = managers.get_room_by_id(id).await;
-    if let Some(w) = worker {
-        let worker_status = w.downloader_status.read().unwrap().clone();
-        match worker_status {
-            WorkerStatus::Working(_) | WorkerStatus::Pending | WorkerStatus::Idle => {
-                // 先落库，避免运行时已暂停但重启后丢失
-                set_streamer_paused(&pool, id, true)
-                    .await
-                    .map_err(report_to_response)?;
-                w.change_status(Stage::Download, WorkerStatus::Pause).await;
-                managers.make_waker(id).await;
-                info!(url=?&w.live_streamer.url, "successfully pause live streamers");
-            }
-            WorkerStatus::Pause => {
-                set_streamer_paused(&pool, id, false)
-                    .await
-                    .map_err(report_to_response)?;
-                w.change_status(Stage::Download, WorkerStatus::Idle).await;
-                managers.wake_waker(id).await;
-                info!(url=?&w.live_streamer.url, "successfully start live streamers");
-            }
-        };
-    }
+    toggle_pause(&managers, id)
+        .await
+        .map_err(report_to_response)?;
     Ok(Json(()))
 }
 
@@ -906,6 +885,138 @@ mod template_field_tests {
 }
 
 #[cfg(test)]
+mod streamer_hook_tests {
+    use super::{get_streamers_endpoint, post_streamers_endpoint, put_streamers_endpoint};
+    use crate::server::api::access::Caller;
+    use crate::server::config::Config;
+    use crate::server::core::download_manager::DownloadManager;
+    use crate::server::infrastructure::connection_pool::ConnectionManager;
+    use crate::server::infrastructure::models::live_streamer::LiveStreamer;
+    use crate::server::infrastructure::permissions::Role;
+    use crate::server::infrastructure::policy::Subject;
+    use crate::server::infrastructure::service_register::ServiceRegister;
+    use axum::Json;
+    use axum::extract::State;
+    use biliup::downloader::live::{LivePlugin, LiveRequest, LiveResult, LiveStatus};
+    use ormlite::Model;
+    use serde_json::json;
+    use std::sync::{Arc, RwLock};
+    use tracing_subscriber::{EnvFilter, reload};
+
+    /// 只认 `https://stuck.example/` 的平台；检测一直不返回，不会向任何真实平台发请求
+    struct StuckPlatform;
+
+    #[async_trait::async_trait]
+    impl LivePlugin for StuckPlatform {
+        fn name(&self) -> &'static str {
+            "stuck"
+        }
+
+        fn matches(&self, url: &str) -> bool {
+            url.starts_with("https://stuck.example/")
+        }
+
+        async fn check_stream(&self, _request: LiveRequest) -> LiveResult<LiveStatus> {
+            std::future::pending().await
+        }
+    }
+
+    fn operator() -> Caller {
+        let mut caller = Caller::unrestricted();
+        caller.subject = Subject::user(2, Role::Operator);
+        caller
+    }
+
+    #[tokio::test]
+    async fn operators_neither_see_nor_change_ffmpeg_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = ConnectionManager::new_pool(dir.path().join("data.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        let managers = DownloadManager::new(1, 1, pool.clone());
+        managers.add_plugin(Arc::new(StuckPlatform)).await;
+        let (_layer, log_handle) = reload::Layer::new(EnvFilter::new("info"));
+        let config = Arc::new(RwLock::new(Config::default()));
+        let services = ServiceRegister::new(pool.clone(), config, managers, log_handle).await;
+        let stored = |id: i64| {
+            let pool = pool.clone();
+            async move {
+                LiveStreamer::select()
+                    .where_("id = ?")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+                    .opt_args
+            }
+        };
+
+        // 新建：没有钩子权限的人带上的 ffmpeg 参数不落库
+        let body = json!({
+            "url": "https://stuck.example/1",
+            "remark": "r",
+            "opt_args": ["-f", "ffmetadata", "/tmp/x"],
+        });
+        let Json(created) = post_streamers_endpoint(
+            operator(),
+            State(services.clone()),
+            Json(serde_json::from_value(body).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored(created.id).await, None);
+
+        let admin_args = json!(["-metadata", "comment=admin"]);
+        let mut edit = created.clone();
+        edit.opt_args = Some(admin_args.clone());
+        let Json(saved) = put_streamers_endpoint(
+            Caller::unrestricted(),
+            State(services.clone()),
+            State(pool.clone()),
+            Json(edit),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.opt_args, Some(admin_args.clone()));
+        assert_eq!(stored(created.id).await, Some(admin_args.clone()));
+
+        // 列表里看不到
+        let list = |caller: Caller| {
+            let services = services.clone();
+            async move {
+                let Json(list) = get_streamers_endpoint(
+                    caller,
+                    State(services.pool),
+                    State(services.managers),
+                    State(services.config),
+                )
+                .await
+                .unwrap();
+                list[0].inner.opt_args.clone()
+            }
+        };
+        assert_eq!(list(operator()).await, None);
+        assert_eq!(list(Caller::unrestricted()).await, Some(admin_args.clone()));
+
+        // 整体覆盖保存：请求体里的 ffmpeg 参数不算数，以库里原值为准，回包里也不带
+        let mut edit = created.clone();
+        edit.remark = "改了备注".into();
+        edit.opt_args = Some(json!(["-f", "ffmetadata", "/tmp/x"]));
+        let Json(saved) = put_streamers_endpoint(
+            operator(),
+            State(services.clone()),
+            State(pool.clone()),
+            Json(edit),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.remark, "改了备注");
+        assert_eq!(saved.opt_args, None);
+        assert_eq!(stored(created.id).await, Some(admin_args));
+    }
+}
+
+#[cfg(test)]
 mod template_delete_tests {
     use super::delete_template_endpoint;
     use crate::server::infrastructure::connection_pool::ConnectionManager;
@@ -1193,10 +1304,10 @@ pub async fn post_uploads(
                     StatusCode::BAD_REQUEST,
                     format!("无效或越界的媒体文件名: {file}"),
                 )
-                    .into_response()
             })
         })
-        .collect::<Result<Vec<_>, Response>>()?;
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(IntoResponse::into_response)?;
     if files.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "至少选择一个媒体文件").into_response());
     }
@@ -1359,7 +1470,6 @@ mod recording_policy_status_tests {
         InsertLiveStreamer {
             url: url.to_string(),
             remark: url.to_string(),
-            paused: false,
             filename_prefix: None,
             time_range,
             upload_streamers_id: None,
@@ -1489,7 +1599,6 @@ mod recording_policy_status_tests {
             id: 1,
             url: "https://live.example.com/x".to_string(),
             remark: "x".to_string(),
-            paused: false,
             filename_prefix: None,
             time_range: None,
             upload_streamers_id: None,
@@ -1525,7 +1634,6 @@ mod recording_policy_status_tests {
             id: 1,
             url: "https://live.example.com/x".to_string(),
             remark: "x".to_string(),
-            paused: false,
             filename_prefix: None,
             time_range: Some(window(3600, 7200)),
             upload_streamers_id: None,
@@ -1561,9 +1669,7 @@ mod configuration_tests {
             "mosaic_config": {"enabled": true, "regions": []}
         });
         assert_eq!(
-            validate_streamer_mosaic(&Some(invalid))
-                .unwrap_err()
-                .status(),
+            validate_streamer_mosaic(&Some(invalid)).unwrap_err().0,
             StatusCode::BAD_REQUEST
         );
         assert!(validate_streamer_mosaic(&None).is_ok());

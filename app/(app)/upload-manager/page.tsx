@@ -1,24 +1,17 @@
 'use client'
 import {
   Button,
-  ButtonGroup,
-  List,
-  Popconfirm,
   Notification,
   Typography,
   Transfer,
-  Card,
-  Tag,
-  Tooltip,
+  Empty,
+  Spin,
   Banner,
 } from '@douyinfe/semi-ui'
 import {
   IconCloudStroked,
   IconPlusCircle,
   IconUserListStroked,
-  IconEdit2Stroked,
-  IconSendStroked,
-  IconDeleteStroked,
 } from '@douyinfe/semi-icons'
 import { useRef, useState } from 'react'
 import Link from 'next/link'
@@ -27,12 +20,15 @@ import useSWR from 'swr'
 import { useRouter } from 'next/navigation'
 import UserList from '../../ui/UserList'
 import useSWRMutation from 'swr/mutation'
-import { useBiliUsers } from '../../lib/use-streamers'
+import { useBiliUsers, useTidNames } from '../../lib/use-streamers'
 import PageHeader from '../components/PageHeader'
 import { pairLabel, pairPeer, useMe } from '../../lib/use-me'
 import dc from '@/app/ui/data-card.module.scss'
+import tc from '@/app/ui/template-card.module.scss'
+import TemplateCard from '@/app/ui/TemplateCard'
 import { FormDialog } from '@/app/ui/shell'
 import { SubmissionLock } from '@/app/lib/submission-lock'
+import { errorMessage } from '@/app/lib/use-fleet'
 
 export default function UploadManager() {
   const { Text } = Typography
@@ -44,6 +40,8 @@ export default function UploadManager() {
     fetcher
   )
   const { biliUsers } = useBiliUsers()
+  // 分区名来自 /bili/archive/pre，与投稿表单的分区选择器同一张表；拿不到时卡片只显示 tid
+  const tidNames = useTidNames()
   const { me, can } = useMe()
   const canManageAccounts = can('account.manage')
   const canEditTemplates = can('template.edit')
@@ -210,111 +208,79 @@ export default function UploadManager() {
             }
           />
         ) : null}
-        <List
-          grid={{
-            gutter: 12,
-            xs: 24,
-            sm: 24,
-            md: 12,
-            lg: 8,
-            xl: 6,
-            xxl: 4,
-          }}
-          dataSource={templates}
-          loading={isLoading}
-          renderItem={(item: StudioEntity) => (
-            <List.Item>
-              <Card
-                shadows="hover"
-                style={{
-                  margin: '8px 2px',
-                  flexGrow: 1,
-                  height: '100%',
-                  borderRadius: 12,
-                  border: '1px solid var(--semi-color-border)',
-                }}
-                bodyStyle={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                  gap: 12,
-                  padding: '16px 18px',
-                }}
-              >
-                {/* 模板名称:优先完整展示,占满剩余宽度,超出才尾部省略 */}
-                <Text
-                  ellipsis={{ showTooltip: true }}
-                  title={item.template_name}
-                  style={{ flex: 1, minWidth: 0, fontSize: 14, fontWeight: 600 }}
-                >
-                  {item.template_name}
-                </Text>
-                {managedIds.has(item.id) ? (
-                  <Tooltip content={managedHint}>
-                    <Tag size="small" color="violet" style={{ flexShrink: 0 }}>
-                      托管
-                    </Tag>
-                  </Tooltip>
-                ) : null}
-                {pair && pairedIds.has(item.id) ? (
-                  <Tooltip content={pairHint}>
-                    <Tag size="small" color="green" style={{ flexShrink: 0 }}>
-                      {pairLabel(pair)}
-                    </Tag>
-                  </Tooltip>
-                ) : null}
-                {(canSubmit || canEditTemplates) && (
-                  <ButtonGroup style={{ flexShrink: 0 }} theme="borderless">
-                    {[
-                      canSubmit && (
-                        <Button
-                          key="send"
-                          icon={<IconSendStroked />}
-                          aria-label="投稿"
-                          onClick={() => showDialog(item)}
-                        />
-                      ),
-                      canEditTemplates && (
-                        <Button
-                          key="edit"
-                          icon={<IconEdit2Stroked />}
-                          aria-label="编辑"
-                          disabled={managedIds.has(item.id)}
-                          title={managedIds.has(item.id) ? managedHint : undefined}
-                          onClick={() => router.push(`/upload-manager/edit?id=${item.id}`)}
-                        />
-                      ),
-                      canEditTemplates && (
-                        <Popconfirm
-                          key="delete"
-                          title="确定是否要删除？"
-                          content="此操作将不可逆"
-                          margin={50}
-                          disabled={managedIds.has(item.id) || pairedIds.has(item.id)}
-                          onConfirm={async () => await onConfirm(item.id)}
-                        >
-                          <Button
-                            theme="borderless"
-                            icon={<IconDeleteStroked />}
-                            aria-label="删除"
-                            disabled={managedIds.has(item.id) || pairedIds.has(item.id)}
-                            title={
-                              managedIds.has(item.id)
-                                ? managedHint
-                                : pairedIds.has(item.id)
-                                  ? pairDeleteHint
-                                  : undefined
-                            }
-                          />
-                        </Popconfirm>
-                      ),
-                    ].filter(Boolean)}
-                  </ButtonGroup>
-                )}
-              </Card>
-            </List.Item>
-          )}
-        />
+        {isLoading ? (
+          <div className={tc.loading}>
+            <Spin />
+            <Text type="tertiary" size="small">
+              正在读取投稿模板…
+            </Text>
+          </div>
+        ) : templates && templates.length > 0 ? (
+          <div className={tc.grid}>
+            {templates.map((item) => {
+              const paired = !!pair && pairedIds.has(item.id)
+              const tid = tidNames.get(item.tid)
+              return (
+                <TemplateCard
+                  key={item.id}
+                  template={item}
+                  // 没有 template.edit 权限时拿不到账号列表（useBiliUsers 按这个权限门控），
+                  // 这时不能回落到 user_cookie —— 那是 biliup 机器上的凭据文件路径
+                  account={
+                    canEditTemplates
+                      ? biliUsers.find((user) => user.value === item.user_cookie)?.name
+                      : undefined
+                  }
+                  tidName={tid?.name}
+                  tidHint={[
+                    tid ? `投稿分区：${tid.path}` : '投稿分区 tid',
+                    item.tid_v2 ? `tid_v2 ${item.tid_v2}` : null,
+                  ]
+                    .filter(Boolean)
+                    .join('；')}
+                  canSubmit={canSubmit}
+                  canEdit={canEditTemplates}
+                  managed={managedIds.has(item.id)}
+                  managedHint={managedHint}
+                  pairLabel={paired ? pairLabel(pair!) : undefined}
+                  pairHint={pairHint}
+                  deleteHint={pairDeleteHint}
+                  onSend={() => showDialog(item)}
+                  onEdit={() => router.push(`/upload-manager/edit?id=${item.id}`)}
+                  onDelete={() => onConfirm(item.id)}
+                />
+              )
+            })}
+          </div>
+        ) : (
+          <div className={tc.empty}>
+            <Empty
+              image={
+                <IconPlusCircle
+                  size="extra-large"
+                  style={{ color: 'var(--semi-color-text-3)' }}
+                />
+              }
+              title={error ? '投稿模板加载失败' : '还没有投稿模板'}
+              description={
+                error
+                  ? // fetcher 抛出的是响应体原文，后端返回 JSON 时要取里面的 message，
+                    // 不能直接把 {"message":"..."} 印到页面上
+                    errorMessage(error) || '请稍后重试'
+                  : canEditTemplates
+                    ? '投稿模板决定录完的视频投到哪个账号、用什么标题和分区。新建后这里会列出它的账号、类型、分区和默认标签。'
+                    : '管理员添加投稿模板后会显示在这里'
+              }
+            />
+            {canEditTemplates && !error ? (
+              <Link href="/upload-manager/add" prefetch={false} onClick={handleAddLinkClick}>
+                <Button theme="solid" icon={<IconPlusCircle />}>
+                  新建模板
+                </Button>
+              </Link>
+            ) : null}
+          </div>
+        )}
       </div>
     </>
   )

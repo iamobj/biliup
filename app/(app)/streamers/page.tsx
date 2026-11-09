@@ -116,7 +116,7 @@ export default function StreamersPage() {
   const pair = fleet?.pair
   const pairedIds = useMemo(() => new Set(pair?.streamers ?? []), [pair])
   const pairHint = pair
-    ? `在两台之间同步：这里的修改会同步到${pairPeer(pair)} ${fleet?.controller}，那边的修改也会同步过来。run 命令与边录边传（sync-downloader）不随配对同步，请到控制面的「任务平台 › 节点管理 › 房间」设置，这里改了会被退回`
+    ? `在两台之间同步：这里的修改会同步到${pairPeer(pair)} ${fleet?.controller}，那边的修改也会同步过来。run 命令、ffmpeg 参数与边录边传（sync-downloader）不随配对同步，请到控制面的「任务平台 › 节点管理 › 房间」设置，这里改了会被退回`
     : undefined
   // 被控制面移除后转为本机自管并暂停、等确认恢复的直播间；手动恢复后标记立即消失
   const revokedIds = useMemo(() => new Set(me?.fleet_revoked?.streamers ?? []), [me?.fleet_revoked])
@@ -249,7 +249,7 @@ export default function StreamersPage() {
   }
 
   // 常用编辑直接显示，其余操作通过点击菜单打开；同一时刻只挂载一个配置面板。
-  const hasActions = canEdit || canControl || canHooks
+  const hasActions = canEdit || canControl || canHooks || can('file.view')
   const renderActions = (item: LiveStreamerEntity) => {
     if (!hasActions) return null
     const locked = managedIds.has(item.id)
@@ -271,14 +271,15 @@ export default function StreamersPage() {
           ) : canControl ? (
             <Button theme="light" icon={paused ? <IconPlay /> : <IconPause />} disabled={disabled}
               onClick={() => togglePause(item)}>{paused ? '恢复监控' : '暂停监控'}</Button>
-          ) : (
+          ) : canHooks ? (
             <Button theme="light" icon={<IconWrench />} disabled={disabled}
               onClick={() => setOverrideTarget({ item, panel: 'plugin' })}>配置覆写</Button>
-          )}
-          {(canEdit || canHooks) && <Dropdown trigger="click" position="bottomRight"
+          ) : null}
+          {(canEdit || canHooks || can('file.view')) && <Dropdown trigger="click" position="bottomRight"
             visible={openActionId === item.id}
             onVisibleChange={visible => setOpenActionId(visible ? item.id : null)} render={
             <Dropdown.Menu>
+              {can('file.view') && <Dropdown.Item icon={<IconVideoListStroked />} onClick={()=>{setOpenActionId(null);router.push(`/sessions?streamer=${item.id}`)}}>直播场次</Dropdown.Item>}
               {canEdit && canControl && (
                 <Dropdown.Item icon={paused ? <IconPlay /> : <IconPause />} disabled={disabled}
                   onClick={() => { setOpenActionId(null); void togglePause(item) }}>{paused ? '恢复监控' : '暂停监控'}</Dropdown.Item>
@@ -302,7 +303,7 @@ export default function StreamersPage() {
               )}
             </Dropdown.Menu>
           }>
-            <Button theme="light" icon={<IconMore />} disabled={disabled} title="更多"
+            <Button theme="light" icon={<IconMore />} disabled={busy || actionBusy !== null} title="更多"
               aria-label={`更多操作：${item.remark || item.url}`} />
           </Dropdown>}
         </SplitButtonGroup>
